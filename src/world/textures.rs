@@ -1,0 +1,1166 @@
+//! Procedurally generated 16x16 block textures (no asset files needed yet).
+//!
+//! Alpha channel meaning: for opaque blocks it's the *tint mask* (255 = multiply by the biome
+//! colour, used for grass and leaves); for water it's the opacity; for item sprites (from
+//! `Tex::Stick` on) it's transparency (drawn as cutouts, see `models` and `ui`).
+
+use crate::render::TextureArrayData;
+
+pub const TEX_SIZE: usize = 16;
+
+/// Declares the texture enum and `Tex::ALL` (every variant, in declaration order) together.
+macro_rules! textures {
+    ($($name:ident,)*) => {
+        #[repr(u8)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum Tex {
+            $($name,)*
+        }
+
+        impl Tex {
+            pub const ALL: &'static [Tex] = &[$(Tex::$name,)*];
+        }
+    };
+}
+
+textures! {
+    Stone,
+    Deepstone,
+    Mantle,
+    OuterCore,
+    InnerCore,
+    Dirt,
+    GrassTop,
+    GrassSide,
+    SnowyGrassSide,
+    Snow,
+    Ice,
+    Water,
+    Sand,
+    RedSand,
+    Sandstone,
+    SandstoneTop,
+    Gravel,
+    TerracottaOrange,
+    TerracottaRed,
+    TerracottaYellow,
+    TerracottaWhite,
+    TerracottaBrown,
+    OakLogSide,
+    SpruceLogSide,
+    LogTop,
+    OakLeaves,
+    SpruceLeaves,
+    JungleLeaves,
+    CactusSide,
+    CactusTop,
+    CoalOre,
+    IronOre,
+    CopperOre,
+    GoldOre,
+    DiamondOre,
+    BauxiteOre,
+    UraniumOre,
+    IlmeniteSand,
+    OakPlanks,
+    SprucePlanks,
+    Cobblestone,
+    CraftingTop,
+    CraftingSide,
+    FurnaceFront,
+    FurnaceFrontLit,
+    FurnaceTop,
+    // Item sprites (alpha = transparency) from here on.
+    Stick,
+    Coal,
+    Charcoal,
+    RawIron,
+    RawCopper,
+    RawGold,
+    IronIngot,
+    CopperIngot,
+    GoldIngot,
+    Diamond,
+    // Tools: kind-major (pickaxe, axe, shovel, sword), then tier (wood, stone, iron, gold,
+    // diamond). `Tex::tool` relies on this order.
+    WoodenPickaxe,
+    StonePickaxe,
+    IronPickaxe,
+    GoldenPickaxe,
+    DiamondPickaxe,
+    WoodenAxe,
+    StoneAxe,
+    IronAxe,
+    GoldenAxe,
+    DiamondAxe,
+    WoodenShovel,
+    StoneShovel,
+    IronShovel,
+    GoldenShovel,
+    DiamondShovel,
+    WoodenSword,
+    StoneSword,
+    IronSword,
+    GoldenSword,
+    DiamondSword,
+    // Interface.
+    Heart,
+    HeartHalf,
+    HeartEmpty,
+    Flame,
+    FlameOff,
+    Arrow,
+    // Added with the light / chest / mob update.
+    Glass,
+    TorchSide,
+    TorchTop,
+    ChestSide,
+    ChestTop,
+    ChestFront,
+    WhiteWool,
+    RawBeef,
+    Steak,
+    RawPorkchop,
+    CookedPorkchop,
+    RawMutton,
+    CookedMutton,
+    Leather,
+    // Armor: piece-major (helmet, chestplate, leggings, boots), then tier (leather, iron,
+    // gold, diamond). `Tex::armor` relies on this order.
+    LeatherHelmet,
+    IronHelmet,
+    GoldenHelmet,
+    DiamondHelmet,
+    LeatherChestplate,
+    IronChestplate,
+    GoldenChestplate,
+    DiamondChestplate,
+    LeatherLeggings,
+    IronLeggings,
+    GoldenLeggings,
+    DiamondLeggings,
+    LeatherBoots,
+    IronBoots,
+    GoldenBoots,
+    DiamondBoots,
+    Food,
+    FoodHalf,
+    FoodEmpty,
+    ArmorIcon,
+    ArmorHalf,
+    ArmorEmpty,
+    // Mob skins (alpha 255: the whole skin takes the tint, used for the red hurt flash).
+    CowSkin,
+    CowFace,
+    PigSkin,
+    PigFace,
+    SheepWool,
+    SheepFace,
+    SheepSkin,
+}
+
+impl Tex {
+    /// The sprite of tool `kind` (0 pickaxe, 1 axe, 2 shovel, 3 sword) of `tier` (0 wood,
+    /// 1 stone, 2 iron, 3 gold, 4 diamond).
+    pub fn tool(kind: usize, tier: usize) -> Tex {
+        Tex::ALL[Tex::WoodenPickaxe as usize + kind * 5 + tier]
+    }
+
+    /// The sprite of armor `piece` (0 helmet, 1 chestplate, 2 leggings, 3 boots) of `tier`
+    /// (0 leather, 1 iron, 2 gold, 3 diamond).
+    pub fn armor(piece: usize, tier: usize) -> Tex {
+        Tex::ALL[Tex::LeatherHelmet as usize + piece * 4 + tier]
+    }
+}
+
+pub fn generate() -> TextureArrayData {
+    for (i, t) in Tex::ALL.iter().enumerate() {
+        debug_assert_eq!(*t as usize, i, "Tex::ALL must be in declaration order");
+    }
+    let layers = Tex::ALL.iter().map(|&t| make(t).into_bytes()).collect();
+    TextureArrayData {
+        size: TEX_SIZE as u32,
+        layers,
+    }
+}
+
+type Rgb = [u8; 3];
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        super::noise::mix64(self.0)
+    }
+    /// Uniform in [0, 1).
+    fn f(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1u64 << 24) as f32
+    }
+    /// Uniform in [-1, 1).
+    fn signed(&mut self) -> f32 {
+        self.f() * 2.0 - 1.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+#[derive(Clone)]
+struct Img {
+    px: Vec<[u8; 4]>,
+}
+
+impl Img {
+    fn get(&self, x: usize, y: usize) -> [u8; 4] {
+        self.px[y * TEX_SIZE + x]
+    }
+    fn set(&mut self, x: usize, y: usize, rgb: Rgb, a: u8) {
+        self.px[y * TEX_SIZE + x] = [rgb[0], rgb[1], rgb[2], a];
+    }
+    fn shade(&mut self, x: usize, y: usize, f: f32) {
+        let p = self.get(x, y);
+        self.set(x, y, scale([p[0], p[1], p[2]], f), p[3]);
+    }
+    fn into_bytes(self) -> Vec<u8> {
+        self.px.into_iter().flatten().collect()
+    }
+}
+
+fn scale(c: Rgb, f: f32) -> Rgb {
+    c.map(|v| (v as f32 * f).clamp(0.0, 255.0) as u8)
+}
+
+/// Base colour with per-pixel brightness noise.
+fn noisy(r: &mut Rng, base: Rgb, amount: f32, alpha: u8) -> Img {
+    let mut img = Img {
+        px: vec![[0; 4]; TEX_SIZE * TEX_SIZE],
+    };
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            img.set(x, y, scale(base, 1.0 + r.signed() * amount), alpha);
+        }
+    }
+    img
+}
+
+/// Scatter `count` little mineral clusters over `img`.
+fn speckle(r: &mut Rng, img: &mut Img, count: usize, colors: &[Rgb], alpha: u8) {
+    for _ in 0..count {
+        let (cx, cy) = (2 + r.below(12), 2 + r.below(12));
+        for _ in 0..3 + r.below(3) {
+            let x = (cx as i32 + r.below(3) as i32 - 1).clamp(0, 15) as usize;
+            let y = (cy as i32 + r.below(3) as i32 - 1).clamp(0, 15) as usize;
+            let c = colors[r.below(colors.len())];
+            img.set(x, y, scale(c, 1.0 + r.signed() * 0.08), alpha);
+        }
+    }
+}
+
+fn stone(r: &mut Rng) -> Img {
+    let mut img = noisy(r, [128, 128, 130], 0.12, 0);
+    for _ in 0..7 {
+        let (x, y) = (r.below(15), r.below(16));
+        img.shade(x, y, 0.82);
+        img.shade(x + 1, y, 0.86);
+    }
+    img
+}
+
+fn dirt(r: &mut Rng) -> Img {
+    let mut img = noisy(r, [121, 85, 58], 0.14, 0);
+    for _ in 0..14 {
+        let (x, y) = (r.below(16), r.below(16));
+        img.shade(x, y, if r.f() < 0.5 { 0.75 } else { 1.18 });
+    }
+    img
+}
+
+fn sand(r: &mut Rng, base: Rgb) -> Img {
+    let mut img = noisy(r, base, 0.06, 0);
+    for _ in 0..10 {
+        let (x, y) = (r.below(16), r.below(16));
+        img.shade(x, y, 0.9);
+    }
+    img
+}
+
+fn terracotta(r: &mut Rng, base: Rgb) -> Img {
+    noisy(r, base, 0.04, 0)
+}
+
+fn leaves(r: &mut Rng, brightness: f32) -> Img {
+    let mut img = Img {
+        px: vec![[0; 4]; TEX_SIZE * TEX_SIZE],
+    };
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            let g = if r.f() < 0.18 {
+                70.0
+            } else {
+                150.0 + r.signed() * 45.0
+            };
+            let g = (g * brightness).clamp(0.0, 255.0) as u8;
+            img.set(x, y, [g, g, g], 255);
+        }
+    }
+    img
+}
+
+fn log_side(r: &mut Rng, base: Rgb) -> Img {
+    let mut img = noisy(r, base, 0.06, 0);
+    let stripes: Vec<f32> = (0..TEX_SIZE).map(|_| 0.8 + r.f() * 0.35).collect();
+    for y in 0..TEX_SIZE {
+        for (x, &s) in stripes.iter().enumerate() {
+            img.shade(x, y, s);
+        }
+    }
+    img
+}
+
+fn make(t: Tex) -> Img {
+    let mut r = Rng((t as u64)
+        .wrapping_mul(0x2545_f491_4f6c_dd1d)
+        .wrapping_add(17));
+    let r = &mut r;
+    match t {
+        Tex::Stone => stone(r),
+        Tex::Deepstone => {
+            let mut img = noisy(r, [74, 74, 86], 0.1, 0);
+            for y in (1..TEX_SIZE).step_by(4) {
+                for x in 0..TEX_SIZE {
+                    if r.f() < 0.7 {
+                        img.shade(x, y, 0.8);
+                    }
+                }
+            }
+            img
+        }
+        Tex::Mantle => {
+            // Peridotite: dark green-grey rock with olivine crystals.
+            let mut img = noisy(r, [66, 74, 58], 0.1, 0);
+            speckle(r, &mut img, 7, &[[112, 138, 64], [92, 120, 52]], 0);
+            speckle(r, &mut img, 3, &[[34, 36, 32]], 0);
+            img
+        }
+        Tex::OuterCore => {
+            // Molten iron: glowing orange with bright streaks and darker crust.
+            let mut img = noisy(r, [226, 110, 28], 0.08, 0);
+            for y in 0..TEX_SIZE {
+                let wave = ((y as f32 * 0.9).sin() * 3.0) as i32;
+                for x in 0..TEX_SIZE {
+                    if (x as i32 + wave).rem_euclid(7) == 0 {
+                        img.set(x, y, [255, 214, 90], 0);
+                    }
+                }
+            }
+            speckle(r, &mut img, 4, &[[120, 40, 16], [150, 56, 20]], 0);
+            img
+        }
+        Tex::InnerCore => {
+            // Iron-nickel: brushed metallic grey.
+            let mut img = noisy(r, [148, 150, 158], 0.04, 0);
+            for y in 0..TEX_SIZE {
+                let f = 0.9 + r.f() * 0.2;
+                for x in 0..TEX_SIZE {
+                    img.shade(x, y, f);
+                }
+            }
+            speckle(r, &mut img, 3, &[[214, 216, 226]], 0);
+            img
+        }
+        Tex::Dirt => dirt(r),
+        Tex::GrassTop => {
+            let mut img = Img {
+                px: vec![[0; 4]; TEX_SIZE * TEX_SIZE],
+            };
+            for y in 0..TEX_SIZE {
+                for x in 0..TEX_SIZE {
+                    let g = (195.0 + r.signed() * 30.0) as u8;
+                    img.set(x, y, [g, g, g], 255);
+                }
+            }
+            img
+        }
+        Tex::GrassSide | Tex::SnowyGrassSide => {
+            let mut img = dirt(r);
+            for x in 0..TEX_SIZE {
+                let depth = 3 + r.below(3);
+                for y in 0..depth {
+                    if t == Tex::GrassSide {
+                        let g = (195.0 + r.signed() * 30.0) as u8;
+                        img.set(x, y, [g, g, g], 255);
+                    } else {
+                        img.set(x, y, scale([240, 245, 250], 1.0 + r.signed() * 0.03), 0);
+                    }
+                }
+            }
+            img
+        }
+        Tex::Snow => noisy(r, [240, 244, 250], 0.03, 0),
+        Tex::Ice => {
+            let mut img = noisy(r, [150, 190, 245], 0.04, 0);
+            for _ in 0..3 {
+                let (mut x, mut y) = (r.below(16) as i32, r.below(16) as i32);
+                for _ in 0..6 {
+                    img.set(
+                        x.clamp(0, 15) as usize,
+                        y.clamp(0, 15) as usize,
+                        [215, 235, 255],
+                        0,
+                    );
+                    x += r.below(3) as i32 - 1;
+                    y += 1;
+                }
+            }
+            img
+        }
+        Tex::Water => {
+            let mut img = noisy(r, [215, 225, 240], 0.03, 215);
+            for y in 0..TEX_SIZE {
+                for x in 0..TEX_SIZE {
+                    if (x + y * 3) % 11 == 0 {
+                        img.set(x, y, [245, 250, 255], 200);
+                    }
+                }
+            }
+            img
+        }
+        Tex::Sand => sand(r, [219, 207, 163]),
+        Tex::RedSand => sand(r, [190, 102, 48]),
+        Tex::Sandstone => {
+            let mut img = noisy(r, [214, 200, 150], 0.04, 0);
+            for x in 0..TEX_SIZE {
+                for y in 0..3 {
+                    img.shade(x, y, 1.07);
+                }
+                img.shade(x, 11, 0.85);
+                img.shade(x, 12, 0.9);
+            }
+            img
+        }
+        Tex::SandstoneTop => noisy(r, [218, 205, 156], 0.03, 0),
+        Tex::Gravel => {
+            let mut img = noisy(r, [120, 116, 112], 0.1, 0);
+            for _ in 0..22 {
+                let (x, y) = (r.below(15), r.below(15));
+                let g = 80 + r.below(100) as u8;
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    img.set(
+                        x + dx,
+                        y + dy,
+                        [g, g.saturating_sub(4), g.saturating_sub(8)],
+                        0,
+                    );
+                }
+            }
+            img
+        }
+        Tex::TerracottaOrange => terracotta(r, [162, 84, 38]),
+        Tex::TerracottaRed => terracotta(r, [143, 61, 47]),
+        Tex::TerracottaYellow => terracotta(r, [186, 133, 35]),
+        Tex::TerracottaWhite => terracotta(r, [209, 178, 161]),
+        Tex::TerracottaBrown => terracotta(r, [96, 62, 42]),
+        Tex::OakLogSide => log_side(r, [104, 80, 50]),
+        Tex::SpruceLogSide => log_side(r, [62, 44, 27]),
+        Tex::LogTop => {
+            let mut img = Img {
+                px: vec![[0; 4]; TEX_SIZE * TEX_SIZE],
+            };
+            for y in 0..TEX_SIZE {
+                for x in 0..TEX_SIZE {
+                    let (dx, dy) = (x as f32 - 7.5, y as f32 - 7.5);
+                    let d = (dx * dx + dy * dy).sqrt();
+                    let c = if d > 7.0 {
+                        [92, 70, 44]
+                    } else if (d as usize).is_multiple_of(2) {
+                        [176, 143, 92]
+                    } else {
+                        [150, 118, 74]
+                    };
+                    img.set(x, y, scale(c, 1.0 + r.signed() * 0.04), 0);
+                }
+            }
+            img
+        }
+        Tex::OakLeaves => leaves(r, 1.0),
+        Tex::SpruceLeaves => leaves(r, 0.85),
+        Tex::JungleLeaves => leaves(r, 1.1),
+        Tex::CactusSide => {
+            let mut img = noisy(r, [82, 132, 46], 0.06, 0);
+            for y in 0..TEX_SIZE {
+                for x in [0, 4, 8, 12] {
+                    img.shade(x, y, 0.75);
+                }
+            }
+            for _ in 0..10 {
+                let (x, y) = (r.below(16), r.below(16));
+                img.set(x, y, [225, 225, 190], 0);
+            }
+            img
+        }
+        Tex::CactusTop => {
+            let mut img = noisy(r, [98, 150, 56], 0.05, 0);
+            for i in 0..TEX_SIZE {
+                for (x, y) in [(i, 0), (i, 15), (0, i), (15, i)] {
+                    img.shade(x, y, 0.75);
+                }
+            }
+            img
+        }
+        Tex::CoalOre => {
+            let mut img = stone(r);
+            speckle(r, &mut img, 6, &[[28, 28, 30], [45, 45, 48]], 0);
+            img
+        }
+        Tex::IronOre => {
+            let mut img = stone(r);
+            speckle(r, &mut img, 5, &[[216, 175, 147], [190, 140, 110]], 0);
+            img
+        }
+        Tex::CopperOre => {
+            let mut img = stone(r);
+            speckle(
+                r,
+                &mut img,
+                5,
+                &[[224, 120, 70], [190, 95, 55], [80, 170, 130]],
+                0,
+            );
+            img
+        }
+        Tex::GoldOre => {
+            let mut img = stone(r);
+            speckle(r, &mut img, 4, &[[250, 220, 60], [230, 180, 30]], 0);
+            img
+        }
+        Tex::DiamondOre => {
+            let mut img = stone(r);
+            speckle(r, &mut img, 4, &[[90, 230, 225], [180, 250, 245]], 0);
+            img
+        }
+        Tex::BauxiteOre => {
+            let mut img = noisy(r, [150, 82, 56], 0.08, 0);
+            speckle(
+                r,
+                &mut img,
+                9,
+                &[[196, 116, 72], [110, 56, 40], [214, 160, 120]],
+                0,
+            );
+            img
+        }
+        Tex::UraniumOre => {
+            let mut img = stone(r);
+            speckle(r, &mut img, 4, &[[170, 230, 40], [210, 250, 90]], 0);
+            speckle(r, &mut img, 2, &[[40, 42, 34]], 0);
+            img
+        }
+        Tex::IlmeniteSand => {
+            let mut img = noisy(r, [150, 140, 122], 0.06, 0);
+            for _ in 0..40 {
+                let (x, y) = (r.below(16), r.below(16));
+                let c = if r.f() < 0.7 {
+                    [32, 32, 36]
+                } else {
+                    [130, 130, 145]
+                };
+                img.set(x, y, c, 0);
+            }
+            img
+        }
+        Tex::OakPlanks => planks(r, [162, 130, 78]),
+        Tex::SprucePlanks => planks(r, [114, 84, 48]),
+        Tex::Cobblestone => cobblestone(r),
+        Tex::CraftingTop => {
+            // Planks with a dark frame and a 3x3 grid burned in.
+            let mut img = planks(r, [162, 130, 78]);
+            for i in 0..TEX_SIZE {
+                for (x, y) in [(i, 0), (i, 15), (0, i), (15, i)] {
+                    img.set(x, y, [74, 52, 30], 0);
+                }
+                for g in [5, 10] {
+                    if (2..14).contains(&i) {
+                        img.set(g, i, [96, 70, 40], 0);
+                        img.set(i, g, [96, 70, 40], 0);
+                    }
+                }
+            }
+            img
+        }
+        Tex::CraftingSide => {
+            // Planks with a dark apron band under the table top, and a saw hanging on it.
+            let mut img = planks(r, [150, 118, 70]);
+            for x in 0..TEX_SIZE {
+                for y in 0..3 {
+                    img.set(x, y, scale([96, 70, 40], 1.0 + r.signed() * 0.06), 0);
+                }
+            }
+            for x in 4..12 {
+                img.set(x, 6, [190, 190, 196], 0);
+                if x % 2 == 0 {
+                    img.set(x, 7, [150, 150, 158], 0);
+                }
+            }
+            for y in 5..8 {
+                img.set(11, y, [92, 60, 30], 0);
+                img.set(12, y, [92, 60, 30], 0);
+            }
+            img
+        }
+        Tex::FurnaceFront | Tex::FurnaceFrontLit => {
+            let mut img = cobblestone(r);
+            let lit = t == Tex::FurnaceFrontLit;
+            for y in 7..14 {
+                for x in 4..12 {
+                    // An arched opening.
+                    if y == 7 && !(5..11).contains(&x) {
+                        continue;
+                    }
+                    let c = if !lit {
+                        scale([28, 24, 22], 1.0 + r.signed() * 0.1)
+                    } else if y >= 11 || r.f() < 0.3 {
+                        [255, 200, 60]
+                    } else {
+                        [240, 110, 24]
+                    };
+                    img.set(x, y, c, 0);
+                }
+            }
+            // Lintel and sill.
+            for x in 3..13 {
+                img.set(x, 6, [96, 96, 98], 0);
+                img.set(x, 14, [84, 84, 86], 0);
+            }
+            img
+        }
+        Tex::FurnaceTop => {
+            let mut img = noisy(r, [138, 138, 140], 0.06, 0);
+            for y in 0..TEX_SIZE {
+                for x in 0..TEX_SIZE {
+                    let d = ((x as f32 - 7.5).powi(2) + (y as f32 - 7.5).powi(2)).sqrt();
+                    if d < 3.2 {
+                        img.set(x, y, [36, 32, 30], 0);
+                    } else if d < 4.4 {
+                        img.shade(x, y, 0.7);
+                    }
+                }
+            }
+            img
+        }
+        Tex::Stick => tool_sprite(None, |_, _| false),
+        Tex::Coal => lump(r, [42, 42, 46], [80, 80, 88], 5.5),
+        Tex::Charcoal => lump(r, [52, 40, 30], [86, 68, 50], 5.0),
+        Tex::RawIron => lump(r, [196, 150, 120], [232, 198, 170], 5.0),
+        Tex::RawCopper => lump(r, [196, 104, 60], [236, 150, 96], 5.0),
+        Tex::RawGold => lump(r, [222, 176, 40], [255, 226, 100], 5.0),
+        Tex::IronIngot => ingot([216, 216, 220]),
+        Tex::CopperIngot => ingot([222, 128, 76]),
+        Tex::GoldIngot => ingot([250, 214, 64]),
+        Tex::Diamond => sprite(|x, y| {
+            let (dx, dy) = (x - 7.5, y - 8.0);
+            if dx.abs() + (dy * 0.85).abs() > 6.2 || dy < -4.5 {
+                return None;
+            }
+            Some(if dy < -2.0 {
+                [190, 255, 250]
+            } else if dx + dy < 0.0 {
+                [90, 230, 220]
+            } else {
+                [40, 170, 170]
+            })
+        }),
+        Tex::Heart | Tex::HeartHalf | Tex::HeartEmpty => {
+            let fill = |x: f32| match t {
+                Tex::Heart => true,
+                Tex::HeartHalf => x < 7.5,
+                _ => false,
+            };
+            sprite(|x, y| {
+                // (x^2 + y^2 - 1)^3 - x^2 y^3 < 0, scaled to the sprite.
+                let (hx, hy) = ((x - 7.5) / 6.5, (8.5 - y) / 6.5 + 0.15);
+                let f = (hx * hx + hy * hy - 1.0).powi(3) - hx * hx * hy.powi(3);
+                (f < 0.0).then(|| {
+                    if !fill(x) {
+                        [52, 18, 18]
+                    } else if hy > 0.55 && hx < -0.25 {
+                        [255, 150, 150]
+                    } else {
+                        [226, 32, 32]
+                    }
+                })
+            })
+        }
+        Tex::Flame | Tex::FlameOff => sprite(|x, y| {
+            let (dx, dy) = (x - 7.5, y - 10.0);
+            let width = if dy < 0.0 {
+                5.0 * (1.0 + dy / 9.0)
+            } else {
+                5.0
+            };
+            if dx.abs() > width || dx * dx + (dy * 1.3).max(0.0).powi(2) > 25.0 || dy < -9.0 {
+                return None;
+            }
+            Some(if t == Tex::FlameOff {
+                [120, 120, 120]
+            } else if dx.abs() < width * 0.45 && dy > -3.0 {
+                [255, 236, 120]
+            } else {
+                [250, 140, 30]
+            })
+        }),
+        Tex::Arrow => sprite(|x, y| {
+            let (dx, dy) = (x - 8.0, (y - 8.0).abs());
+            let shaft = dx < 2.0 && dx > -6.5 && dy < 1.5;
+            let head = (2.0..6.5).contains(&dx) && dy < 6.5 - dx;
+            (shaft || head).then_some([255, 255, 255])
+        }),
+        Tex::Glass => {
+            // Clear (alpha 0) with a pale frame and a few glints.
+            let mut img = Img {
+                px: vec![[0; 4]; TEX_SIZE * TEX_SIZE],
+            };
+            for i in 0..TEX_SIZE {
+                for (x, y) in [(i, 0), (i, 15), (0, i), (15, i)] {
+                    img.set(x, y, [222, 238, 244], 255);
+                }
+            }
+            for (x, y) in [(3, 4), (4, 3), (5, 2), (10, 11), (11, 10), (12, 9), (4, 5)] {
+                img.set(x, y, [245, 252, 255], 255);
+            }
+            img
+        }
+        Tex::TorchSide => {
+            // Only the middle two columns are used: a stick with a flame on top. Doubles as
+            // the torch's item sprite.
+            let mut img = Img {
+                px: vec![[0; 4]; TEX_SIZE * TEX_SIZE],
+            };
+            for y in 6..TEX_SIZE {
+                for x in 7..9 {
+                    let c = match y {
+                        6 => [255, 236, 130],
+                        7 => [255, 170, 40],
+                        _ if x == 7 => [137, 103, 39],
+                        _ => [104, 78, 29],
+                    };
+                    img.set(x, y, c, 255);
+                }
+            }
+            img
+        }
+        Tex::TorchTop => noisy(r, [255, 214, 90], 0.08, 0),
+        Tex::ChestSide | Tex::ChestTop | Tex::ChestFront => {
+            let mut img = planks(r, [150, 108, 56]);
+            for i in 0..TEX_SIZE {
+                for (x, y) in [(i, 0), (i, 15), (0, i), (15, i)] {
+                    img.set(x, y, [70, 46, 22], 0);
+                }
+            }
+            if t == Tex::ChestFront {
+                for y in 3..8 {
+                    for x in 7..9 {
+                        img.set(
+                            x,
+                            y,
+                            if y == 3 {
+                                [90, 90, 96]
+                            } else {
+                                [196, 196, 204]
+                            },
+                            0,
+                        );
+                    }
+                }
+            }
+            img
+        }
+        Tex::WhiteWool => {
+            let mut img = noisy(r, [232, 232, 228], 0.05, 0);
+            for _ in 0..30 {
+                let (x, y) = (r.below(16), r.below(16));
+                img.shade(x, y, 0.88);
+            }
+            img
+        }
+        Tex::RawBeef => meat(r, [196, 52, 48], [240, 214, 206]),
+        Tex::Steak => meat(r, [120, 70, 40], [170, 120, 80]),
+        Tex::RawPorkchop => meat(r, [238, 150, 150], [250, 232, 228]),
+        Tex::CookedPorkchop => meat(r, [196, 140, 90], [232, 206, 160]),
+        Tex::RawMutton => meat(r, [208, 78, 78], [236, 200, 196]),
+        Tex::CookedMutton => meat(r, [140, 82, 52], [196, 150, 110]),
+        Tex::Leather => sprite(|x, y| {
+            let (dx, dy) = (x - 8.0, y - 8.0);
+            let edge = 5.5 + ((x * 1.7).sin() + (y * 2.3).cos()) * 0.6;
+            (dx.abs().max(dy.abs() * 1.1) < edge).then(|| {
+                if (x as i32 + y as i32) % 5 == 0 {
+                    [128, 76, 40]
+                } else {
+                    [156, 96, 52]
+                }
+            })
+        }),
+        Tex::Food | Tex::FoodHalf | Tex::FoodEmpty => {
+            let fill = |x: f32| match t {
+                Tex::Food => true,
+                Tex::FoodHalf => x < 7.5,
+                _ => false,
+            };
+            sprite(|x, y| {
+                let meat = (x - 6.0).powi(2) + (y - 6.5).powi(2) < 22.0;
+                let bone = (x - y).abs() < 1.5 && x > 8.0 && x < 14.5;
+                let knob = (x - 13.0).powi(2) + (y - 14.0).powi(2) < 3.0
+                    || (x - 14.0).powi(2) + (y - 12.5).powi(2) < 3.0;
+                if meat {
+                    Some(if !fill(x) {
+                        [48, 30, 22]
+                    } else if x + y < 10.0 {
+                        [214, 132, 60]
+                    } else {
+                        [176, 96, 40]
+                    })
+                } else if bone || knob {
+                    Some(if fill(x) {
+                        [236, 228, 214]
+                    } else {
+                        [60, 56, 52]
+                    })
+                } else {
+                    None
+                }
+            })
+        }
+        Tex::ArmorIcon | Tex::ArmorHalf | Tex::ArmorEmpty => {
+            let fill = |x: f32| match t {
+                Tex::ArmorIcon => true,
+                Tex::ArmorHalf => x < 7.5,
+                _ => false,
+            };
+            sprite(|x, y| {
+                armor_shape(1, x, y).then(|| {
+                    if fill(x) {
+                        [214, 214, 220]
+                    } else {
+                        [52, 52, 56]
+                    }
+                })
+            })
+        }
+        Tex::CowSkin => {
+            let mut img = noisy(r, [92, 62, 40], 0.08, 255);
+            for _ in 0..4 {
+                let (cx, cy, rad) = (r.f() * 16.0, r.f() * 16.0, 2.0 + r.f() * 2.5);
+                for y in 0..TEX_SIZE {
+                    for x in 0..TEX_SIZE {
+                        if (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2) < rad * rad {
+                            img.set(x, y, scale([236, 234, 228], 1.0 + r.signed() * 0.04), 255);
+                        }
+                    }
+                }
+            }
+            img
+        }
+        Tex::CowFace => {
+            let mut img = noisy(r, [92, 62, 40], 0.06, 255);
+            face_eyes(&mut img, 5);
+            for y in 10..16 {
+                for x in 3..13 {
+                    img.set(x, y, scale([214, 170, 150], 1.0 + r.signed() * 0.04), 255);
+                }
+            }
+            img.set(5, 12, [60, 40, 36], 255);
+            img.set(10, 12, [60, 40, 36], 255);
+            img
+        }
+        Tex::PigSkin => noisy(r, [238, 164, 164], 0.05, 255),
+        Tex::PigFace => {
+            let mut img = noisy(r, [238, 164, 164], 0.05, 255);
+            face_eyes(&mut img, 5);
+            for y in 9..13 {
+                for x in 5..11 {
+                    img.set(x, y, [214, 128, 132], 255);
+                }
+            }
+            img.set(6, 10, [110, 56, 60], 255);
+            img.set(9, 10, [110, 56, 60], 255);
+            img
+        }
+        Tex::SheepWool => {
+            let mut img = noisy(r, [226, 226, 220], 0.05, 255);
+            for _ in 0..40 {
+                let (x, y) = (r.below(16), r.below(16));
+                img.shade(x, y, 0.86);
+            }
+            img
+        }
+        Tex::SheepSkin => noisy(r, [172, 160, 142], 0.06, 255),
+        Tex::SheepFace => {
+            let mut img = noisy(r, [172, 160, 142], 0.05, 255);
+            face_eyes(&mut img, 6);
+            for x in 6..10 {
+                img.set(x, 12, [120, 100, 90], 255);
+            }
+            img
+        }
+        _ if t as usize >= Tex::LeatherHelmet as usize => {
+            let i = t as usize - Tex::LeatherHelmet as usize;
+            let (piece, tier) = (i / 4, i % 4);
+            let color: Rgb = [
+                [160, 100, 58],
+                [216, 216, 222],
+                [250, 214, 64],
+                [86, 224, 212],
+            ][tier];
+            sprite(|x, y| {
+                armor_shape(piece, x, y).then(|| {
+                    if x + y < 14.0 {
+                        scale(color, 1.15)
+                    } else {
+                        color
+                    }
+                })
+            })
+        }
+        _ => {
+            let tool = t as usize - Tex::WoodenPickaxe as usize;
+            let (kind, tier) = (tool / 5, tool % 5);
+            let head: [Rgb; 5] = [
+                [150, 116, 65],
+                [128, 128, 130],
+                [222, 222, 226],
+                [250, 222, 70],
+                [80, 226, 210],
+            ];
+            let shape: fn(f32, f32) -> bool = match kind {
+                // Pickaxe: a curved head across the top of the handle.
+                0 => |s, t| (s - 11.4 + 0.08 * t * t).abs() < 1.1 && t.abs() < 6.6,
+                // Axe: a rounded blade on one side.
+                1 => |s, t| {
+                    ((s - 11.6) / 3.1).powi(2) + ((t + 2.2) / 2.9).powi(2) < 1.0
+                        || ((9.2..14.0).contains(&s) && (-1.2..0.9).contains(&t))
+                },
+                // Shovel: an oval blade on the end.
+                2 => |s, t| ((s - 12.6) / 3.3).powi(2) + (t / 2.3).powi(2) < 1.0,
+                // Sword: a long tapering blade with a cross guard.
+                _ => |s, t| {
+                    ((4.6..16.6).contains(&s) && t.abs() < 1.2f32.min((16.8 - s) * 0.9))
+                        || ((3.4..4.6).contains(&s) && t.abs() < 3.0)
+                },
+            };
+            tool_sprite(Some((head[tier], kind == 3)), shape)
+        }
+    }
+}
+
+/// A cut of meat (a lump with a streak of fat).
+fn meat(r: &mut Rng, base: Rgb, fat: Rgb) -> Img {
+    let mut img = lump(r, base, scale(base, 1.15), 5.0);
+    for i in 0..6 {
+        let (x, y) = (5 + i, 10 - i / 2);
+        if img.get(x, y)[3] != 0 {
+            img.set(x, y, fat, 255);
+        }
+    }
+    img
+}
+
+/// Eyes on a mob face, `y` rows down.
+fn face_eyes(img: &mut Img, y: usize) {
+    for (x, c) in [
+        (3, [240, 240, 240]),
+        (4, [20, 20, 20]),
+        (11, [20, 20, 20]),
+        (12, [240, 240, 240]),
+    ] {
+        img.set(x, y, c, 255);
+        img.set(x, y + 1, c, 255);
+    }
+}
+
+/// Armor piece silhouettes: 0 helmet, 1 chestplate, 2 leggings, 3 boots.
+fn armor_shape(piece: usize, x: f32, y: f32) -> bool {
+    let (x, y) = (x as i32, y as i32);
+    match piece {
+        0 => {
+            let dome = (3..11).contains(&y) && (x - 7).abs() + (x - 8).abs() <= 11;
+            let face = (7..11).contains(&y) && (4..12).contains(&x);
+            dome && (2..14).contains(&x) && !face
+        }
+        1 => {
+            let shoulders = (2..6).contains(&y) && (1..15).contains(&x);
+            let body = (5..14).contains(&y) && (3..13).contains(&x);
+            let neck = (2..4).contains(&y) && (6..10).contains(&x);
+            (shoulders || body) && !neck
+        }
+        2 => {
+            let waist = (2..5).contains(&y) && (3..13).contains(&x);
+            let legs = (5..14).contains(&y) && ((3..7).contains(&x) || (9..13).contains(&x));
+            waist || legs
+        }
+        _ => {
+            let shafts = (6..12).contains(&y) && ((2..6).contains(&x) || (10..14).contains(&x));
+            let toes = (11..14).contains(&y) && ((1..7).contains(&x) || (9..15).contains(&x));
+            shafts || toes
+        }
+    }
+}
+
+fn planks(r: &mut Rng, base: Rgb) -> Img {
+    let mut img = noisy(r, base, 0.05, 0);
+    for board in 0..4 {
+        let joint = r.below(16);
+        for x in 0..TEX_SIZE {
+            for dy in 0..4 {
+                let y = board * 4 + dy;
+                if dy == 3 {
+                    img.shade(x, y, 0.62);
+                } else if x == joint {
+                    img.shade(x, y, 0.7);
+                } else if r.f() < 0.12 {
+                    img.shade(x, y, 0.9);
+                }
+            }
+        }
+    }
+    img
+}
+
+/// Rounded stones with dark mortar between them (Voronoi cells on a wrapping 16x16 tile).
+fn cobblestone(r: &mut Rng) -> Img {
+    let seeds: Vec<(f32, f32, f32)> = (0..10)
+        .map(|_| (r.f() * 16.0, r.f() * 16.0, 0.8 + r.f() * 0.4))
+        .collect();
+    let mut img = noisy(r, [124, 124, 126], 0.06, 0);
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            let mut d = [(f32::MAX, 1.0f32); 2];
+            for &(sx, sy, shade) in &seeds {
+                let dx = (x as f32 + 0.5 - sx).abs();
+                let dy = (y as f32 + 0.5 - sy).abs();
+                let (dx, dy) = (dx.min(16.0 - dx), dy.min(16.0 - dy));
+                let dist = (dx * dx + dy * dy).sqrt();
+                if dist < d[0].0 {
+                    d[1] = d[0];
+                    d[0] = (dist, shade);
+                } else if dist < d[1].0 {
+                    d[1] = (dist, shade);
+                }
+            }
+            if d[1].0 - d[0].0 < 0.9 {
+                img.set(x, y, [70, 70, 72], 0);
+            } else {
+                img.shade(x, y, d[0].1);
+            }
+        }
+    }
+    img
+}
+
+/// A sprite from a per-pixel colour function (pixel centres), with a dark outline.
+fn sprite(color: impl Fn(f32, f32) -> Option<Rgb>) -> Img {
+    let mut img = Img {
+        px: vec![[0; 4]; TEX_SIZE * TEX_SIZE],
+    };
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            if let Some(c) = color(x as f32 + 0.5, y as f32 + 0.5) {
+                img.set(x, y, c, 255);
+            }
+        }
+    }
+    outline(&mut img);
+    img
+}
+
+/// Gives every transparent pixel next to an opaque one a dark version of its colour.
+fn outline(img: &mut Img) {
+    let src = img.clone();
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            if src.get(x, y)[3] != 0 {
+                continue;
+            }
+            let neighbours = [(1, 0), (-1, 0), (0, 1), (0, -1)].map(|(dx, dy)| {
+                let (nx, ny) = (x as i32 + dx, y as i32 + dy);
+                ((0..16).contains(&nx) && (0..16).contains(&ny))
+                    .then(|| src.get(nx as usize, ny as usize))
+                    .filter(|p| p[3] != 0)
+            });
+            if let Some(p) = neighbours.iter().flatten().next() {
+                img.set(x, y, scale([p[0], p[1], p[2]], 0.3), 255);
+            }
+        }
+    }
+}
+
+/// A stick from the bottom left towards the top right, plus an optional head:
+/// `shape(s, t)` with s along the handle and t across it (positive towards bottom right).
+fn tool_sprite(head: Option<(Rgb, bool)>, shape: fn(f32, f32) -> bool) -> Img {
+    let h = std::f32::consts::FRAC_1_SQRT_2;
+    sprite(|x, y| {
+        let (px, py) = (x - 2.0, y - 14.0);
+        let (s, t) = ((px - py) * h, (px + py) * h);
+        let shade = |c: Rgb| {
+            if t < -0.35 {
+                scale(c, 1.18)
+            } else if t > 0.6 {
+                scale(c, 0.78)
+            } else {
+                c
+            }
+        };
+        if let Some((color, _)) = head
+            && shape(s, t)
+        {
+            return Some(shade(color));
+        }
+        let length = match head {
+            None => 15.2,
+            Some((_, true)) => 3.4,
+            Some(_) => 12.5,
+        };
+        ((0.3..length).contains(&s) && t.abs() < 0.8).then(|| shade([137, 103, 39]))
+    })
+}
+
+/// A rough lump (coal, raw ore) with lighter flecks.
+fn lump(r: &mut Rng, base: Rgb, fleck: Rgb, radius: f32) -> Img {
+    let bumps: Vec<f32> = (0..8).map(|_| r.f() * 1.4).collect();
+    let flecks: Vec<(usize, usize)> = (0..9).map(|_| (3 + r.below(10), 3 + r.below(10))).collect();
+    let noise: Vec<f32> = (0..256).map(|_| r.signed()).collect();
+    let mut img = sprite(|x, y| {
+        let (dx, dy) = (x - 8.0, y - 8.0);
+        let a = dy.atan2(dx) / std::f32::consts::TAU * 8.0 + 4.0;
+        let bump = bumps[(a as usize) % 8];
+        if (dx * dx + dy * dy).sqrt() > radius + bump {
+            return None;
+        }
+        let i = (y as usize) * 16 + x as usize;
+        Some(scale(base, 1.0 + noise[i] * 0.08 - dy * 0.02))
+    });
+    for (x, y) in flecks {
+        if img.get(x, y)[3] != 0 && img.get(x, y)[0] != scale(base, 0.3)[0] {
+            img.set(x, y, fleck, 255);
+        }
+    }
+    img
+}
+
+/// A metal bar seen from slightly above.
+fn ingot(base: Rgb) -> Img {
+    sprite(|x, y| {
+        let (x, y) = (x as i32, y as i32);
+        let top = (6..8).contains(&y) && (4 + (7 - y)..=12 + (7 - y)).contains(&x);
+        let front = (8..12).contains(&y) && (2..=11).contains(&x);
+        let side = (6..11).contains(&y) && (12..=13).contains(&x) && x - 12 <= y - 6;
+        if top {
+            Some(scale(base, 1.15))
+        } else if front {
+            Some(if y == 11 { scale(base, 0.8) } else { base })
+        } else if side {
+            Some(scale(base, 0.7))
+        } else {
+            None
+        }
+    })
+}

@@ -1,0 +1,1303 @@
+//! Vulkan renderer.
+//!
+//! # Large-world precision
+//! All world positions are `f64` (`DVec3`). The GPU only ever works in f32 *relative to the
+//! camera*: each frame, for every draw, we compute `origin - camera_position` in f64 on the CPU
+//! and bake that (now small) offset into the MVP matrix. Geometry near the camera therefore
+//! always has full precision, whether the camera is at the world origin or 10 light-years away.
+//! The view matrix contains rotation only - the camera is always at the origin in render space.
+//!
+//! # Streaming
+//! Meshes can be created and destroyed every frame without stalling: uploads are recorded at
+//! the start of the next frame's command buffer, and freed buffers are kept alive until the
+//! GPU has finished every frame that might still use them.
+
+mod arena;
+pub mod atmosphere;
+mod buffer;
+mod context;
+pub mod font;
+mod frustum;
+mod mesh;
+mod pipeline;
+mod starfield;
+mod swapchain;
+mod texture;
+
+use std::{
+    mem::ManuallyDrop,
+    path::{Path, PathBuf},
+    slice,
+    sync::Arc,
+    time::Instant,
+};
+
+use anyhow::{Result, ensure};
+use ash::vk;
+use bytemuck::{Pod, Zeroable};
+use glam::{DVec3, Mat3, Mat4, Vec3, Vec4};
+use gpu_allocator::{
+    MemoryLocation,
+    vulkan::{Allocator, AllocatorCreateDesc},
+};
+use winit::window::Window;
+
+use crate::camera::Camera;
+use arena::{ArenaAlloc, StagingRing, VertexArena};
+use atmosphere::{Atmosphere, AtmosphereLuts};
+use buffer::Buffer;
+use context::VulkanContext;
+use frustum::Frustum;
+use mesh::{GpuMesh, PushConstants};
+use pipeline::{BINDINGS, PUSH_STAGES, Pipelines};
+use swapchain::{
+    ColorTarget, DepthBuffer, Swapchain, color_subresource_range, depth_subresource_range,
+};
+use texture::Texture;
+
+pub use mesh::{BlockVertex, ChunkMesh, DrawItem, Fade, MeshHandle, UiVertex};
+pub use texture::TextureArrayData;
+
+/// How many frames the CPU may record ahead of the GPU.
+const FRAMES_IN_FLIGHT: usize = 2;
+/// Every mesh is a list of quads, so a single shared index buffer
+/// (0,1,2, 0,2,3, 4,5,6, 4,6,7, ...) serves all of them.
+const MAX_QUADS_PER_DRAW: u32 = 1 << 17;
+/// Overlay vertices per frame (4 per quad).
+const MAX_UI_VERTICES: usize = 1 << 16;
+
+/// Per-frame scene parameters. Directions are in the world (= planet body) frame.
+pub struct FrameParams {
+    /// Camera position relative to the planet centre.
+    pub camera_planet: DVec3,
+    /// Direction towards the sun.
+    pub sun_dir: Vec3,
+    pub sun_angular_radius: f32,
+    /// Sun illuminance above the atmosphere. All scene radiance is in these units; the
+    /// exposure maps it to the display.
+    pub sun_illuminance: Vec3,
+    /// Planet body frame -> inertial frame (orients the star field).
+    pub star_rotation: Mat3,
+    pub exposure: f32,
+    /// Extra star brightness (artistic: stars stand out more in space).
+    pub star_boost: f32,
+    /// Atmosphere and sky; off underground (dark background and cave fog instead).
+    pub sky: bool,
+    /// Underground fog: colour and distance.
+    pub cave_fog: Vec4,
+    /// Starlight / airglow illuminance, so nights aren't pitch black.
+    pub night_ambient: f32,
+    /// Seconds, for animated effects.
+    pub time: f32,
+    /// LOD fragments closer than this are discarded (real chunks cover that area), and chunk
+    /// water fragments further away (LOD water covers that). Infinity when LOD is off.
+    pub far_discard_radius: f32,
+    /// The block the player is looking at (outlined).
+    pub target: Option<BlockTarget>,
+}
+
+/// The targeted block, for the outline drawn by `block.frag`.
+pub struct BlockTarget {
+    /// Maps a camera-relative position into the block's local box, [-1, 1]^3 inside.
+    pub local_from_camera: Mat4,
+    /// Survival mining progress, 0..1 (darkens the block).
+    pub progress: f32,
+}
+
+/// Uniform buffer contents (std140); must match `Frame` in `shaders/atmosphere.glsl`.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct FrameUniforms {
+    inv_view_proj: Mat4,
+    star_rotation: Mat4,
+    camera: Vec4,
+    sun: Vec4,
+    sun_color: Vec4,
+    radii: Vec4,
+    rayleigh: Vec4,
+    mie: Vec4,
+    ozone: Vec4,
+    misc: Vec4,
+    cave: Vec4,
+    target: Mat4,
+    target_info: Vec4,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RenderStats {
+    pub chunks_drawn: usize,
+    pub chunks_culled: usize,
+    pub far_drawn: usize,
+    /// Time the CPU spent waiting for the GPU to finish an older frame (high = GPU-bound).
+    pub gpu_wait_ms: f32,
+}
+
+#[derive(Clone, Copy)]
+struct Frame {
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    image_available: vk::Semaphore,
+    in_flight: vk::Fence,
+}
+
+struct PendingUpload {
+    src_offset: vk::DeviceSize,
+    dst: ArenaAlloc,
+}
+
+/// Staging space per frame in flight; caps how much mesh data is uploaded per frame.
+const STAGING_BYTES_PER_FRAME: usize = 24 << 20;
+
+pub struct Renderer {
+    ctx: VulkanContext,
+    allocator: ManuallyDrop<Allocator>,
+    swapchain: Swapchain,
+    depth: DepthBuffer,
+    /// The scene is rendered here (HDR), then composited into the swapchain.
+    hdr: ColorTarget,
+    pipelines: Pipelines,
+    texture: Texture,
+    /// Transmittance, multiple scattering and sky irradiance LUTs, and the galaxy map.
+    luts: [Texture; 4],
+    atmosphere: Atmosphere,
+    /// One uniform buffer and descriptor set per frame in flight.
+    frame_uniforms: Vec<Buffer>,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+    quad_indices: Buffer,
+    /// Font atlas for the overlay, and the overlay's vertices (one buffer per frame).
+    font: Texture,
+    ui_buffers: Vec<Buffer>,
+
+    frames: Vec<Frame>,
+    /// Vertex blocks to free once the matching frame slot's fence has signalled.
+    garbage: Vec<Vec<ArenaAlloc>>,
+    frame_index: usize,
+    upload_pool: vk::CommandPool,
+
+    arena: VertexArena,
+    staging: Vec<StagingRing>,
+    /// Whether `staging[frame_index]` has been made safe to write this frame.
+    staging_ready: bool,
+    meshes: Vec<Option<GpuMesh>>,
+    free_mesh_slots: Vec<usize>,
+    pending_uploads: Vec<PendingUpload>,
+    needs_resize: bool,
+    capture_request: Option<PathBuf>,
+
+    // Declared last so it's dropped after the Vulkan surface is destroyed.
+    window: Arc<Window>,
+}
+
+impl Renderer {
+    pub fn new(
+        window: Arc<Window>,
+        textures: &TextureArrayData,
+        atmosphere: &Atmosphere,
+        atmosphere_luts: &AtmosphereLuts,
+    ) -> Result<Self> {
+        let ctx = VulkanContext::new(&window)?;
+        let device = &ctx.device;
+
+        let mut allocator = Allocator::new(&AllocatorCreateDesc {
+            instance: ctx.instance.clone(),
+            device: device.clone(),
+            physical_device: ctx.physical_device,
+            debug_settings: Default::default(),
+            buffer_device_address: false,
+            allocation_sizes: Default::default(),
+        })?;
+
+        let swapchain = Swapchain::new(&ctx, window.inner_size(), vk::SwapchainKHR::null())?;
+        let depth = DepthBuffer::new(device, &mut allocator, swapchain.extent)?;
+        let hdr = ColorTarget::new(device, &mut allocator, swapchain.extent)?;
+        let pipelines = Pipelines::new(device, ColorTarget::FORMAT, swapchain.format)?;
+
+        let upload_pool = unsafe {
+            device.create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+                    .queue_family_index(ctx.queue_family),
+                None,
+            )?
+        };
+
+        let texture = Texture::new_array(&ctx, &mut allocator, upload_pool, textures)?;
+        let lut = |allocator: &mut Allocator, lut, name| {
+            Texture::new_lut(&ctx, allocator, upload_pool, lut, name)
+        };
+        let luts = [
+            lut(
+                &mut allocator,
+                &atmosphere_luts.transmittance,
+                "transmittance lut",
+            )?,
+            lut(
+                &mut allocator,
+                &atmosphere_luts.multiscattering,
+                "multiple scattering lut",
+            )?,
+            lut(
+                &mut allocator,
+                &atmosphere_luts.irradiance,
+                "irradiance lut",
+            )?,
+            lut(&mut allocator, &starfield::galaxy_map(), "galaxy map")?,
+        ];
+        let frame_uniforms = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                Buffer::new(
+                    device,
+                    &mut allocator,
+                    "frame uniforms",
+                    size_of::<FrameUniforms>() as u64,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let font = Texture::new_2d(
+            &ctx,
+            &mut allocator,
+            upload_pool,
+            font::ATLAS_SIZE,
+            vk::Format::R8G8B8A8_UNORM,
+            &font::atlas(),
+            vk::Filter::NEAREST,
+            "font",
+        )?;
+        let ui_buffers = (0..FRAMES_IN_FLIGHT)
+            .map(|_| {
+                Buffer::new(
+                    device,
+                    &mut allocator,
+                    "ui vertices",
+                    (MAX_UI_VERTICES * size_of::<UiVertex>()) as u64,
+                    vk::BufferUsageFlags::VERTEX_BUFFER,
+                    MemoryLocation::CpuToGpu,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (descriptor_pool, descriptor_sets) = create_descriptors(device, &pipelines)?;
+        let quad_indices = create_quad_index_buffer(&ctx, &mut allocator, upload_pool)?;
+
+        let frames = (0..FRAMES_IN_FLIGHT)
+            .map(|_| -> Result<Frame> {
+                unsafe {
+                    let pool_info = vk::CommandPoolCreateInfo::default()
+                        .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+                        .queue_family_index(ctx.queue_family);
+                    let command_pool = device.create_command_pool(&pool_info, None)?;
+                    let alloc_info = vk::CommandBufferAllocateInfo::default()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1);
+                    let command_buffer = device.allocate_command_buffers(&alloc_info)?[0];
+                    let image_available =
+                        device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?;
+                    let in_flight = device.create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )?;
+                    Ok(Frame {
+                        command_pool,
+                        command_buffer,
+                        image_available,
+                        in_flight,
+                    })
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let staging = (0..FRAMES_IN_FLIGHT)
+            .map(|_| StagingRing::new(device, &mut allocator, STAGING_BYTES_PER_FRAME))
+            .collect::<Result<Vec<_>>>()?;
+
+        let renderer = Self {
+            ctx,
+            allocator: ManuallyDrop::new(allocator),
+            swapchain,
+            depth,
+            hdr,
+            pipelines,
+            texture,
+            luts,
+            atmosphere: *atmosphere,
+            frame_uniforms,
+            descriptor_pool,
+            descriptor_sets,
+            quad_indices,
+            font,
+            ui_buffers,
+            frames,
+            garbage: (0..FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect(),
+            frame_index: 0,
+            upload_pool,
+            arena: VertexArena::new(),
+            staging,
+            staging_ready: false,
+            meshes: Vec::new(),
+            free_mesh_slots: Vec::new(),
+            pending_uploads: Vec::new(),
+            needs_resize: false,
+            capture_request: None,
+            window,
+        };
+        renderer.write_descriptors();
+        Ok(renderer)
+    }
+
+    /// Points every frame's descriptor set at the current resources (again after a resize,
+    /// which recreates the HDR target and the depth buffer).
+    fn write_descriptors(&self) {
+        let image = |view, layout| {
+            [vk::DescriptorImageInfo {
+                sampler: vk::Sampler::null(),
+                image_view: view,
+                image_layout: layout,
+            }]
+        };
+        let sampler = |sampler| {
+            [vk::DescriptorImageInfo {
+                sampler,
+                image_view: vk::ImageView::null(),
+                image_layout: vk::ImageLayout::UNDEFINED,
+            }]
+        };
+        let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let images = [
+            (0, image(self.texture.view, read_only)),
+            (1, sampler(self.texture.sampler)),
+            (2, sampler(self.luts[0].sampler)),
+            (3, image(self.luts[0].view, read_only)),
+            (4, image(self.luts[1].view, read_only)),
+            (5, image(self.luts[2].view, read_only)),
+            (7, image(self.hdr.view, read_only)),
+            (9, image(self.luts[3].view, read_only)),
+            (10, image(self.font.view, read_only)),
+            (
+                8,
+                image(self.depth.view, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
+            ),
+        ];
+        for (set, uniforms) in self.descriptor_sets.iter().zip(&self.frame_uniforms) {
+            let buffer = [vk::DescriptorBufferInfo {
+                buffer: uniforms.handle,
+                offset: 0,
+                range: size_of::<FrameUniforms>() as u64,
+            }];
+            let mut writes: Vec<_> = images
+                .iter()
+                .map(|(binding, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(*set)
+                        .dst_binding(*binding)
+                        .descriptor_type(BINDINGS[*binding as usize].0)
+                        .image_info(info)
+                })
+                .collect();
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(6)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .buffer_info(&buffer),
+            );
+            unsafe { self.ctx.device.update_descriptor_sets(&writes, &[]) };
+        }
+    }
+
+    /// Call when the window was resized; the swapchain is rebuilt before the next frame.
+    pub fn resize(&mut self) {
+        self.needs_resize = true;
+    }
+
+    /// Swapchain size in pixels.
+    pub fn screen_size(&self) -> (f32, f32) {
+        let e = self.swapchain.extent;
+        (e.width as f32, e.height as f32)
+    }
+
+    pub fn aspect_ratio(&self) -> f32 {
+        self.swapchain.extent.width as f32 / self.swapchain.extent.height.max(1) as f32
+    }
+
+    /// Creates a GPU mesh. Returns immediately; the data is copied to VRAM at the start of
+    /// the next rendered frame (before any draws), so the mesh is usable right away.
+    ///
+    /// Returns `Ok(None)` if this frame's upload budget is used up - try again next frame.
+    pub fn create_mesh(&mut self, mesh: &ChunkMesh) -> Result<Option<MeshHandle>> {
+        let opaque_quads = (mesh.opaque.len() / 4) as u32;
+        let water_quads = (mesh.water.len() / 4) as u32;
+        let cutout_quads = (mesh.cutout.len() / 4) as u32;
+        ensure!(
+            opaque_quads + water_quads + cutout_quads > 0,
+            "cannot create an empty mesh"
+        );
+        ensure!(
+            opaque_quads.max(water_quads).max(cutout_quads) <= MAX_QUADS_PER_DRAW,
+            "mesh too large"
+        );
+
+        let opaque_bytes: &[u8] = bytemuck::cast_slice(&mesh.opaque);
+        let water_bytes: &[u8] = bytemuck::cast_slice(&mesh.water);
+        let cutout_bytes: &[u8] = bytemuck::cast_slice(&mesh.cutout);
+        let size = (opaque_bytes.len() + water_bytes.len() + cutout_bytes.len()) as vk::DeviceSize;
+
+        self.prepare_staging()?;
+        let Some(src_offset) =
+            self.staging[self.frame_index].push(&[opaque_bytes, water_bytes, cutout_bytes])?
+        else {
+            return Ok(None);
+        };
+        let alloc = self
+            .arena
+            .alloc(&self.ctx.device, &mut self.allocator, size)?;
+        self.pending_uploads.push(PendingUpload {
+            src_offset,
+            dst: alloc,
+        });
+
+        let gpu = GpuMesh {
+            alloc,
+            opaque_quads,
+            water_quads,
+            cutout_quads,
+            scale: mesh.scale,
+        };
+        let slot = match self.free_mesh_slots.pop() {
+            Some(slot) => {
+                self.meshes[slot] = Some(gpu);
+                slot
+            }
+            None => {
+                self.meshes.push(Some(gpu));
+                self.meshes.len() - 1
+            }
+        };
+        Ok(Some(MeshHandle(slot)))
+    }
+
+    /// Destroys a mesh. Its memory is released once in-flight frames no longer use it.
+    pub fn destroy_mesh(&mut self, handle: MeshHandle) {
+        if let Some(mesh) = self.meshes.get_mut(handle.0).and_then(Option::take) {
+            self.garbage[self.frame_index].push(mesh.alloc);
+            self.free_mesh_slots.push(handle.0);
+        }
+    }
+
+    /// (live mesh bytes, VRAM reserved for meshes) - for stats.
+    pub fn mesh_memory(&self) -> (u64, u64) {
+        (self.arena.used_bytes, self.arena.allocated_bytes())
+    }
+
+    /// Makes this frame slot's staging ring writable: the GPU must have finished the frame
+    /// that used it last.
+    fn prepare_staging(&mut self) -> Result<()> {
+        if !self.staging_ready {
+            let fence = self.frames[self.frame_index].in_flight;
+            unsafe { self.ctx.device.wait_for_fences(&[fence], true, u64::MAX)? };
+            self.staging[self.frame_index].reset();
+            self.staging_ready = true;
+        }
+        Ok(())
+    }
+
+    /// Renders one frame: chunk meshes (frustum culled), far terrain, models and dropped items
+    /// (`objects`), then translucent water.
+    pub fn render(
+        &mut self,
+        camera: &Camera,
+        params: &FrameParams,
+        chunks: &[DrawItem],
+        far: &[DrawItem],
+        objects: &[DrawItem],
+        ui: &[UiVertex],
+    ) -> Result<RenderStats> {
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(RenderStats::default()); // minimized
+        }
+        if self.needs_resize {
+            self.recreate_swapchain()?;
+        }
+
+        let frame = self.frames[self.frame_index];
+        let wait_start = Instant::now();
+        unsafe {
+            self.ctx
+                .device
+                .wait_for_fences(&[frame.in_flight], true, u64::MAX)?
+        };
+        let gpu_wait_ms = wait_start.elapsed().as_secs_f32() * 1000.0;
+
+        // The GPU is done with everything submitted in this slot two frames ago.
+        for alloc in self.garbage[self.frame_index].drain(..) {
+            self.arena.free(alloc);
+        }
+        let uniforms = self.frame_uniforms(camera, params);
+        self.frame_uniforms[self.frame_index].write(0, bytemuck::bytes_of(&uniforms))?;
+        let ui_len = ui.len().min(MAX_UI_VERTICES) / 4 * 4;
+        self.ui_buffers[self.frame_index].write(0, bytemuck::cast_slice(&ui[..ui_len]))?;
+
+        let image_index = match unsafe {
+            self.ctx.swapchain_loader.acquire_next_image(
+                self.swapchain.handle,
+                u64::MAX,
+                frame.image_available,
+                vk::Fence::null(),
+            )
+        } {
+            Ok((index, suboptimal)) => {
+                self.needs_resize |= suboptimal;
+                index as usize
+            }
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.needs_resize = true;
+                return Ok(RenderStats::default());
+            }
+            Err(e) => return Err(e.into()),
+        };
+
+        let cmd = frame.command_buffer;
+        unsafe {
+            let device = &self.ctx.device;
+            // Only reset the fence once we know we'll submit work that signals it.
+            device.reset_fences(&[frame.in_flight])?;
+            device.reset_command_pool(frame.command_pool, vk::CommandPoolResetFlags::empty())?;
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+        }
+        self.record_uploads(cmd);
+        let capture = match self.capture_request.take() {
+            Some(path) => {
+                let extent = self.swapchain.extent;
+                let buffer = Buffer::new(
+                    &self.ctx.device,
+                    &mut self.allocator,
+                    "screenshot",
+                    extent.width as u64 * extent.height as u64 * 4,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    MemoryLocation::GpuToCpu,
+                )?;
+                Some((path, buffer))
+            }
+            None => None,
+        };
+        let mut stats = self.record_scene(
+            cmd,
+            image_index,
+            camera,
+            params,
+            chunks,
+            far,
+            objects,
+            ui_len as u32 / 4,
+            capture.as_ref().map(|c| c.1.handle),
+        );
+        stats.gpu_wait_ms = gpu_wait_ms;
+        unsafe { self.ctx.device.end_command_buffer(cmd)? };
+
+        let render_finished = self.swapchain.render_finished[image_index];
+        unsafe {
+            let wait = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(frame.image_available)
+                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)];
+            let signal = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(render_finished)
+                .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)];
+            let cmd_info = [vk::CommandBufferSubmitInfo::default().command_buffer(cmd)];
+            let submit = vk::SubmitInfo2::default()
+                .wait_semaphore_infos(&wait)
+                .command_buffer_infos(&cmd_info)
+                .signal_semaphore_infos(&signal);
+            self.ctx
+                .device
+                .queue_submit2(self.ctx.queue, &[submit], frame.in_flight)?;
+        }
+
+        if let Some((path, mut buffer)) = capture {
+            unsafe {
+                self.ctx
+                    .device
+                    .wait_for_fences(&[frame.in_flight], true, u64::MAX)?
+            };
+            let extent = self.swapchain.extent;
+            let rgba_order = matches!(
+                self.swapchain.format,
+                vk::Format::R8G8B8A8_SRGB | vk::Format::R8G8B8A8_UNORM
+            );
+            let result = match buffer.read() {
+                Some(pixels) => write_bmp(&path, extent.width, extent.height, pixels, rgba_order),
+                None => Err(anyhow::anyhow!("screenshot buffer is not mapped")),
+            };
+            buffer.destroy(&self.ctx.device, &mut self.allocator);
+            match result {
+                Ok(()) => log::info!("saved screenshot to {}", path.display()),
+                Err(e) => log::error!("screenshot failed: {e:#}"),
+            }
+        }
+
+        let wait_semaphores = [render_finished];
+        let swapchains = [self.swapchain.handle];
+        let image_indices = [image_index as u32];
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&wait_semaphores)
+            .swapchains(&swapchains)
+            .image_indices(&image_indices);
+        match unsafe {
+            self.ctx
+                .swapchain_loader
+                .queue_present(self.ctx.queue, &present_info)
+        } {
+            Ok(false) => {}
+            Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.needs_resize = true,
+            Err(e) => return Err(e.into()),
+        }
+
+        self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
+        self.staging_ready = false;
+        Ok(stats)
+    }
+
+    /// Copies pending mesh data into VRAM; the barrier makes it visible to vertex input.
+    fn record_uploads(&mut self, cmd: vk::CommandBuffer) {
+        if self.pending_uploads.is_empty() {
+            return;
+        }
+        let device = &self.ctx.device;
+        let staging = self.staging[self.frame_index].handle();
+        for upload in self.pending_uploads.drain(..) {
+            let region = vk::BufferCopy {
+                src_offset: upload.src_offset,
+                dst_offset: upload.dst.offset,
+                size: upload.dst.size,
+            };
+            unsafe {
+                device.cmd_copy_buffer(cmd, staging, self.arena.buffer(upload.dst.page), &[region])
+            };
+        }
+        let barrier = [vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT)
+            .dst_access_mask(vk::AccessFlags2::VERTEX_ATTRIBUTE_READ)];
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().memory_barriers(&barrier),
+            );
+        }
+    }
+
+    fn frame_uniforms(&self, camera: &Camera, params: &FrameParams) -> FrameUniforms {
+        let a = &self.atmosphere;
+        let view_proj = camera.view_projection(self.aspect_ratio());
+        let pixel_angle = camera.fov_y / self.swapchain.extent.height.max(1) as f32;
+        FrameUniforms {
+            inv_view_proj: view_proj.inverse(),
+            star_rotation: Mat4::from_mat3(params.star_rotation),
+            camera: params.camera_planet.as_vec3().extend(params.exposure),
+            sun: params.sun_dir.extend(params.sun_angular_radius.cos()),
+            sun_color: params
+                .sun_illuminance
+                .extend(if params.sky { 1.0 } else { 0.0 }),
+            radii: Vec4::new(a.bottom_radius, a.top_radius, params.time, pixel_angle),
+            rayleigh: a.rayleigh_scattering.extend(a.rayleigh_scale_height),
+            mie: Vec4::new(
+                a.mie_scattering,
+                a.mie_extinction,
+                a.mie_scale_height,
+                a.mie_g,
+            ),
+            ozone: a.ozone_absorption.extend(a.ozone_center),
+            misc: Vec4::new(
+                a.ozone_half_width,
+                a.ground_albedo,
+                params.night_ambient,
+                params.star_boost,
+            ),
+            cave: params.cave_fog,
+            target: params
+                .target
+                .as_ref()
+                .map_or(Mat4::ZERO, |t| t.local_from_camera),
+            target_info: params
+                .target
+                .as_ref()
+                .map_or(Vec4::ZERO, |t| Vec4::new(1.0, t.progress, 0.0, 0.0)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_scene(
+        &self,
+        cmd: vk::CommandBuffer,
+        image_index: usize,
+        camera: &Camera,
+        params: &FrameParams,
+        chunks: &[DrawItem],
+        far: &[DrawItem],
+        objects: &[DrawItem],
+        ui_quads: u32,
+        capture: Option<vk::Buffer>,
+    ) -> RenderStats {
+        let device = &self.ctx.device;
+        let extent = self.swapchain.extent;
+        let image = self.swapchain.images[image_index];
+        let view_proj = camera.view_projection(self.aspect_ratio());
+        let frustum = Frustum::from_view_projection(view_proj);
+        let mut stats = RenderStats::default();
+
+        // ---- Culling ------------------------------------------------------------------
+        // (distance, mesh slot, camera-relative origin, fade). Subtracting in f64 *then*
+        // converting to f32 is what keeps huge worlds precise.
+        let mut visible_chunks = Vec::with_capacity(chunks.len());
+        for draw in chunks {
+            let rel = (draw.origin - camera.position).as_vec3();
+            if self.meshes.get(draw.mesh.0).is_some_and(Option::is_some)
+                && frustum.sphere_visible(rel, draw.radius)
+            {
+                visible_chunks.push((rel.length(), draw.mesh.0, rel, draw.fade));
+            } else {
+                stats.chunks_culled += 1;
+            }
+        }
+        // Front-to-back so early depth testing rejects hidden fragments.
+        visible_chunks.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        stats.chunks_drawn = visible_chunks.len();
+
+        // Models and dropped items (only those whose mesh is uploaded).
+        let visible_objects: Vec<(usize, Vec3)> = objects
+            .iter()
+            .filter_map(|d| {
+                let rel = (d.origin - camera.position).as_vec3();
+                (self.meshes.get(d.mesh.0).is_some_and(Option::is_some)
+                    && frustum.sphere_visible(rel, d.radius))
+                .then_some((d.mesh.0, rel))
+            })
+            .collect();
+
+        let mut visible_far: Vec<(f32, usize, Vec3, Fade)> = far
+            .iter()
+            .filter_map(|d| {
+                let rel = (d.origin - camera.position).as_vec3();
+                frustum.sphere_visible(rel, d.radius).then_some((
+                    rel.length(),
+                    d.mesh.0,
+                    rel,
+                    d.fade,
+                ))
+            })
+            .collect();
+        visible_far.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        stats.far_drawn = visible_far.len();
+
+        let push_for = |rel: Vec3, scale: f32, clip: [f32; 2], fade: Fade| {
+            let (progress, direction) = fade.shader();
+            PushConstants {
+                mvp: view_proj * Mat4::from_translation(rel),
+                offset: rel.extend(clip[0]),
+                params: Vec4::new(scale, clip[1], progress, direction),
+            }
+        };
+
+        unsafe {
+            // Transition the HDR target + depth buffer into attachment layouts. Both are
+            // shared between frames in flight, so the barriers also order us after the
+            // previous frame's writes and its atmosphere pass reading them.
+            let to_attachment = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT
+                            | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    )
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(self.hdr.image)
+                    .subresource_range(color_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                    )
+                    .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    )
+                    .dst_access_mask(
+                        vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                    )
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .image(self.depth.image)
+                    .subresource_range(depth_subresource_range()),
+            ];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_attachment),
+            );
+
+            let color_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(self.hdr.view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                });
+            // Depth is kept: the atmosphere pass needs the distance to every pixel.
+            let depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(self.depth.view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    // Reverse-Z: 0.0 is infinitely far away.
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 0.0,
+                        stencil: 0,
+                    },
+                });
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent,
+                })
+                .layer_count(1)
+                .color_attachments(slice::from_ref(&color_attachment))
+                .depth_attachment(&depth_attachment);
+            device.cmd_begin_rendering(cmd, &rendering_info);
+
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            device.cmd_set_viewport(cmd, 0, &[viewport]);
+            device.cmd_set_scissor(
+                cmd,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent,
+                }],
+            );
+
+            let layout = self.pipelines.layout;
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[self.descriptor_sets[self.frame_index]],
+                &[],
+            );
+            device.cmd_bind_index_buffer(cmd, self.quad_indices.handle, 0, vk::IndexType::UINT32);
+
+            // `clip`: [inner, outer] discard radii (clip pipelines only).
+            let draw = |slot: usize, rel: Vec3, section: Section, clip: [f32; 2], fade: Fade| {
+                let Some(Some(mesh)) = self.meshes.get(slot) else {
+                    return;
+                };
+                let (quads, first_vertex) = match section {
+                    Section::Opaque => (mesh.opaque_quads, 0),
+                    Section::Water => (mesh.water_quads, mesh.opaque_quads * 4),
+                    Section::Cutout => (
+                        mesh.cutout_quads,
+                        (mesh.opaque_quads + mesh.water_quads) * 4,
+                    ),
+                };
+                if quads == 0 {
+                    return;
+                }
+                device.cmd_push_constants(
+                    cmd,
+                    layout,
+                    PUSH_STAGES,
+                    0,
+                    bytemuck::bytes_of(&push_for(rel, mesh.scale, clip, fade)),
+                );
+                device.cmd_bind_vertex_buffers(
+                    cmd,
+                    0,
+                    &[self.arena.buffer(mesh.alloc.page)],
+                    &[mesh.alloc.offset],
+                );
+                device.cmd_draw_indexed(cmd, quads * 6, 1, 0, first_vertex as i32, 0);
+            };
+            // LOD terrain is hidden inside `lod_radius`, where the real chunks are loaded; chunk
+            // water is hidden outside it (LOD water takes over there).
+            let lod_radius = params.far_discard_radius;
+            const NONE: f32 = f32::INFINITY;
+
+            // 1. Opaque chunks, front to back.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.opaque);
+            for &(_, slot, rel, fade) in &visible_chunks {
+                if fade == Fade::Visible {
+                    draw(slot, rel, Section::Opaque, [0.0, NONE], fade);
+                }
+            }
+
+            // 2. Chunks fading in or out, and the LOD terrain (everything beyond the loaded
+            //    chunks, out to the horizon). Both need the clip pipeline.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.far);
+            for &(_, slot, rel, fade) in &visible_chunks {
+                if fade != Fade::Visible {
+                    draw(slot, rel, Section::Opaque, [0.0, NONE], fade);
+                }
+            }
+            for &(_, slot, rel, fade) in &visible_far {
+                draw(slot, rel, Section::Opaque, [lod_radius, NONE], fade);
+            }
+            // Glass and other cutout blocks in chunks.
+            for &(_, slot, rel, fade) in &visible_chunks {
+                draw(slot, rel, Section::Cutout, [0.0, NONE], fade);
+            }
+            // Models and dropped items: the clip pipeline also does their cutout sprites.
+            for &(slot, rel) in &visible_objects {
+                draw(slot, rel, Section::Opaque, [0.0, NONE], Fade::Visible);
+            }
+
+            // 3. Translucent water, back to front.
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.water);
+            for &(_, slot, rel, fade) in visible_far.iter().rev() {
+                draw(slot, rel, Section::Water, [lod_radius, NONE], fade);
+            }
+            for &(_, slot, rel, fade) in visible_chunks.iter().rev() {
+                draw(slot, rel, Section::Water, [0.0, lod_radius], fade);
+            }
+
+            device.cmd_end_rendering(cmd);
+
+            // 4. Atmosphere, sky and tone mapping: reads the HDR scene + depth, writes the
+            //    swapchain image.
+            let to_composite = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image(self.hdr.image)
+                    .subresource_range(color_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    )
+                    .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
+                    .image(self.depth.image)
+                    .subresource_range(depth_subresource_range()),
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .src_access_mask(vk::AccessFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .image(image)
+                    .subresource_range(color_subresource_range()),
+            ];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_composite),
+            );
+            let target = vk::RenderingAttachmentInfo::default()
+                .image_view(self.swapchain.views[image_index])
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE);
+            device.cmd_begin_rendering(
+                cmd,
+                &vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent,
+                    })
+                    .layer_count(1)
+                    .color_attachments(slice::from_ref(&target)),
+            );
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.sky);
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+
+            // 5. The overlay (console, HUD).
+            if ui_quads > 0 {
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.ui);
+                let screen = [extent.width as f32, extent.height as f32, 0.0, 0.0];
+                device.cmd_push_constants(cmd, layout, PUSH_STAGES, 0, bytemuck::bytes_of(&screen));
+                device.cmd_bind_vertex_buffers(
+                    cmd,
+                    0,
+                    &[self.ui_buffers[self.frame_index].handle],
+                    &[0],
+                );
+                device.cmd_draw_indexed(cmd, ui_quads * 6, 1, 0, 0, 0);
+            }
+            device.cmd_end_rendering(cmd);
+
+            let mut last_layout = vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL;
+            let mut last_stage = vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
+            let mut last_access = vk::AccessFlags2::COLOR_ATTACHMENT_WRITE;
+            if let Some(capture) = capture {
+                let to_transfer = [vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(last_stage)
+                    .src_access_mask(last_access)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                    .old_layout(last_layout)
+                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .image(image)
+                    .subresource_range(color_subresource_range())];
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_transfer),
+                );
+                let region = vk::BufferImageCopy {
+                    buffer_offset: 0,
+                    buffer_row_length: 0,
+                    buffer_image_height: 0,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: vk::Offset3D::default(),
+                    image_extent: vk::Extent3D {
+                        width: extent.width,
+                        height: extent.height,
+                        depth: 1,
+                    },
+                };
+                device.cmd_copy_image_to_buffer(
+                    cmd,
+                    image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    capture,
+                    &[region],
+                );
+                last_layout = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+                last_stage = vk::PipelineStageFlags2::COPY;
+                last_access = vk::AccessFlags2::NONE;
+            }
+
+            let to_present = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(last_stage)
+                .src_access_mask(last_access)
+                .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+                .dst_access_mask(vk::AccessFlags2::NONE)
+                .old_layout(last_layout)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .image(image)
+                .subresource_range(color_subresource_range())];
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_present),
+            );
+        }
+        stats
+    }
+
+    /// Saves the next rendered frame as a BMP file.
+    pub fn request_capture(&mut self, path: PathBuf) {
+        self.capture_request = Some(path);
+    }
+
+    fn recreate_swapchain(&mut self) -> Result<()> {
+        let size = self.window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+        let device = &self.ctx.device;
+        unsafe { device.device_wait_idle()? };
+
+        let new = Swapchain::new(&self.ctx, size, self.swapchain.handle)?;
+        let mut old = std::mem::replace(&mut self.swapchain, new);
+        old.destroy(&self.ctx);
+
+        self.depth.destroy(device, &mut self.allocator);
+        self.depth = DepthBuffer::new(device, &mut self.allocator, self.swapchain.extent)?;
+        self.hdr.destroy(device, &mut self.allocator);
+        self.hdr = ColorTarget::new(device, &mut self.allocator, self.swapchain.extent)?;
+        self.write_descriptors();
+
+        self.needs_resize = false;
+        Ok(())
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        let device = &self.ctx.device;
+        let allocator = &mut *self.allocator;
+        unsafe {
+            let _ = device.device_wait_idle();
+
+            // Mesh memory all lives in the arena pages.
+            self.arena.destroy(device, allocator);
+            for staging in &mut self.staging {
+                staging.destroy(device, allocator);
+            }
+            self.quad_indices.destroy(device, allocator);
+            self.texture.destroy(device, allocator);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            self.depth.destroy(device, allocator);
+            self.hdr.destroy(device, allocator);
+            for lut in &mut self.luts {
+                lut.destroy(device, allocator);
+            }
+            for uniforms in &mut self.frame_uniforms {
+                uniforms.destroy(device, allocator);
+            }
+            self.font.destroy(device, allocator);
+            for buffer in &mut self.ui_buffers {
+                buffer.destroy(device, allocator);
+            }
+            self.swapchain.destroy(&self.ctx);
+            self.pipelines.destroy(device);
+            for frame in &self.frames {
+                device.destroy_command_pool(frame.command_pool, None);
+                device.destroy_semaphore(frame.image_available, None);
+                device.destroy_fence(frame.in_flight, None);
+            }
+            device.destroy_command_pool(self.upload_pool, None);
+
+            // The allocator must be gone before the device is destroyed (in ctx's Drop).
+            ManuallyDrop::drop(&mut self.allocator);
+        }
+    }
+}
+
+/// One descriptor set per frame in flight (they differ only in the uniform buffer).
+fn create_descriptors(
+    device: &ash::Device,
+    pipelines: &Pipelines,
+) -> Result<(vk::DescriptorPool, Vec<vk::DescriptorSet>)> {
+    let frames = FRAMES_IN_FLIGHT as u32;
+    let count = |ty| BINDINGS.iter().filter(|b| b.0 == ty).count() as u32 * frames;
+    let sizes = [
+        vk::DescriptorType::SAMPLED_IMAGE,
+        vk::DescriptorType::SAMPLER,
+        vk::DescriptorType::UNIFORM_BUFFER,
+    ]
+    .map(|ty| vk::DescriptorPoolSize {
+        ty,
+        descriptor_count: count(ty),
+    });
+    unsafe {
+        let pool = device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(frames)
+                .pool_sizes(&sizes),
+            None,
+        )?;
+        let layouts = vec![pipelines.set_layout; FRAMES_IN_FLIGHT];
+        let sets = device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(pool)
+                .set_layouts(&layouts),
+        )?;
+        Ok((pool, sets))
+    }
+}
+
+/// Writes a 32-bit top-down BMP from BGRA (or RGBA if `rgba_order`) pixels.
+fn write_bmp(path: &Path, width: u32, height: u32, pixels: &[u8], rgba_order: bool) -> Result<()> {
+    let data_len = width * height * 4;
+    let mut out = Vec::with_capacity(54 + data_len as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(54 + data_len).to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+    out.extend_from_slice(&(width as i32).to_le_bytes());
+    out.extend_from_slice(&(-(height as i32)).to_le_bytes()); // negative = top-down
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&[0; 24]); // BI_RGB, no compression, defaults
+    for px in pixels[..data_len as usize].as_chunks::<4>().0 {
+        if rgba_order {
+            out.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        } else {
+            out.extend_from_slice(&[px[0], px[1], px[2], 255]);
+        }
+    }
+    std::fs::write(path, out)?;
+    Ok(())
+}
+
+fn create_quad_index_buffer(
+    ctx: &VulkanContext,
+    allocator: &mut Allocator,
+    upload_pool: vk::CommandPool,
+) -> Result<Buffer> {
+    let indices: Vec<u32> = (0..MAX_QUADS_PER_DRAW)
+        .flat_map(|q| {
+            let b = q * 4;
+            [b, b + 1, b + 2, b, b + 2, b + 3]
+        })
+        .collect();
+    let bytes: &[u8] = bytemuck::cast_slice(&indices);
+    let size = bytes.len() as vk::DeviceSize;
+    let device = &ctx.device;
+
+    let mut staging = Buffer::new(
+        device,
+        allocator,
+        "index staging",
+        size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        MemoryLocation::CpuToGpu,
+    )?;
+    staging.write(0, bytes)?;
+    let buffer = Buffer::new(
+        device,
+        allocator,
+        "quad indices",
+        size,
+        vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuOnly,
+    )?;
+    ctx.submit_and_wait(upload_pool, |cmd| unsafe {
+        device.cmd_copy_buffer(
+            cmd,
+            staging.handle,
+            buffer.handle,
+            &[vk::BufferCopy {
+                src_offset: 0,
+                dst_offset: 0,
+                size,
+            }],
+        );
+    })?;
+    staging.destroy(device, allocator);
+    Ok(buffer)
+}
+
+/// Which part of a mesh to draw.
+#[derive(Clone, Copy)]
+enum Section {
+    Opaque,
+    Water,
+    /// Cutout blocks (glass): alpha-tested, drawn with the clip pipeline.
+    Cutout,
+}
