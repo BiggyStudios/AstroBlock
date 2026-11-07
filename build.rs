@@ -23,6 +23,11 @@ const SHADERS: &[(&str, &str, &[&str])] = &[
     ("sky.frag", "sky.frag", &[]),
     ("ui.vert", "ui.vert", &[]),
     ("ui.frag", "ui.frag", &[]),
+    ("particles.vert", "particles.vert", &[]),
+    ("particles.frag", "particles.frag", &[]),
+    ("particles.frag", "particles_blend.frag", &["BLEND"]),
+    ("particles_sim.comp", "particles_sim.comp", &[]),
+    ("particles_emit.comp", "particles_emit.comp", &[]),
 ];
 
 fn main() {

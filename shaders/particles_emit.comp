@@ -1,0 +1,78 @@
+#version 450
+
+// Spawns this frame's new particles: one thread each, written into the ring buffer after the
+// newest ones (overwriting the oldest when it is full).
+
+layout(local_size_x = 64) in;
+
+#include "particle.glsl"
+#include "particle_batch.glsl"
+
+layout(std430, set = 0, binding = 11) buffer Particles {
+    Particle particles[];
+};
+
+uint hash(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+// Uniform in [0, 1).
+float random(inout uint state) {
+    state = hash(state);
+    return float(state >> 8u) / 16777216.0;
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= b_info.x) {
+        return;
+    }
+    // The emitter this particle belongs to (they are in order of their first index).
+    uint e = 0u;
+    for (uint k = 1u; k < b_info.y; k++) {
+        if (i >= b_emitters[k].look.w) {
+            e = k;
+        }
+    }
+    Emitter em = b_emitters[e];
+    uint s = hash(i * 747796405u + b_sim.z);
+
+    vec3 unit = vec3(random(s), random(s), random(s)) * 2.0 - 1.0;
+    vec3 offset = unit * em.extent.xyz;
+    // A random direction (uniform on the sphere) for the random part of the velocity.
+    float z = random(s) * 2.0 - 1.0;
+    float a = random(s) * 6.2831853;
+    float r = sqrt(max(1.0 - z * z, 0.0));
+    vec3 dir = vec3(r * cos(a), r * sin(a), z);
+    vec3 velocity = em.velocity.xyz + unit * em.origin.w + dir * em.extent.w * random(s);
+
+    float life = mix(em.ranges.x, em.ranges.y, random(s));
+    float size = mix(em.ranges.z, em.ranges.w, random(s));
+
+    // A random piece of the texture rect (block debris shows bits of the block).
+    uint rect = em.look.y;
+    uint piece = uint(em.phys.w);
+    if (piece > 0u) {
+        uint u0 = rect & 255u;
+        uint v0 = (rect >> 8u) & 255u;
+        uint u1 = (rect >> 16u) & 255u;
+        uint v1 = rect >> 24u;
+        uint su = u1 - u0 > piece ? u1 - u0 - piece : 0u;
+        uint sv = v1 - v0 > piece ? v1 - v0 - piece : 0u;
+        uint pu = u0 + min(uint(random(s) * float(su + 1u)), su);
+        uint pv = v0 + min(uint(random(s) * float(sv + 1u)), sv);
+        rect = pu | (pv << 8u) | (min(pu + piece, u1) << 16u) | (min(pv + piece, v1) << 24u);
+    }
+
+    Particle p;
+    p.pos_age = vec4(em.origin.xyz + offset, 0.0);
+    p.vel_life = vec4(velocity, life);
+    p.phys = vec4(em.phys.x, em.phys.y, size, em.phys.z);
+    p.look = uvec4(em.look.x, rect, em.look.z, s);
+    particles[(b_info.z + i) % b_info.w] = p;
+}

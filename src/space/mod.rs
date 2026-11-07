@@ -6,12 +6,15 @@
 //! frame (the star, the stars in the sky) is converted into that frame each frame - which is
 //! what makes the sun rise and set, and the seasons change, as the planet spins and orbits.
 
+pub mod bodies;
+pub mod conic;
 pub mod gravity;
 pub mod orbit;
+pub mod trajectory;
 
 use std::f64::consts::TAU;
 
-use glam::{DMat3, DQuat, DVec3};
+use glam::{DQuat, DVec3};
 
 use orbit::Orbit;
 
@@ -48,12 +51,14 @@ impl RotatingFrame {
     }
 }
 
+#[derive(Clone)]
 pub struct Star {
     /// Gravitational parameter G*M (m^3/s^2).
     pub mu: f64,
     pub radius: f64,
 }
 
+#[derive(Clone)]
 pub struct Planet {
     /// Orbit around the star.
     pub orbit: Orbit,
@@ -64,6 +69,7 @@ pub struct Planet {
 }
 
 /// The star and the home planet.
+#[derive(Clone)]
 pub struct SolarSystem {
     pub star: Star,
     pub planet: Planet,
@@ -106,11 +112,6 @@ impl SolarSystem {
             rotation: self.planet_rotation(t),
             omega: DVec3::Y * (TAU / self.planet.sidereal_day),
         }
-    }
-
-    /// Same as [`Self::planet_rotation`], as a matrix (e.g. to orient the star field).
-    pub fn planet_rotation_matrix(&self, t: f64) -> DMat3 {
-        DMat3::from_quat(self.planet_rotation(t))
     }
 
     /// The star's position relative to the planet's centre, in the planet's body frame.

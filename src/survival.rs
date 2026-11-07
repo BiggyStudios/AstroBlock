@@ -17,6 +17,7 @@ use crate::{
     audio::Sound,
     crafting,
     drops::{self, Drop},
+    effects::{self, Effects},
     furnace::Furnace,
     input::Input,
     interact::{self, Hit},
@@ -26,7 +27,7 @@ use crate::{
     models::{self, Light, ModelState},
     player::{GameMode, HALF_WIDTH, HEIGHT, Voxels},
     render::{DrawItem, Fade, MeshHandle, Renderer},
-    screen::{self, CHEST_SLOTS, Layout, Screen, SlotId, View},
+    screen::{self, CHEST_SLOTS, Layout, Screen, ScreenAnim, SlotId, View},
     ui::Ui,
     util::FastMap,
     world::{
@@ -98,6 +99,17 @@ struct Drag {
     stack: ItemStack,
 }
 
+/// What survival keeps per world (home, the moon): placed models and their contents, items
+/// lying around, and animals. The world you are not on keeps its own (see `swap_world`).
+#[derive(Default)]
+pub struct WorldState {
+    furnaces: FastMap<BlockCell, Furnace>,
+    chests: FastMap<BlockCell, [Slot; CHEST_SLOTS]>,
+    objects: FastMap<BlockCell, Object>,
+    drops: Vec<Drop>,
+    mobs: Vec<Mob>,
+}
+
 pub struct Survival {
     pub inventory: Inventory,
     /// Helmet, chestplate, leggings, boots.
@@ -123,7 +135,7 @@ pub struct Survival {
     exhaustion: f32,
     food_timer: f32,
     /// Seconds spent eating the held food.
-    eating: f32,
+    pub eating: f32,
     /// Breaking a block: the cell, seconds spent and seconds needed.
     pub mining: Option<(BlockCell, f32, f32)>,
     mining_sound: f32,
@@ -132,9 +144,15 @@ pub struct Survival {
     pub attack: (f32, f32),
     /// What the crosshair is on (a block or an animal), for the HUD.
     pub target_name: Option<String>,
+    /// Gestures so far, for the first-person view: swings (hits, swings at nothing,
+    /// creative breaks) and uses (placing, opening, putting on). Mining shows as `mining`.
+    pub swings: u32,
+    pub uses: u32,
     pub catalog: Vec<Item>,
     /// Sounds to play (sound, planet-relative position), drained by the app.
     pub sounds: Vec<(Sound, DVec3)>,
+    /// Particle effects to spawn (planet-relative), drained by the app.
+    pub effects: Effects,
     /// Light sources to add / remove in the world (cell, level).
     lights: Vec<(BlockCell, u8)>,
     drag: Option<Drag>,
@@ -172,8 +190,11 @@ impl Default for Survival {
             action_cooldown: 0.0,
             attack: (0.0, 0.25),
             target_name: None,
+            swings: 0,
+            uses: 0,
             catalog: Item::all(),
             sounds: Vec::new(),
+            effects: Effects::default(),
             lights: Vec::new(),
             drag: None,
             last_click: None,
@@ -186,6 +207,23 @@ impl Default for Survival {
 }
 
 impl Survival {
+    /// Trades the current world's state for `other`'s (moving to another world).
+    pub fn swap_world(&mut self, other: &mut WorldState) {
+        std::mem::swap(&mut self.furnaces, &mut other.furnaces);
+        std::mem::swap(&mut self.chests, &mut other.chests);
+        std::mem::swap(&mut self.objects, &mut other.objects);
+        std::mem::swap(&mut self.drops, &mut other.drops);
+        std::mem::swap(&mut self.mobs, &mut other.mobs);
+        self.mining = None;
+        self.target_name = None;
+        if matches!(
+            self.screen,
+            Some(Screen::Furnace(_) | Screen::Chest(_) | Screen::Crafting(_))
+        ) {
+            self.screen = None;
+        }
+    }
+
     fn random(&mut self) -> f64 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 7;
@@ -289,6 +327,8 @@ impl Survival {
         world.streamer.set_block(cell, Block::Air);
         let center = interact::cell_center(world.planet, cell);
         self.sound(Sound::Break(block.material()), center);
+        let up = center.normalize_or(DVec3::Y);
+        self.effects.push(effects::block_break(block, center, up));
         if let Some(object) = self.objects.remove(&cell) {
             self.garbage.extend(object.mesh);
             if matches!(object.block, Block::Torch | Block::Furnace) {
@@ -356,6 +396,10 @@ impl Survival {
         }
         world.streamer.set_block(cell, block);
         self.sound(Sound::Place(block.material()), center);
+        if !block.is_model() {
+            let up = center.normalize_or(DVec3::Y);
+            self.effects.push(effects::block_place(block, center, up));
+        }
         if block.is_model() {
             self.objects.insert(
                 cell,
@@ -395,6 +439,18 @@ impl Survival {
             .map(|(i, _)| i)
     }
 
+    /// What the crosshair is on: an animal (returned, as an index into `mobs`) beats the
+    /// block `target`. Names it in `target_name`.
+    pub fn aim(&mut self, pose: &Pose, reach: f64, target: Option<&Hit>) -> Option<usize> {
+        let mob = self.mob_target(pose, reach, target);
+        self.target_name = match (mob, target) {
+            (Some(i), _) => Some(self.mobs[i].kind.name().to_string()),
+            (None, Some(hit)) => Some(hit.block.name()),
+            _ => None,
+        };
+        mob
+    }
+
     /// Mouse and keys in the world: break / attack (left), use / place / eat / wear (right),
     /// pick block (middle), drop the held item (Q). Returns a message to show, if any.
     #[allow(clippy::too_many_arguments)]
@@ -412,13 +468,8 @@ impl Survival {
         self.action_cooldown -= dt;
         self.attack.0 = (self.attack.0 - dt).max(0.0);
         let mut message = None;
-        let mob = self.mob_target(pose, reach, target);
+        let mob = self.aim(pose, reach, target);
         let target = if mob.is_some() { None } else { target };
-        self.target_name = match (mob, target) {
-            (Some(i), _) => Some(self.mobs[i].kind.name().to_string()),
-            (None, Some(hit)) => Some(hit.block.name()),
-            _ => None,
-        };
 
         // Q drops one of the held item, Ctrl+Q the whole stack.
         if input.pressed(KeyCode::KeyQ) {
@@ -435,6 +486,7 @@ impl Survival {
             match target {
                 Some(hit) if creative => {
                     if input.button_pressed(MouseButton::Left) || self.action_cooldown <= 0.0 {
+                        self.swings += 1;
                         self.break_block(world, hit.cell, hit.block, true);
                         self.action_cooldown = CREATIVE_BREAK_REPEAT;
                     }
@@ -450,7 +502,17 @@ impl Survival {
                         if self.mining_sound <= 0.0 {
                             self.mining_sound = 0.25;
                             let at = interact::cell_center(world.planet, hit.cell);
-                            self.sound(Sound::Step(hit.block.material()), at);
+                            self.sound(Sound::Dig(hit.block.material()), at);
+                            // Chips fly off the face being hit.
+                            let point = pose.eye + pose.look * hit.distance;
+                            let normal = hit
+                                .before
+                                .map(|b| interact::cell_center(world.planet, b) - at)
+                                .and_then(DVec3::try_normalize)
+                                .unwrap_or(-pose.look);
+                            let up = at.normalize_or(DVec3::Y);
+                            self.effects
+                                .push(effects::mining_chips(hit.block, point, normal, up));
                         }
                         if spent >= total {
                             self.break_block(world, hit.cell, hit.block, false);
@@ -509,7 +571,8 @@ impl Survival {
                 &mut self.armor[piece as usize],
                 &mut self.inventory.slots[self.selected],
             );
-            self.sound(Sound::Place(crate::world::block::Material::Wool), pose.feet);
+            self.sound(Sound::Equip, pose.eye);
+            self.uses += 1;
             return message;
         }
         if right && let Some(hit) = target {
@@ -526,13 +589,17 @@ impl Survival {
                         _ => Screen::Crafting(hit.cell),
                     };
                     self.open(screen);
+                    self.uses += 1;
                 }
             } else if let (Some(cell), Some(stack)) = (hit.before, held)
                 && let Some(block) = stack.item.block()
                 && (block == Block::Torch || !overlaps_player(world.planet, cell, pose.feet))
             {
-                if self.place(world, cell, block, hit.cell, pose) && !creative {
-                    self.inventory.take_one(self.selected);
+                if self.place(world, cell, block, hit.cell, pose) {
+                    self.uses += 1;
+                    if !creative {
+                        self.inventory.take_one(self.selected);
+                    }
                 }
                 self.action_cooldown = PLACE_REPEAT;
             }
@@ -566,6 +633,7 @@ impl Survival {
 
     /// Hits an animal with the held item: full damage when the weapon has recharged.
     fn attack_mob(&mut self, i: usize, pose: &Pose, creative: bool) -> Option<String> {
+        self.swings += 1;
         let (damage, speed) = self.held().map_or((1.0, 4.0), |s| s.item.attack());
         let charge = 1.0 - self.attack.0 / self.attack.1.max(1e-3);
         let damage = damage * (0.2 + 0.8 * charge * charge);
@@ -615,6 +683,7 @@ impl Survival {
 
     /// Swinging at nothing still makes the weapon recharge (shown under the crosshair).
     fn swing(&mut self) {
+        self.swings += 1;
         let (_, speed) = self.held().map_or((1.0, 4.0), |s| s.item.attack());
         self.attack = (1.0 / speed, 1.0 / speed);
     }
@@ -925,6 +994,7 @@ impl Survival {
             }
             if let Some(mesh) = object.mesh {
                 draws.push(DrawItem {
+                    rotation: glam::Quat::IDENTITY,
                     mesh,
                     origin: planet.center + center,
                     radius: 1.6,
@@ -946,6 +1016,7 @@ impl Survival {
             }
             if let Some(mesh) = drop.mesh {
                 draws.push(DrawItem {
+                    rotation: glam::Quat::IDENTITY,
                     mesh,
                     origin: planet.center + drop.draw_position(),
                     radius: 0.5,
@@ -958,11 +1029,9 @@ impl Survival {
                 continue;
             }
             let up = mob.position.normalize_or(DVec3::Y);
-            let mesh = models::mob_model(
+            let mesh = crate::mob_models::mob_model(
                 mob.kind,
-                mob.walk,
-                mob.swing,
-                mob.hurt > 0.0,
+                &mob.pose(),
                 (mob.heading, up),
                 // Animals live on open grass: full sky light.
                 Light {
@@ -978,6 +1047,7 @@ impl Survival {
             }
             if let Some(mesh) = mob.mesh {
                 draws.push(DrawItem {
+                    rotation: glam::Quat::IDENTITY,
                     mesh,
                     origin: planet.center + mob.position,
                     radius: 2.0,
@@ -1467,8 +1537,12 @@ impl Survival {
     }
 
     /// Draws the open screen.
-    pub fn draw_screen(&self, ui: &mut Ui, mouse: (f32, f32)) {
-        let Some(screen) = self.screen else { return };
+    /// The open screen, or the last one fading out.
+    pub fn draw_screen(&self, ui: &mut Ui, mouse: (f32, f32), anim: &mut ScreenAnim, dt: f32) {
+        let Some(screen) = self.screen else {
+            anim.draw_closing(ui, dt);
+            return;
+        };
         let layout = self.layout(screen, (ui.width, ui.height, ui.scale));
         let slot = |id: SlotId| self.slot(id);
         let view = View {
@@ -1478,7 +1552,7 @@ impl Survival {
             furnace: self.open_furnace(),
             catalog: &self.catalog,
         };
-        screen::draw(ui, screen, &layout, &view);
+        screen::draw(ui, screen, &layout, &view, anim, dt);
     }
 }
 
@@ -1504,7 +1578,11 @@ fn overlaps_player(planet: &Planet, cell: BlockCell, feet: DVec3) -> bool {
 }
 
 /// The mesher's fake sky light (15 in the open, darker below the column's surface).
-fn sky_light(planet: &Planet, terrain: &TerrainGenerator, cell: Option<BlockCell>) -> u32 {
+pub(crate) fn sky_light(
+    planet: &Planet,
+    terrain: &TerrainGenerator,
+    cell: Option<BlockCell>,
+) -> u32 {
     let Some(cell) = cell else { return 15 };
     if planet.res_at(cell.k) != planet.face_blocks {
         return 1;

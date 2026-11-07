@@ -1,13 +1,24 @@
-//! Inventory screens: the player inventory (with its 2x2 crafting grid), the crafting table,
-//! the furnace, chests and the creative catalog. Layout and drawing follow Minecraft's (176 GUI
-//! pixels wide, 18-pixel slots); the click rules live in `survival`.
+//! Inventory screens: the player inventory (suit slots and a 2x2 assembly grid), the
+//! workbench, the furnace, storage chests and the creative catalog.
+//!
+//! The look is Astro Block's minimal flat style: no panel, the world just dims behind a grid
+//! of faintly outlined cells; sections carry small lowercase labels; progress is a thin line.
+//! Layout is in "GUI pixels" (`Ui::scale` screen pixels each) on a 20-pixel cell pitch. The
+//! click rules live in `survival`.
+//!
+//! Screens move (see `ScreenAnim`): they fade and rise in when opened and sink out when
+//! closed, hovered cells light up and fade out behind the mouse, the details card fades in,
+//! slots pop when items land in them, and a ready result glows softly.
 
 use crate::{
+    anim::{Pop, approach, ease_out},
     furnace::Furnace,
     inventory::{HOTBAR, SLOTS, Slot},
-    items::{Item, ItemStack, Tier, ToolKind},
+    items::{Item, ItemStack, ToolKind},
+    render::UiVertex,
     ui::Ui,
-    world::{chunk::BlockCell, textures::Tex},
+    util::FastMap,
+    world::chunk::BlockCell,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,7 +45,7 @@ impl Screen {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SlotId {
     /// Player inventory slot (0..9 hotbar, 9..36 main).
     Inv(usize),
@@ -47,111 +58,104 @@ pub enum SlotId {
     FurnaceOut,
     /// Creative catalog entry.
     Catalog(usize),
-    /// Worn armor (helmet, chestplate, leggings, boots).
+    /// Worn armor (head, body, legs, feet).
     Armor(usize),
     /// A slot of the open chest.
     Chest(usize),
 }
 
-/// GUI size in GUI pixels.
-const GUI_W: f32 = 176.0;
-const GUI_H: f32 = 166.0;
-const CATALOG_COLUMNS: usize = 9;
+/// Cell pitch and content width, in GUI pixels.
+const CELL: f32 = 20.0;
+const WIDTH: f32 = 9.0 * CELL;
+const COLUMNS: usize = 9;
 
 pub struct Layout {
-    /// Panel rectangle in screen pixels, and screen pixels per GUI pixel.
+    /// Content box in screen pixels (clicks outside it drop the held stack), and screen
+    /// pixels per GUI pixel.
     pub x: f32,
     pub y: f32,
     pub w: f32,
     pub h: f32,
     pub s: f32,
-    /// (slot, item position in GUI pixels, big result slot).
-    pub slots: Vec<(SlotId, f32, f32, bool)>,
+    /// (slot, cell top-left in GUI pixels).
+    pub slots: Vec<(SlotId, f32, f32)>,
+    /// Section labels (GUI pixels).
+    labels: Vec<(f32, f32, &'static str)>,
 }
 
 impl Layout {
     pub fn new(screen: Screen, width: f32, height: f32, s: f32, catalog: usize) -> Self {
         let mut slots = Vec::new();
-        let catalog_rows = catalog.div_ceil(CATALOG_COLUMNS);
-        let h = match screen {
-            Screen::Creative => 18.0 + catalog_rows as f32 * 18.0 + 32.0,
-            _ => GUI_H,
+        let mut labels = Vec::new();
+        let row = |slots: &mut Vec<_>, ids: &mut dyn Iterator<Item = SlotId>, y: f32| {
+            for (i, id) in ids.enumerate() {
+                slots.push((
+                    id,
+                    (i % COLUMNS) as f32 * CELL,
+                    y + (i / COLUMNS) as f32 * CELL,
+                ));
+            }
         };
-        // Player inventory: three rows plus the hotbar (creative: the hotbar only).
-        if screen == Screen::Creative {
-            for i in 0..catalog {
-                let (col, row) = (i % CATALOG_COLUMNS, i / CATALOG_COLUMNS);
-                slots.push((
-                    SlotId::Catalog(i),
-                    8.0 + col as f32 * 18.0,
-                    18.0 + row as f32 * 18.0,
-                    false,
-                ));
-            }
-            for i in 0..HOTBAR {
-                slots.push((SlotId::Inv(i), 8.0 + i as f32 * 18.0, h - 24.0, false));
-            }
-        } else {
-            for i in HOTBAR..SLOTS {
-                let (col, row) = ((i - HOTBAR) % 9, (i - HOTBAR) / 9);
-                slots.push((
-                    SlotId::Inv(i),
-                    8.0 + col as f32 * 18.0,
-                    84.0 + row as f32 * 18.0,
-                    false,
-                ));
-            }
-            for i in 0..HOTBAR {
-                slots.push((SlotId::Inv(i), 8.0 + i as f32 * 18.0, 142.0, false));
-            }
-        }
-        match screen {
+
+        // The screen's own section on top.
+        let top = match screen {
             Screen::Inventory => {
+                labels.push((0.0, 0.0, "suit"));
                 for i in 0..4 {
-                    let (col, row) = (i % 2, i / 2);
-                    slots.push((
-                        SlotId::Grid(i),
-                        88.0 + col as f32 * 18.0,
-                        26.0 + row as f32 * 18.0,
-                        false,
-                    ));
+                    slots.push((SlotId::Armor(i), 0.0, 10.0 + i as f32 * CELL));
                 }
-                slots.push((SlotId::Output, 148.0, 36.0, true));
+                labels.push((80.0, 0.0, "assemble"));
                 for i in 0..4 {
-                    slots.push((SlotId::Armor(i), 8.0, 8.0 + i as f32 * 18.0, false));
+                    let (c, r) = ((i % 2) as f32, (i / 2) as f32);
+                    slots.push((SlotId::Grid(i), 80.0 + c * CELL, 20.0 + r * CELL));
                 }
+                slots.push((SlotId::Output, 160.0, 30.0));
+                92.0
             }
             Screen::Crafting(_) => {
+                labels.push((20.0, 0.0, "workbench"));
                 for i in 0..9 {
-                    let (col, row) = (i % 3, i / 3);
-                    slots.push((
-                        SlotId::Grid(i),
-                        30.0 + col as f32 * 18.0,
-                        17.0 + row as f32 * 18.0,
-                        false,
-                    ));
+                    let (c, r) = ((i % 3) as f32, (i / 3) as f32);
+                    slots.push((SlotId::Grid(i), 20.0 + c * CELL, 10.0 + r * CELL));
                 }
-                slots.push((SlotId::Output, 124.0, 35.0, true));
+                slots.push((SlotId::Output, 140.0, 30.0));
+                72.0
             }
             Screen::Furnace(_) => {
-                slots.push((SlotId::FurnaceIn, 56.0, 17.0, false));
-                slots.push((SlotId::FurnaceFuel, 56.0, 53.0, false));
-                slots.push((SlotId::FurnaceOut, 116.0, 35.0, true));
+                labels.push((40.0, 0.0, "furnace"));
+                slots.push((SlotId::FurnaceIn, 40.0, 10.0));
+                slots.push((SlotId::FurnaceFuel, 40.0, 50.0));
+                slots.push((SlotId::FurnaceOut, 120.0, 30.0));
+                72.0
             }
             Screen::Chest(_) => {
-                for i in 0..CHEST_SLOTS {
-                    let (col, row) = (i % 9, i / 9);
-                    slots.push((
-                        SlotId::Chest(i),
-                        8.0 + col as f32 * 18.0,
-                        18.0 + row as f32 * 18.0,
-                        false,
-                    ));
-                }
+                labels.push((0.0, 0.0, "storage"));
+                row(&mut slots, &mut (0..CHEST_SLOTS).map(SlotId::Chest), 10.0);
+                72.0
             }
-            Screen::Creative => {}
-        }
-        let (w, h) = (GUI_W * s, h * s);
+            Screen::Creative => {
+                labels.push((0.0, 0.0, "catalog"));
+                row(&mut slots, &mut (0..catalog).map(SlotId::Catalog), 10.0);
+                10.0 + catalog.div_ceil(COLUMNS) as f32 * CELL + 2.0
+            }
+        };
+
+        // The player's own items below: the backpack, then the hotbar a little apart.
+        let hotbar_y = if screen == Screen::Creative {
+            top + 6.0
+        } else {
+            labels.push((0.0, top + 4.0, "backpack"));
+            row(
+                &mut slots,
+                &mut (HOTBAR..SLOTS).map(SlotId::Inv),
+                top + 14.0,
+            );
+            top + 14.0 + 3.0 * CELL + 6.0
+        };
+        row(&mut slots, &mut (0..HOTBAR).map(SlotId::Inv), hotbar_y);
+        let content_h = hotbar_y + CELL;
+
+        let (w, h) = (WIDTH * s, content_h * s);
         Self {
             x: ((width - w) / 2.0).round(),
             y: ((height - h) / 2.0).round(),
@@ -159,6 +163,7 @@ impl Layout {
             h,
             s,
             slots,
+            labels,
         }
     }
 
@@ -169,16 +174,17 @@ impl Layout {
 
     /// The slot under the mouse.
     pub fn slot_at(&self, mx: f32, my: f32) -> Option<SlotId> {
-        self.slots.iter().find_map(|&(id, gx, gy, big)| {
-            let pad = if big { 5.0 } else { 1.0 };
-            let (x, y) = self.at(gx - pad, gy - pad);
-            let size = (16.0 + 2.0 * pad) * self.s;
+        self.slots.iter().find_map(|&(id, gx, gy)| {
+            let (x, y) = self.at(gx, gy);
+            let size = CELL * self.s;
             (mx >= x && mx < x + size && my >= y && my < y + size).then_some(id)
         })
     }
 
+    /// Whether the mouse is over the screen's content (with a small margin).
     pub fn contains(&self, mx: f32, my: f32) -> bool {
-        mx >= self.x && mx < self.x + self.w && my >= self.y && my < self.y + self.h
+        let m = 8.0 * self.s;
+        mx >= self.x - m && mx < self.x + self.w + m && my >= self.y - m && my < self.y + self.h + m
     }
 }
 
@@ -191,195 +197,267 @@ pub struct View<'a> {
     pub catalog: &'a [Item],
 }
 
-const PANEL: [u8; 4] = [198, 198, 198, 255];
-const LIGHT: [u8; 4] = [255, 255, 255, 255];
-const SHADOW: [u8; 4] = [85, 85, 85, 255];
-const SLOT: [u8; 4] = [139, 139, 139, 255];
-const SLOT_DARK: [u8; 4] = [55, 55, 55, 255];
-const LABEL: [u8; 4] = [64, 64, 64, 255];
+const LABEL: [u8; 4] = [190, 200, 210, 170];
+const OUTLINE: [u8; 4] = [255, 255, 255, 38];
+const ACCENT: [u8; 4] = [240, 196, 120, 150];
+const HOVER: [u8; 4] = [255, 255, 255, 28];
+const LINE: [u8; 4] = [235, 240, 245, 235];
+const FAINT: [u8; 4] = [255, 255, 255, 45];
 
-pub fn draw(ui: &mut Ui, screen: Screen, layout: &Layout, view: &View) {
+/// Seconds a screen takes to open and to close.
+const OPEN_TIME: f32 = 0.18;
+const CLOSE_TIME: f32 = 0.12;
+/// How far (GUI pixels) the content rises while opening and sinks while closing.
+const RISE: f32 = 8.0;
+
+/// The screens' motion state, carried from frame to frame.
+#[derive(Default)]
+pub struct ScreenAnim {
+    time: f32,
+    /// The screen drawn last frame, and how far it has opened (0..1, linear).
+    shown: Option<Screen>,
+    open: f32,
+    /// Hover glow per cell (0..1).
+    hover: FastMap<SlotId, f32>,
+    pops: FastMap<SlotId, Pop>,
+    held: Pop,
+    /// The cell whose details card is up, and the card's fade (0..1).
+    card: (Option<SlotId>, f32),
+    /// Last frame's screen (dim first, then content), replayed while it closes.
+    closing: Vec<UiVertex>,
+}
+
+impl ScreenAnim {
+    /// Called on frames without an open screen: the last one fades and sinks out.
+    pub fn draw_closing(&mut self, ui: &mut Ui, dt: f32) {
+        if self.shown.take().is_some() {
+            // Close from wherever opening had got to.
+            self.open = ease_out(self.open);
+        }
+        if self.closing.is_empty() {
+            return;
+        }
+        self.open -= dt / CLOSE_TIME;
+        if self.open <= 0.0 {
+            self.closing.clear();
+            self.open = 0.0;
+            return;
+        }
+        let e = self.open * self.open;
+        let start = ui.vertices.len();
+        ui.vertices.extend_from_slice(&self.closing);
+        ui.fade_from(start, e, 0.0, 0.0);
+        ui.fade_from(start + 4, 1.0, 0.0, (1.0 - e) * RISE * 0.5 * ui.scale);
+    }
+}
+
+pub fn draw(
+    ui: &mut Ui,
+    screen: Screen,
+    layout: &Layout,
+    view: &View,
+    anim: &mut ScreenAnim,
+    dt: f32,
+) {
     let s = layout.s;
-    // Dim the world behind.
-    ui.rect(0.0, 0.0, ui.width, ui.height, [0, 0, 0, 110]);
-    // A raised grey panel.
-    let (x, y, w, h) = (layout.x, layout.y, layout.w, layout.h);
-    ui.rect(x, y, w, h, [0, 0, 0, 255]);
-    ui.rect(x + s, y + s, w - 2.0 * s, h - 2.0 * s, LIGHT);
-    ui.rect(x + 3.0 * s, y + 3.0 * s, w - 4.0 * s, h - 4.0 * s, SHADOW);
-    ui.rect(x + 3.0 * s, y + 3.0 * s, w - 6.0 * s, h - 6.0 * s, PANEL);
+    anim.time += dt;
+    if anim.shown != Some(screen) {
+        // Freshly opened: start from the bottom, and don't pop what's already there.
+        if anim.shown.is_none() && anim.closing.is_empty() {
+            anim.open = 0.0;
+        }
+        anim.shown = Some(screen);
+        anim.pops.clear();
+        anim.hover.clear();
+        anim.card = (None, 0.0);
+        anim.held = Pop::new(&view.cursor);
+    }
+    anim.open = (anim.open + dt / OPEN_TIME).min(1.0);
 
-    let title = match screen {
-        Screen::Inventory => "Crafting",
-        Screen::Creative => "Creative Inventory",
-        Screen::Crafting(_) => "Crafting",
-        Screen::Furnace(_) => "Furnace",
-        Screen::Chest(_) => "Chest",
-    };
-    let label = |ui: &mut Ui, gx: f32, gy: f32, text: &str| {
+    // The world dims; there is no panel.
+    let start = ui.vertices.len();
+    ui.rect(0.0, 0.0, ui.width, ui.height, [4, 6, 10, 165]);
+    for &(gx, gy, text) in &layout.labels {
         let (lx, ly) = layout.at(gx, gy);
-        // Labels are drawn without the shadow, Minecraft-style.
         ui.text_plain(lx, ly, text, LABEL);
-    };
-    let title_x = if screen == Screen::Inventory {
-        88.0
-    } else {
-        8.0
-    };
-    label(ui, title_x, 6.0, title);
-    // (The player inventory has its armor column there instead, as in Minecraft.)
-    if !matches!(screen, Screen::Creative | Screen::Inventory) {
-        label(ui, 8.0, 73.0, "Inventory");
     }
 
-    // Arrows and the furnace flame.
-    let arrow = |ui: &mut Ui, gx: f32, gy: f32, fill: f32| {
-        let (ax, ay) = layout.at(gx, gy);
-        let size = 16.0 * s;
-        ui.sprite(ax, ay, size, Tex::Arrow, [139, 139, 139, 255]);
+    // Thin lines: assembly input -> result, and the furnace's fuel and progress.
+    let line = |ui: &mut Ui, gx: f32, gy: f32, len: f32, fill: f32| {
+        let (x, y) = layout.at(gx, gy);
+        ui.rect(x, y, len * s, s, FAINT);
         if fill > 0.0 {
-            ui.sprite_part(
-                (ax, ay, size * fill, size),
-                Tex::Arrow,
-                ([0.0, 0.0], [fill, 1.0]),
-                [255, 255, 255, 255],
-            );
+            ui.rect(x, y, len * s * fill.min(1.0), s, LINE);
         }
     };
     match screen {
-        Screen::Inventory => arrow(ui, 126.0, 36.0, 0.0),
-        Screen::Crafting(_) => arrow(ui, 92.0, 35.0, 0.0),
+        Screen::Inventory => line(ui, 124.0, 40.0, 32.0, 0.0),
+        Screen::Crafting(_) => line(ui, 84.0, 40.0, 52.0, 0.0),
         Screen::Furnace(_) => {
             let f = view.furnace.copied().unwrap_or_default();
-            let cook = f.cook / crate::furnace::COOK_TIME;
-            arrow(ui, 82.0, 35.0, cook);
-            let (fx, fy) = layout.at(56.0, 36.0);
-            let size = 16.0 * s;
-            ui.sprite(fx, fy, size, Tex::FlameOff, [255, 255, 255, 255]);
-            if f.lit() && f.burn_total > 0.0 {
-                // The flame shrinks from the top as the fuel burns.
-                let left = (f.burn_left / f.burn_total).clamp(0.0, 1.0);
-                ui.sprite_part(
-                    (fx, fy + size * (1.0 - left), size, size * left),
-                    Tex::Flame,
-                    ([0.0, 1.0 - left], [1.0, 1.0]),
-                    [255, 255, 255, 255],
-                );
-            }
+            line(ui, 64.0, 40.0, 52.0, f.cook / crate::furnace::COOK_TIME);
+            let burn = if f.lit() && f.burn_total > 0.0 {
+                f.burn_left / f.burn_total
+            } else {
+                0.0
+            };
+            line(ui, 42.0, 40.0, 16.0, burn);
         }
         Screen::Creative | Screen::Chest(_) => {}
     }
 
-    // Slots and their items.
+    // Hover glow: quick to light up, slower to fade, so it trails behind the mouse.
     let hovered = layout.slot_at(view.mouse.0, view.mouse.1);
-    for &(id, gx, gy, big) in &layout.slots {
-        let pad = if big { 5.0 } else { 1.0 };
-        let (bx, by) = layout.at(gx - pad, gy - pad);
-        let size = (16.0 + 2.0 * pad) * s;
-        ui.rect(bx, by, size, size, LIGHT);
-        ui.rect(bx, by, size - s, size - s, SLOT_DARK);
-        ui.rect(bx + s, by + s, size - 2.0 * s, size - 2.0 * s, SLOT);
-        let (ix, iy) = layout.at(gx, gy);
+    if let Some(id) = hovered {
+        anim.hover.entry(id).or_insert(0.0);
+    }
+    anim.hover.retain(|&id, glow| {
+        let on = hovered == Some(id);
+        *glow = approach(
+            *glow,
+            if on { 1.0 } else { 0.0 },
+            if on { 30.0 } else { 9.0 },
+            dt,
+        );
+        on || *glow > 0.01
+    });
+
+    // Cells and their items.
+    let pulse = 0.5 + 0.5 * (anim.time * 4.0).sin();
+    for &(id, gx, gy) in &layout.slots {
+        let (cx, cy) = layout.at(gx + 1.0, gy + 1.0);
+        let size = (CELL - 2.0) * s;
         let stack = match id {
             SlotId::Catalog(i) => view.catalog.get(i).map(|&item| ItemStack::one(item)),
             _ => (view.slot)(id),
         };
-        if let Some(stack) = stack {
-            ui.item(ix, iy, 16.0 * s, &stack);
-        } else if let SlotId::Armor(i) = id {
-            // An empty armor slot shows a faint outline of what goes there.
-            ui.sprite(ix, iy, 16.0 * s, Tex::armor(i, 1), [70, 70, 70, 160]);
+        let glow = anim.hover.get(&id).copied().unwrap_or(0.0);
+        let result = matches!(id, SlotId::Output | SlotId::FurnaceOut);
+        let outline = if result {
+            // A ready result breathes softly.
+            let ready = if stack.is_some() { 60.0 * pulse } else { 0.0 };
+            with_alpha(ACCENT, ACCENT[3] as f32 + ready + 60.0 * glow)
+        } else {
+            with_alpha(OUTLINE, OUTLINE[3] as f32 + 50.0 * glow)
+        };
+        ui.frame(cx, cy, size, size, s, outline);
+        if glow > 0.0 {
+            ui.rect(
+                cx,
+                cy,
+                size,
+                size,
+                with_alpha(HOVER, HOVER[3] as f32 * glow),
+            );
         }
-        if hovered == Some(id) {
-            ui.rect(ix, iy, 16.0 * s, 16.0 * s, [255, 255, 255, 110]);
+        let (ix, iy) = layout.at(gx + 2.0, gy + 2.0);
+        // Items pop when they land in a cell (not the catalog's, which never change).
+        let scale = match id {
+            SlotId::Catalog(_) => 1.0,
+            _ => anim
+                .pops
+                .entry(id)
+                .or_insert_with(|| Pop::new(&stack))
+                .observe(&stack, dt),
+        };
+        if let Some(stack) = stack {
+            let icon = (16.0 * s * scale).round();
+            let off = ((icon - 16.0 * s) / 2.0).round();
+            ui.item(ix - off, iy - off, icon, &stack);
+        } else if let SlotId::Armor(i) = id {
+            // An empty suit slot says what goes there.
+            let text = ["hd", "bd", "lg", "ft"][i];
+            let tw = ui.text_width(text);
+            let (_, ch) = ui.char_size();
+            ui.text_plain(
+                cx + (size - tw) / 2.0,
+                cy + (size - ch) / 2.0 + s,
+                text,
+                FAINT,
+            );
         }
     }
 
-    // The held stack follows the mouse; otherwise the hovered item's tooltip.
+    // The held stack follows the mouse (popping when picked up); otherwise the hovered
+    // item's details, on a card that fades and slides in.
     let (mx, my) = view.mouse;
+    let held = anim.held.observe(&view.cursor, dt);
+    let card = if view.cursor.is_some() { None } else { hovered };
+    if card != anim.card.0 {
+        anim.card = (card, 0.0);
+    }
+    anim.card.1 = approach(anim.card.1, 1.0, 20.0, dt);
     if let Some(stack) = view.cursor {
-        ui.item(mx - 8.0 * s, my - 8.0 * s, 16.0 * s, &stack);
+        let icon = (16.0 * s * held).round();
+        ui.item(mx - icon / 2.0, my - icon / 2.0, icon, &stack);
     } else if let Some(id) = hovered {
         let stack = match id {
             SlotId::Catalog(i) => view.catalog.get(i).map(|&item| ItemStack::one(item)),
             _ => (view.slot)(id),
         };
         if let Some(stack) = stack {
-            tooltip(ui, mx + 12.0 * s, my - 12.0 * s, &stack);
+            let card_start = ui.vertices.len();
+            tooltip(ui, mx + 12.0 * s, my + 8.0 * s, &stack);
+            let a = ease_out(anim.card.1);
+            ui.fade_from(card_start, a, 0.0, (1.0 - a) * 3.0 * s);
         }
     }
+
+    // Kept for the closing fade, then faded and lifted in while opening (the dim only fades).
+    anim.closing.clear();
+    anim.closing.extend_from_slice(&ui.vertices[start..]);
+    let e = ease_out(anim.open);
+    ui.fade_from(start, e, 0.0, 0.0);
+    ui.fade_from(start + 4, 1.0, 0.0, (1.0 - e) * RISE * s);
 }
 
-/// Minecraft-style tooltip: the name, then what the item does.
+/// A colour with a new alpha (clamped to 0..255).
+fn with_alpha(color: [u8; 4], alpha: f32) -> [u8; 4] {
+    [color[0], color[1], color[2], alpha.clamp(0.0, 255.0) as u8]
+}
+
+/// An item's details: its name, then a few short facts, on a dark translucent card.
 pub fn tooltip(ui: &mut Ui, x: f32, y: f32, stack: &ItemStack) {
     let s = ui.scale;
-    let mut lines: Vec<(String, [u8; 4])> = vec![(stack.item.name(), [255, 255, 255, 255])];
-    let grey = [170, 170, 170, 255];
-    let blue = [85, 85, 255, 255];
+    let name = stack.item.name().to_lowercase();
+    let mut facts: Vec<String> = Vec::new();
     if let Some((kind, tier)) = stack.item.tool() {
         let (damage, speed) = stack.item.attack();
-        lines.push((String::new(), grey));
-        lines.push(("When in main hand:".into(), grey));
-        lines.push((format!(" {damage} Attack Damage"), [0, 168, 0, 255]));
-        lines.push((format!(" {speed} Attack Speed"), [0, 168, 0, 255]));
+        facts.push(format!("damage {damage}   {speed}/s"));
         if kind != ToolKind::Sword {
-            lines.push((format!(" {}x Mining Speed", tier.speed()), blue));
-            let level = match tier {
-                Tier::Wood | Tier::Gold => "stone, coal",
-                Tier::Stone => "iron, copper",
-                Tier::Iron => "gold, diamonds",
-                Tier::Diamond => "everything",
-            };
-            if kind == ToolKind::Pickaxe {
-                lines.push((format!(" Mines {level}"), blue));
-            }
+            facts.push(format!("dig speed x{}", tier.speed()));
         }
-        lines.push((
-            format!(
-                "Durability: {} / {}",
-                tier.durability() - stack.wear,
-                tier.durability()
-            ),
-            grey,
-        ));
     }
     if let Some((piece, tier)) = stack.item.armor() {
-        lines.push((String::new(), grey));
-        lines.push(("When worn:".into(), grey));
-        lines.push((format!(" +{} Armor", tier.points(piece)), blue));
-        let max = tier.durability(piece);
-        lines.push((format!("Durability: {} / {}", max - stack.wear, max), grey));
+        facts.push(format!("plating +{}", tier.points(piece)));
+    }
+    if let Some(max) = stack.item.max_durability() {
+        facts.push(format!("wear {} / {}", max - stack.wear.min(max), max));
     }
     if let Some((food, _)) = stack.item.food() {
-        lines.push((format!("Restores {food} hunger"), grey));
+        facts.push(format!("food +{food}"));
     }
     if let Some(fuel) = stack.item.fuel() {
-        lines.push((format!("Fuel: {} s", fuel), grey));
+        facts.push(format!("burns {fuel} s"));
     }
     if let Some(result) = stack.item.smelted() {
-        lines.push((format!("Smelts into {}", result.name()), grey));
+        facts.push(format!("smelts to {}", result.name().to_lowercase()));
     }
     let (_, ch) = ui.char_size();
-    let width = lines
-        .iter()
-        .map(|(l, _)| ui.text_width(l))
+    let width = std::iter::once(&name)
+        .chain(&facts)
+        .map(|l| ui.text_width(l))
         .fold(0.0, f32::max)
-        + 8.0 * s;
-    let height = lines.len() as f32 * (ch + 2.0 * s) + 6.0 * s;
+        + 10.0 * s;
+    let height = (1 + facts.len()) as f32 * (ch + 2.0 * s) + 8.0 * s;
     let x = x.min(ui.width - width - 2.0 * s);
     let y = y.max(2.0 * s).min(ui.height - height - 2.0 * s);
-    ui.rect(x, y, width, height, [16, 0, 16, 240]);
-    ui.frame(
-        x + s,
-        y + s,
-        width - 2.0 * s,
-        height - 2.0 * s,
-        s,
-        [80, 0, 255, 120],
-    );
+    ui.rect(x, y, width, height, [8, 10, 14, 230]);
+    ui.rect(x, y, s, height, ACCENT);
     let mut ly = y + 4.0 * s;
-    for (line, color) in &lines {
-        ui.text(x + 4.0 * s, ly, line, *color);
+    ui.text_plain(x + 5.0 * s, ly, &name, LINE);
+    for fact in &facts {
         ly += ch + 2.0 * s;
+        ui.text_plain(x + 5.0 * s, ly, fact, LABEL);
     }
 }

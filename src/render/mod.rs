@@ -19,6 +19,7 @@ mod context;
 pub mod font;
 mod frustum;
 mod mesh;
+mod particles;
 mod pipeline;
 mod starfield;
 mod swapchain;
@@ -35,7 +36,7 @@ use std::{
 use anyhow::{Result, ensure};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use glam::{DVec3, Mat3, Mat4, Vec3, Vec4};
+use glam::{DVec3, Mat3, Mat4, Quat, Vec3, Vec4};
 use gpu_allocator::{
     MemoryLocation,
     vulkan::{Allocator, AllocatorCreateDesc},
@@ -49,6 +50,10 @@ use buffer::Buffer;
 use context::VulkanContext;
 use frustum::Frustum;
 use mesh::{GpuMesh, PushConstants};
+use particles::{
+    CAPACITY as PARTICLE_CAPACITY, GROUP as PARTICLE_GROUP, ParticleEnvironment, ParticleFrame,
+    ParticlePush, Particles,
+};
 use pipeline::{BINDINGS, PUSH_STAGES, Pipelines};
 use swapchain::{
     ColorTarget, DepthBuffer, Swapchain, color_subresource_range, depth_subresource_range,
@@ -56,6 +61,7 @@ use swapchain::{
 use texture::Texture;
 
 pub use mesh::{BlockVertex, ChunkMesh, DrawItem, Fade, MeshHandle, UiVertex};
+pub use particles::{Emitter as ParticleEmitter, flags as particle_flags};
 pub use texture::TextureArrayData;
 
 /// How many frames the CPU may record ahead of the GPU.
@@ -68,8 +74,10 @@ const MAX_UI_VERTICES: usize = 1 << 16;
 
 /// Per-frame scene parameters. Directions are in the world (= planet body) frame.
 pub struct FrameParams {
-    /// Camera position relative to the planet centre.
+    /// Camera position relative to home's centre (for the atmosphere).
     pub camera_planet: DVec3,
+    /// What particles fall towards (absolute): the centre of the world loaded now.
+    pub gravity_center: DVec3,
     /// Direction towards the sun.
     pub sun_dir: Vec3,
     pub sun_angular_radius: f32,
@@ -94,6 +102,10 @@ pub struct FrameParams {
     pub far_discard_radius: f32,
     /// The block the player is looking at (outlined).
     pub target: Option<BlockTarget>,
+    /// Particle simulation: gravity at the surface (m/s^2), wind (m/s) and the time step (s).
+    pub gravity: f32,
+    pub wind: Vec3,
+    pub particle_dt: f32,
 }
 
 /// The targeted block, for the outline drawn by `block.frag`.
@@ -168,6 +180,8 @@ pub struct Renderer {
     /// Font atlas for the overlay, and the overlay's vertices (one buffer per frame).
     font: Texture,
     ui_buffers: Vec<Buffer>,
+    /// GPU particles (see `particles`).
+    particles: Particles,
 
     frames: Vec<Frame>,
     /// Vertex blocks to free once the matching frame slot's fence has signalled.
@@ -278,6 +292,7 @@ impl Renderer {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        let particles = Particles::new(device, &mut allocator, FRAMES_IN_FLIGHT)?;
         let (descriptor_pool, descriptor_sets) = create_descriptors(device, &pipelines)?;
         let quad_indices = create_quad_index_buffer(&ctx, &mut allocator, upload_pool)?;
 
@@ -328,6 +343,7 @@ impl Renderer {
             quad_indices,
             font,
             ui_buffers,
+            particles,
             frames,
             garbage: (0..FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect(),
             frame_index: 0,
@@ -379,11 +395,26 @@ impl Renderer {
                 image(self.depth.view, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
             ),
         ];
-        for (set, uniforms) in self.descriptor_sets.iter().zip(&self.frame_uniforms) {
+        let particles = [vk::DescriptorBufferInfo {
+            buffer: self.particles.buffer.handle,
+            offset: 0,
+            range: vk::WHOLE_SIZE,
+        }];
+        for ((set, uniforms), batch) in self
+            .descriptor_sets
+            .iter()
+            .zip(&self.frame_uniforms)
+            .zip(&self.particles.batches)
+        {
             let buffer = [vk::DescriptorBufferInfo {
                 buffer: uniforms.handle,
                 offset: 0,
                 range: size_of::<FrameUniforms>() as u64,
+            }];
+            let batch = [vk::DescriptorBufferInfo {
+                buffer: batch.handle,
+                offset: 0,
+                range: Particles::batch_bytes(),
             }];
             let mut writes: Vec<_> = images
                 .iter()
@@ -401,6 +432,20 @@ impl Renderer {
                     .dst_binding(6)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .buffer_info(&buffer),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(11)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&particles),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(12)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&batch),
             );
             unsafe { self.ctx.device.update_descriptor_sets(&writes, &[]) };
         }
@@ -503,7 +548,8 @@ impl Renderer {
     }
 
     /// Renders one frame: chunk meshes (frustum culled), far terrain, models and dropped items
-    /// (`objects`), then translucent water.
+    /// (`objects`), translucent water, and the first-person `view_model` in front of it all.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         camera: &Camera,
@@ -511,6 +557,7 @@ impl Renderer {
         chunks: &[DrawItem],
         far: &[DrawItem],
         objects: &[DrawItem],
+        view_model: Option<DrawItem>,
         ui: &[UiVertex],
     ) -> Result<RenderStats> {
         let size = self.window.inner_size();
@@ -534,6 +581,19 @@ impl Renderer {
         for alloc in self.garbage[self.frame_index].drain(..) {
             self.arena.free(alloc);
         }
+        // Particles: what to draw, simulate and spawn this frame (writes this slot's batch).
+        let particle_frame = self.particles.prepare(
+            self.frame_index,
+            &ParticleEnvironment {
+                camera: camera.position,
+                planet_center: params.gravity_center,
+                gravity: params.gravity,
+                wind: params.wind,
+                dt: params.particle_dt,
+                view_proj: camera.view_projection(self.aspect_ratio()),
+                near: camera.near,
+            },
+        )?;
         let uniforms = self.frame_uniforms(camera, params);
         self.frame_uniforms[self.frame_index].write(0, bytemuck::bytes_of(&uniforms))?;
         let ui_len = ui.len().min(MAX_UI_VERTICES) / 4 * 4;
@@ -594,6 +654,8 @@ impl Renderer {
             chunks,
             far,
             objects,
+            view_model,
+            particle_frame,
             ui_len as u32 / 4,
             capture.as_ref().map(|c| c.1.handle),
         );
@@ -741,6 +803,8 @@ impl Renderer {
         chunks: &[DrawItem],
         far: &[DrawItem],
         objects: &[DrawItem],
+        view_model: Option<DrawItem>,
+        particle_frame: ParticleFrame,
         ui_quads: u32,
         capture: Option<vk::Buffer>,
     ) -> RenderStats {
@@ -770,17 +834,18 @@ impl Renderer {
         stats.chunks_drawn = visible_chunks.len();
 
         // Models and dropped items (only those whose mesh is uploaded).
-        let visible_objects: Vec<(usize, Vec3)> = objects
+        let visible_objects: Vec<(usize, Vec3, Quat)> = objects
             .iter()
             .filter_map(|d| {
                 let rel = (d.origin - camera.position).as_vec3();
                 (self.meshes.get(d.mesh.0).is_some_and(Option::is_some)
                     && frustum.sphere_visible(rel, d.radius))
-                .then_some((d.mesh.0, rel))
+                .then_some((d.mesh.0, rel, d.rotation))
             })
             .collect();
 
-        let mut visible_far: Vec<(f32, usize, Vec3, Fade)> = far
+        // (Far terrain can be another world's, turned into place: it keeps its rotation.)
+        let mut visible_far: Vec<(f32, usize, Vec3, Fade, Quat)> = far
             .iter()
             .filter_map(|d| {
                 let rel = (d.origin - camera.position).as_vec3();
@@ -789,22 +854,40 @@ impl Renderer {
                     d.mesh.0,
                     rel,
                     d.fade,
+                    d.rotation,
                 ))
             })
             .collect();
         visible_far.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         stats.far_drawn = visible_far.len();
 
-        let push_for = |rel: Vec3, scale: f32, clip: [f32; 2], fade: Fade| {
+        let push_for = |rel: Vec3, scale: f32, clip: [f32; 2], fade: Fade, rotation: Quat| {
             let (progress, direction) = fade.shader();
             PushConstants {
                 mvp: view_proj * Mat4::from_translation(rel),
                 offset: rel.extend(clip[0]),
                 params: Vec4::new(scale, clip[1], progress, direction),
+                rotation: Vec4::from(rotation),
             }
         };
 
         unsafe {
+            if particle_frame.clear {
+                device.cmd_fill_buffer(cmd, self.particles.buffer.handle, 0, vk::WHOLE_SIZE, 0);
+                self.particle_barrier(
+                    cmd,
+                    (
+                        vk::PipelineStageFlags2::CLEAR,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    ),
+                    (
+                        vk::PipelineStageFlags2::VERTEX_SHADER
+                            | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                        vk::AccessFlags2::SHADER_STORAGE_READ
+                            | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    ),
+                );
+            }
             // Transition the HDR target + depth buffer into attachment layouts. Both are
             // shared between frames in flight, so the barriers also order us after the
             // previous frame's writes and its atmosphere pass reading them.
@@ -825,7 +908,8 @@ impl Renderer {
                     .src_stage_mask(
                         vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                             | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                            | vk::PipelineStageFlags2::FRAGMENT_SHADER
+                            | vk::PipelineStageFlags2::COMPUTE_SHADER,
                     )
                     .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .dst_stage_mask(
@@ -909,7 +993,12 @@ impl Renderer {
             device.cmd_bind_index_buffer(cmd, self.quad_indices.handle, 0, vk::IndexType::UINT32);
 
             // `clip`: [inner, outer] discard radii (clip pipelines only).
-            let draw = |slot: usize, rel: Vec3, section: Section, clip: [f32; 2], fade: Fade| {
+            let draw_rotated = |slot: usize,
+                                rel: Vec3,
+                                section: Section,
+                                clip: [f32; 2],
+                                fade: Fade,
+                                rotation: Quat| {
                 let Some(Some(mesh)) = self.meshes.get(slot) else {
                     return;
                 };
@@ -929,7 +1018,7 @@ impl Renderer {
                     layout,
                     PUSH_STAGES,
                     0,
-                    bytemuck::bytes_of(&push_for(rel, mesh.scale, clip, fade)),
+                    bytemuck::bytes_of(&push_for(rel, mesh.scale, clip, fade, rotation)),
                 );
                 device.cmd_bind_vertex_buffers(
                     cmd,
@@ -938,6 +1027,9 @@ impl Renderer {
                     &[mesh.alloc.offset],
                 );
                 device.cmd_draw_indexed(cmd, quads * 6, 1, 0, first_vertex as i32, 0);
+            };
+            let draw = |slot: usize, rel: Vec3, section: Section, clip: [f32; 2], fade: Fade| {
+                draw_rotated(slot, rel, section, clip, fade, Quat::IDENTITY)
             };
             // LOD terrain is hidden inside `lod_radius`, where the real chunks are loaded; chunk
             // water is hidden outside it (LOD water takes over there).
@@ -960,30 +1052,105 @@ impl Renderer {
                     draw(slot, rel, Section::Opaque, [0.0, NONE], fade);
                 }
             }
-            for &(_, slot, rel, fade) in &visible_far {
-                draw(slot, rel, Section::Opaque, [lod_radius, NONE], fade);
+            for &(_, slot, rel, fade, turn) in &visible_far {
+                draw_rotated(slot, rel, Section::Opaque, [lod_radius, NONE], fade, turn);
             }
             // Glass and other cutout blocks in chunks.
             for &(_, slot, rel, fade) in &visible_chunks {
                 draw(slot, rel, Section::Cutout, [0.0, NONE], fade);
             }
             // Models and dropped items: the clip pipeline also does their cutout sprites.
-            for &(slot, rel) in &visible_objects {
-                draw(slot, rel, Section::Opaque, [0.0, NONE], Fade::Visible);
+            for &(slot, rel, rotation) in &visible_objects {
+                draw_rotated(
+                    slot,
+                    rel,
+                    Section::Opaque,
+                    [0.0, NONE],
+                    Fade::Visible,
+                    rotation,
+                );
             }
 
-            // 3. Translucent water, back to front.
+            // Particles: one quad per ring slot of the live range (dead ones collapse).
+            let draw_particles = |pipeline: vk::Pipeline, blended: bool| {
+                let Some((first, count)) = particle_frame.draw else {
+                    return;
+                };
+                let orientation = camera.orientation();
+                let push = ParticlePush {
+                    view_proj,
+                    anchor: (particle_frame.draw_anchor - camera.position)
+                        .as_vec3()
+                        .extend(if blended { 1.0 } else { 0.0 }),
+                    right: (orientation * Vec3::X).extend(first as f32),
+                    up: (orientation * Vec3::Y).extend(PARTICLE_CAPACITY as f32),
+                };
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                device.cmd_push_constants(cmd, layout, PUSH_STAGES, 0, bytemuck::bytes_of(&push));
+                device.cmd_draw(cmd, count * 6, 1, 0, 0);
+            };
+            // 3. Particles: simulate and spawn against the depth of the world drawn so far, i.e.
+            //    not the particles themselves, the water or the arm. (Debris colliding with its
+            //    own quad climbed towards the camera.) Rendering pauses for the compute work.
+            if particle_frame.simulate.is_some() || particle_frame.spawn > 0 {
+                device.cmd_end_rendering(cmd);
+                self.particle_compute(cmd, &particle_frame);
+                let color = color_attachment.load_op(vk::AttachmentLoadOp::LOAD);
+                let depth = depth_attachment.load_op(vk::AttachmentLoadOp::LOAD);
+                let resume = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D::default(),
+                        extent,
+                    })
+                    .layer_count(1)
+                    .color_attachments(slice::from_ref(&color))
+                    .depth_attachment(&depth);
+                device.cmd_begin_rendering(cmd, &resume);
+            }
+            // Debris and other cut-out particles.
+            draw_particles(self.pipelines.particles, false);
+
+            // 4. Translucent water, back to front.
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.water);
-            for &(_, slot, rel, fade) in visible_far.iter().rev() {
-                draw(slot, rel, Section::Water, [lod_radius, NONE], fade);
+            for &(_, slot, rel, fade, turn) in visible_far.iter().rev() {
+                draw_rotated(slot, rel, Section::Water, [lod_radius, NONE], fade, turn);
             }
             for &(_, slot, rel, fade) in visible_chunks.iter().rev() {
                 draw(slot, rel, Section::Water, [0.0, lod_radius], fade);
             }
 
+            // Translucent particles (rain, snow, dust) over everything but the view model.
+            draw_particles(self.pipelines.particles_blend, true);
+
+            // 5. The first-person view model, last and with its own depth range (always in
+            //    front, see `Camera::view_model_projection`). params.z < 0 tells the shader
+            //    it isn't part of the world (no target outline).
+            if let Some(vm) = view_model
+                && let Some(Some(mesh)) = self.meshes.get(vm.mesh.0)
+                && mesh.opaque_quads > 0
+            {
+                let rel = (vm.origin - camera.position).as_vec3();
+                let push = PushConstants {
+                    mvp: camera.view_model_projection(self.aspect_ratio())
+                        * Mat4::from_translation(rel),
+                    offset: rel.extend(0.0),
+                    params: Vec4::new(mesh.scale, NONE, -1.0, 0.0),
+                    rotation: Vec4::from(Quat::IDENTITY),
+                };
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.far);
+                device.cmd_push_constants(cmd, layout, PUSH_STAGES, 0, bytemuck::bytes_of(&push));
+                device.cmd_bind_vertex_buffers(
+                    cmd,
+                    0,
+                    &[self.arena.buffer(mesh.alloc.page)],
+                    &[mesh.alloc.offset],
+                );
+                device.cmd_draw_indexed(cmd, mesh.opaque_quads * 6, 1, 0, 0, 0);
+            }
+
             device.cmd_end_rendering(cmd);
 
-            // 4. Atmosphere, sky and tone mapping: reads the HDR scene + depth, writes the
+            // 6. Atmosphere, sky and tone mapping: reads the HDR scene + depth, writes the
             //    swapchain image.
             let to_composite = [
                 vk::ImageMemoryBarrier2::default()
@@ -1001,7 +1168,10 @@ impl Renderer {
                             | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                     )
                     .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::FRAGMENT_SHADER
+                            | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    )
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                     .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                     .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
@@ -1039,7 +1209,7 @@ impl Renderer {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.sky);
             device.cmd_draw(cmd, 3, 1, 0, 0);
 
-            // 5. The overlay (console, HUD).
+            // 7. The overlay (console, HUD).
             if ui_quads > 0 {
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipelines.ui);
                 let screen = [extent.width as f32, extent.height as f32, 0.0, 0.0];
@@ -1117,6 +1287,137 @@ impl Renderer {
         stats
     }
 
+    /// Simulates the live particles and spawns this frame's new ones, between the world and
+    /// everything drawn after it: the depth buffer becomes readable for the compute shaders,
+    /// then an attachment again (contents kept); the HDR target keeps its contents.
+    fn particle_compute(&self, cmd: vk::CommandBuffer, frame: &ParticleFrame) {
+        use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as P};
+        let device = &self.ctx.device;
+        let tests = P::EARLY_FRAGMENT_TESTS | P::LATE_FRAGMENT_TESTS;
+        let depth = |(src_stage, src_access, old): (P, A, L),
+                     (dst_stage, dst_access, new): (P, A, L)| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(src_stage)
+                .src_access_mask(src_access)
+                .dst_stage_mask(dst_stage)
+                .dst_access_mask(dst_access)
+                .old_layout(old)
+                .new_layout(new)
+                .image(self.depth.image)
+                .subresource_range(depth_subresource_range())
+        };
+        let to_compute = [depth(
+            (
+                tests,
+                A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                L::DEPTH_ATTACHMENT_OPTIMAL,
+            ),
+            (
+                P::COMPUTE_SHADER,
+                A::SHADER_SAMPLED_READ,
+                L::DEPTH_READ_ONLY_OPTIMAL,
+            ),
+        )];
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&to_compute),
+            );
+        }
+
+        let read_write = A::SHADER_STORAGE_READ | A::SHADER_STORAGE_WRITE;
+        // Last frame's particle draws read the buffer we now write.
+        self.particle_barrier(
+            cmd,
+            (P::VERTEX_SHADER, A::SHADER_STORAGE_READ),
+            (P::COMPUTE_SHADER, read_write),
+        );
+        unsafe {
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipelines.layout,
+                0,
+                &[self.descriptor_sets[self.frame_index]],
+                &[],
+            );
+            if let Some((_, count)) = frame.simulate {
+                let sim = self.pipelines.particle_sim;
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, sim);
+                device.cmd_dispatch(cmd, count.div_ceil(PARTICLE_GROUP), 1, 1);
+            }
+        }
+        if frame.simulate.is_some() {
+            self.particle_barrier(
+                cmd,
+                (P::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
+                (P::COMPUTE_SHADER, read_write),
+            );
+        }
+        if frame.spawn > 0 {
+            let emit = self.pipelines.particle_emit;
+            unsafe {
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, emit);
+                device.cmd_dispatch(cmd, frame.spawn.div_ceil(PARTICLE_GROUP), 1, 1);
+            }
+        }
+        // This frame's particle draws read the result.
+        self.particle_barrier(
+            cmd,
+            (P::COMPUTE_SHADER, A::SHADER_STORAGE_WRITE),
+            (P::VERTEX_SHADER | P::COMPUTE_SHADER, read_write),
+        );
+
+        // Back to rendering: depth an attachment again, colour writes ordered after the
+        // first half's.
+        let back = [depth(
+            (P::COMPUTE_SHADER, A::NONE, L::DEPTH_READ_ONLY_OPTIMAL),
+            (
+                tests,
+                A::DEPTH_STENCIL_ATTACHMENT_READ | A::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                L::DEPTH_ATTACHMENT_OPTIMAL,
+            ),
+        )];
+        let colour = [vk::MemoryBarrier2::default()
+            .src_stage_mask(P::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(A::COLOR_ATTACHMENT_WRITE)
+            .dst_stage_mask(P::COLOR_ATTACHMENT_OUTPUT)
+            .dst_access_mask(A::COLOR_ATTACHMENT_READ | A::COLOR_ATTACHMENT_WRITE)];
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&colour)
+                    .image_memory_barriers(&back),
+            );
+        }
+    }
+
+    /// A memory barrier on the whole particle buffer, from `(stages, accesses)` to `(stages,
+    /// accesses)`.
+    fn particle_barrier(
+        &self,
+        cmd: vk::CommandBuffer,
+        (src_stage, src_access): (vk::PipelineStageFlags2, vk::AccessFlags2),
+        (dst_stage, dst_access): (vk::PipelineStageFlags2, vk::AccessFlags2),
+    ) {
+        let barrier = [vk::BufferMemoryBarrier2::default()
+            .src_stage_mask(src_stage)
+            .src_access_mask(src_access)
+            .dst_stage_mask(dst_stage)
+            .dst_access_mask(dst_access)
+            .buffer(self.particles.buffer.handle)
+            .offset(0)
+            .size(vk::WHOLE_SIZE)];
+        let info = vk::DependencyInfo::default().buffer_memory_barriers(&barrier);
+        unsafe { self.ctx.device.cmd_pipeline_barrier2(cmd, &info) };
+    }
+
+    /// Queues particles to spawn at the end of this frame (see `particles::Emitter`).
+    pub fn emit_particles(&mut self, emitters: &[ParticleEmitter]) {
+        self.particles.emit(emitters);
+    }
+
     /// Saves the next rendered frame as a BMP file.
     pub fn request_capture(&mut self, path: PathBuf) {
         self.capture_request = Some(path);
@@ -1172,6 +1473,7 @@ impl Drop for Renderer {
             for buffer in &mut self.ui_buffers {
                 buffer.destroy(device, allocator);
             }
+            self.particles.destroy(device, allocator);
             self.swapchain.destroy(&self.ctx);
             self.pipelines.destroy(device);
             for frame in &self.frames {
@@ -1198,6 +1500,7 @@ fn create_descriptors(
         vk::DescriptorType::SAMPLED_IMAGE,
         vk::DescriptorType::SAMPLER,
         vk::DescriptorType::UNIFORM_BUFFER,
+        vk::DescriptorType::STORAGE_BUFFER,
     ]
     .map(|ty| vk::DescriptorPoolSize {
         ty,

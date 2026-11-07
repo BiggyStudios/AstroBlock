@@ -255,9 +255,16 @@ impl WorldStreamer {
         }
     }
 
-    /// Call once per frame.
-    pub fn update(&mut self, camera_pos: DVec3, renderer: &mut Renderer) -> Result<()> {
-        let rel = camera_pos - self.planet.center;
+    /// Call once per frame. Chunks load around `focus` (the player or their craft); the LOD
+    /// terrain is chosen for `lod_camera` (the same, except when looking from afar: the map).
+    pub fn update(
+        &mut self,
+        focus: DVec3,
+        lod_camera: DVec3,
+        renderer: &mut Renderer,
+    ) -> Result<()> {
+        let rel = focus - self.planet.center;
+        let lod_rel = lod_camera - self.planet.center;
 
         let centre = self.planet.chunk_at(rel);
         if self.centre != Some(centre) {
@@ -275,10 +282,10 @@ impl WorldStreamer {
 
         if self
             .lod_camera
-            .is_none_or(|c| (c - rel).length() > LOD_RESELECT_DISTANCE)
+            .is_none_or(|c| (c - lod_rel).length() > LOD_RESELECT_DISTANCE)
         {
-            self.lod_camera = Some(rel);
-            self.reselect_lod(rel);
+            self.lod_camera = Some(lod_rel);
+            self.reselect_lod(lod_rel);
         }
 
         // Collect finished work and upload a bounded number of meshes.
@@ -636,6 +643,7 @@ impl WorldStreamer {
             .filter_map(|(key, &(start, out))| {
                 let tile = self.lod_tiles.get(key)?;
                 Some(DrawItem {
+                    rotation: glam::Quat::IDENTITY,
                     mesh: tile.mesh?,
                     origin: self.planet.center + tile.origin,
                     radius: tile.radius,
@@ -819,6 +827,7 @@ impl WorldStreamer {
         let now = Instant::now();
         let loaded = self.chunks.values().filter_map(|c| {
             c.mesh.map(|mesh| DrawItem {
+                rotation: glam::Quat::IDENTITY,
                 mesh,
                 origin: self.planet.center + c.origin,
                 radius: c.radius,
@@ -826,6 +835,7 @@ impl WorldStreamer {
             })
         });
         let retiring = self.retiring.iter().map(|r| DrawItem {
+            rotation: glam::Quat::IDENTITY,
             mesh: r.mesh,
             origin: self.planet.center + r.origin,
             radius: r.radius,

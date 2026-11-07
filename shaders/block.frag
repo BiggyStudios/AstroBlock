@@ -114,15 +114,18 @@ void main() {
     // Outline of the block the player is looking at (and how far mining has got).
     vec3 local = (frame.target * vec4(v_rel, 1.0)).xyz;
     float edge_width = max(0.02, 1.5 * length(fwidth(local)));
-    if (frame.target_info.x > 0.5) {
+    // (params.z < 0: the first-person view model, which is never outlined.)
+    if (frame.target_info.x > 0.5 && pc.params.z >= 0.0) {
         vec3 a = abs(local);
         float largest = max(a.x, max(a.y, a.z));
         if (largest < 1.02) {
             float second = a.x + a.y + a.z - largest - min(a.x, min(a.y, a.z));
             if (second > 1.0 - edge_width) {
-                color *= 0.1;
+                // A soft light edge (brightened, not a dark line).
+                color = color * 1.8 + albedo * 0.02 * frame.sun_color.rgb;
             } else {
-                color *= 1.0 - 0.6 * frame.target_info.y;
+                // Mining progress: the block fades a little.
+                color *= 1.0 - 0.45 * frame.target_info.y;
             }
         }
     }

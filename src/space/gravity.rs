@@ -13,6 +13,7 @@ pub const SURFACE_GRAVITY: f64 = 9.81;
 /// Sea-level air density (kg/m^3).
 const SEA_LEVEL_DENSITY: f64 = 1.225;
 
+#[derive(Clone)]
 pub struct PlanetGravity {
     /// Gravitational parameter G*M (m^3/s^2).
     pub mu: f64,
@@ -27,6 +28,15 @@ pub struct PlanetGravity {
 
 impl PlanetGravity {
     pub fn new(radius: f64, scale_height: f64, atmosphere_top: f64) -> Self {
+        Self::with_gravity(radius, SURFACE_GRAVITY, scale_height, atmosphere_top)
+    }
+
+    /// A body without air (`atmosphere_top` 0) and surface gravity `g`: a moon.
+    pub fn airless(radius: f64, g: f64) -> Self {
+        Self::with_gravity(radius, g, 1.0, 0.0)
+    }
+
+    fn with_gravity(radius: f64, g: f64, scale_height: f64, atmosphere_top: f64) -> Self {
         // Layer boundaries match `TerrainGenerator::deep_block`: inner core to 0.2 R, outer
         // core to 0.55 R, mantle up to 3 km below sea level, then crust. Densities in g/cm^3.
         let bounds = [
@@ -35,7 +45,7 @@ impl PlanetGravity {
             (radius - 3_000.0, 4.5),
             (radius, 2.7),
         ];
-        let mu = SURFACE_GRAVITY * radius * radius;
+        let mu = g * radius * radius;
         // Enclosed mass (relative units) at each boundary, then scale to the total.
         let mut enclosed = 0.0;
         let mut inner = 0.0f64;
@@ -86,7 +96,7 @@ impl PlanetGravity {
     /// sea-level air.
     pub fn air_density(&self, r: f64) -> f64 {
         let h = r - self.radius;
-        if h >= self.atmosphere_top {
+        if h >= self.atmosphere_top || self.atmosphere_top <= 0.0 {
             0.0
         } else {
             SEA_LEVEL_DENSITY * (-h.max(0.0) / self.scale_height).exp()

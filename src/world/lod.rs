@@ -103,7 +103,7 @@ pub fn tile_bounds(planet: &Planet, key: LodKey) -> (DVec3, f64) {
         key.tv as f64 * key.columns() as f64 + half,
         n,
     );
-    // Surface columns are at most 1.19 m wide (see `planet::MAP_ANGLE`); 1.3 leaves a margin.
+    // Surface columns are at most 1.08 m wide (see `planet::BLOCK_WIDTH`); 1.3 leaves a margin.
     let angular_radius =
         key.columns() as f64 * std::f64::consts::FRAC_1_SQRT_2 * 1.3 / planet.sea_radius;
     (centre, angular_radius)
@@ -287,7 +287,8 @@ fn describe_cell(
         grass_color(s.temperature, s.humidity).map(|c| c * 0.82),
     ));
     let white = BlockVertex::tint565(WHITE);
-    let ocean = ground < sea;
+    let lunar = matches!(s.biome, Biome::Highlands | Biome::Mare);
+    let ocean = ground < sea && !lunar;
     let water_tint = BlockVertex::tint565(pack_rgb(water_color(s.temperature)));
 
     // Forest canopy (coarse levels only): a share of the cells is drawn as tree tops, so
@@ -323,6 +324,10 @@ fn describe_cell(
     }
 
     let (top_tex, side_tex, tint) = match s.biome {
+        Biome::Highlands if steep => (Tex::MoonRock, Tex::MoonRock, white),
+        Biome::Mare if steep => (Tex::Basalt, Tex::Basalt, white),
+        Biome::Highlands => (Tex::Regolith, Tex::MoonRock, white),
+        Biome::Mare => (Tex::Regolith, Tex::Basalt, white),
         Biome::FrozenOcean => (Tex::Ice, Tex::Ice, white),
         Biome::Ocean if s.temperature > 0.25 => (Tex::Sand, Tex::Sandstone, white),
         Biome::Ocean | Biome::DeepOcean => (Tex::Gravel, Tex::Stone, white),

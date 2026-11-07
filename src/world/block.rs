@@ -57,6 +57,12 @@ pub enum Block {
     /// A model; its contents live in `Survival::chests`.
     Chest,
     WhiteWool,
+    /// Loose grey dust over the moon's rock.
+    Regolith,
+    /// The moon's pale highland rock (anorthosite).
+    MoonRock,
+    /// The dark rock of the moon's maria.
+    Basalt,
 }
 
 /// What a block sounds like (footsteps, breaking, placing).
@@ -86,7 +92,7 @@ pub enum Tint {
 
 impl Block {
     /// Every block, in declaration order.
-    pub const ALL: [Block; 44] = {
+    pub const ALL: [Block; 47] = {
         use Block::*;
         [
             Air,
@@ -133,6 +139,9 @@ impl Block {
             Torch,
             Chest,
             WhiteWool,
+            Regolith,
+            MoonRock,
+            Basalt,
         ]
     };
 
@@ -222,6 +231,9 @@ impl Block {
             Torch => [Tex::TorchTop, Tex::TorchSide, Tex::TorchSide],
             Chest => [Tex::ChestTop, Tex::ChestSide, Tex::ChestSide],
             WhiteWool => all(Tex::WhiteWool),
+            Regolith => all(Tex::Regolith),
+            MoonRock => all(Tex::MoonRock),
+            Basalt => all(Tex::Basalt),
         }
     }
 
@@ -233,7 +245,7 @@ impl Block {
             OakLog | SpruceLog | OakPlanks | SprucePlanks | CraftingTable | Chest | Torch => {
                 Material::Wood
             }
-            Sand | RedSand | IlmeniteSand => Material::Sand,
+            Sand | RedSand | IlmeniteSand | Regolith => Material::Sand,
             Gravel => Material::Gravel,
             Snow => Material::Snow,
             Glass | Ice => Material::Glass,
@@ -288,6 +300,6 @@ mod tests {
         for (i, b) in Block::ALL.iter().enumerate() {
             assert_eq!(*b as usize, i);
         }
-        assert_eq!(*Block::ALL.last().unwrap(), Block::WhiteWool);
+        assert_eq!(*Block::ALL.last().unwrap(), Block::Basalt);
     }
 }

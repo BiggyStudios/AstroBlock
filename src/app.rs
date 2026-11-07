@@ -13,27 +13,41 @@ use winit::{
     window::{CursorGrabMode, Window, WindowId},
 };
 
+mod flight;
+mod worlds;
+
+use flight::Flight;
+use worlds::OtherWorld;
+
 use crate::{
     audio::Audio,
     camera::Camera,
     console::{self, Console},
+    effects,
     hud::{self, HudInfo},
     input::Input,
     interact::{self, CREATIVE_REACH, Hit, SURVIVAL_REACH},
     inventory,
     items::{Item, ItemStack},
     mobs::MobKind,
+    models::Light,
     player::{EYE_HEIGHT, GameMode, MAX_PHYSICS_WARP, Physics, Player, PlayerInput, Voxels},
     render::{
-        BlockTarget, FrameParams, RenderStats, Renderer,
+        BlockTarget, DrawItem, FrameParams, RenderStats, Renderer,
         atmosphere::{Atmosphere, AtmosphereLuts},
     },
-    screen::Screen,
-    space::{SolarSystem, gravity::PlanetGravity},
+    screen::{self, Screen},
+    space::{
+        SolarSystem,
+        bodies::{Bodies, Body, MOON_GRAVITY},
+        gravity::PlanetGravity,
+    },
     survival::{self, Pose, Survival},
     ui::Ui,
+    viewmodel::{ViewInput, ViewModel},
     world::{
         block::Block,
+        chunk::BlockCell,
         planet::{Face, Planet},
         streaming::{UNDERGROUND_RADIUS, WorldStreamer},
         terrain::TerrainGenerator,
@@ -46,11 +60,15 @@ use crate::{
 /// rendering to work at all.
 const PLANET_CENTER: DVec3 = DVec3::new(1.496e11, 0.0, 0.0);
 const SEED: u64 = 0x5eed_a57b;
-/// 2048 chunks per face edge -> 65,536 blocks -> ~45.9 km radius, ~288 km circumference.
+/// 2048 chunks per face edge -> 65,536 blocks -> ~43.9 km radius, ~276 km circumference.
 const CHUNKS_PER_FACE: i32 = 2048;
 /// Build limit: layers above sea level. Below sea level the planet is solid all the way
 /// to its centre (see `world::planet` for how the block grid coarsens with depth).
 const HEIGHT_LIMIT: i32 = 1024;
+/// The moon's block world: 512 chunks per face edge, 16,384 blocks (an 11 km radius), and
+/// layers above its datum.
+const MOON_CHUNKS_PER_FACE: i32 = 512;
+const MOON_HEIGHT_LIMIT: i32 = 512;
 const LOAD_RADIUS: f64 = 12.0 * 32.0;
 /// Sun illuminance above the atmosphere, in scene units (all HDR radiance is relative to
 /// it; the auto exposure maps it to the display).
@@ -98,6 +116,14 @@ struct Game {
     exposure: Option<f32>,
     gravity: PlanetGravity,
     player: Player,
+    /// Sun, planet and moon for flight (patched conics).
+    bodies: Bodies,
+    /// The body whose block world is loaded (`planet`, `terrain`, `streamer`, `gravity`),
+    /// and the other one (see `worlds`).
+    active: Body,
+    other: OtherWorld,
+    /// Rockets, the one the player is in, its cameras, the map and maneuver planner.
+    flight: Flight,
     /// Air drag on the player (console: `drag on|off`).
     drag: bool,
     console: Console,
@@ -116,6 +142,15 @@ struct Game {
     last_jump_tap: Option<Instant>,
     /// A short message shown above the hotbar.
     message: Option<(String, Instant)>,
+    /// UI motion state (eased values kept between the immediate-mode frames).
+    hud_anim: hud::HudAnim,
+    screen_anim: screen::ScreenAnim,
+    /// The first-person arm and held item, and the sky light at the camera's cell (cached:
+    /// estimating it samples the terrain).
+    view_model: ViewModel,
+    view_sky: Option<(BlockCell, u32)>,
+    /// The `rain` test shower: drops per second, and the fraction of a drop carried over.
+    rain: Option<(f32, f32)>,
     /// Spectator fly speed in m/s; the scroll wheel scales it exponentially.
     fly_speed: f64,
     mouse_grabbed: bool,
@@ -213,7 +248,9 @@ impl ApplicationHandler for App {
                 match state {
                     // The first click only captures the mouse (unless a screen uses it).
                     ElementState::Pressed
-                        if !game.mouse_grabbed && game.survival.screen.is_none() =>
+                        if !game.mouse_grabbed
+                            && game.survival.screen.is_none()
+                            && game.first_person() =>
                     {
                         game.set_mouse_grab(true)
                     }
@@ -284,7 +321,7 @@ impl Voxels for WorldVoxels<'_> {
         let ground = self.planet.sea_layer + column.height.floor() as i32;
         if k <= ground {
             Block::Stone
-        } else if k < self.planet.sea_layer {
+        } else if k < self.planet.sea_layer && !self.terrain.lunar {
             Block::Water
         } else {
             Block::Air
@@ -419,6 +456,23 @@ impl Game {
             .map(|c| c.split(';').map(|s| s.trim().to_string()).collect())
             .unwrap_or_default();
 
+        let moon_planet = Arc::new(Planet::new(
+            PLANET_CENTER,
+            MOON_CHUNKS_PER_FACE,
+            MOON_HEIGHT_LIMIT,
+            SEED ^ 0x3005_3005,
+        ));
+        let moon_terrain = Arc::new(TerrainGenerator::moon(moon_planet.clone()));
+        let other = OtherWorld {
+            body: Body::Moon,
+            gravity: PlanetGravity::airless(moon_planet.sea_radius, MOON_GRAVITY),
+            streamer: WorldStreamer::new(moon_planet.clone(), moon_terrain.clone(), LOAD_RADIUS),
+            planet: moon_planet,
+            terrain: moon_terrain,
+            state: Default::default(),
+        };
+        let bodies = Bodies::new(system.clone(), gravity.clone(), other.planet.sea_radius);
+
         Ok(Self {
             window,
             camera,
@@ -433,6 +487,10 @@ impl Game {
             atmosphere,
             atmosphere_luts,
             exposure: None,
+            bodies,
+            active: Body::Planet,
+            other,
+            flight: Flight::default(),
             gravity,
             player,
             drag: true,
@@ -445,6 +503,11 @@ impl Game {
             target: None,
             last_jump_tap: None,
             message: None,
+            hud_anim: hud::HudAnim::default(),
+            screen_anim: screen::ScreenAnim::default(),
+            view_model: ViewModel::default(),
+            view_sky: None,
+            rain: None,
             fly_speed: 12.0,
             mouse_grabbed: false,
             last_frame: Instant::now(),
@@ -458,9 +521,15 @@ impl Game {
         })
     }
 
-    /// Body-frame feet position standing on the terrain (or the sea) along `dir`.
+    /// Body-frame feet position standing on the terrain (or home's sea) along `dir`.
     fn ground_position(planet: &Planet, terrain: &TerrainGenerator, dir: DVec3) -> DVec3 {
-        let ground = terrain.sample_column(dir).height.floor().max(0.0);
+        let height = terrain.sample_column(dir).height.floor();
+        // At home low ground is under the sea: stand on the water. The moon is dry.
+        let ground = if terrain.lunar {
+            height
+        } else {
+            height.max(0.0)
+        };
         dir * (planet.sea_radius + ground + 1.0)
     }
 
@@ -480,8 +549,10 @@ impl Game {
         self.update(dt);
 
         let stream_start = Instant::now();
+        let focus = self.stream_focus();
         self.streamer
-            .update(self.camera.position, &mut self.renderer)?;
+            .update(focus, self.camera.position, &mut self.renderer)?;
+        self.update_other_world()?;
         let stream_ms = stream_start.elapsed().as_secs_f64() * 1000.0;
 
         let mut exit = false;
@@ -497,6 +568,10 @@ impl Game {
 
         let draws = self.streamer.draw_items();
         let (mut params, underground) = self.frame_params(dt);
+        if self.flight.map {
+            // Seen from afar: the LOD terrain everywhere (the chunks are tiny specks).
+            params.far_discard_radius = 0.0;
+        }
         if underground {
             // No LOD: chunk water must not hand over to it.
             params.far_discard_radius = f32::INFINITY;
@@ -505,20 +580,43 @@ impl Game {
         let lod = if underground {
             Vec::new()
         } else {
-            self.streamer.lod_draw_items()
+            let mut lod = self.streamer.lod_draw_items();
+            lod.extend(self.other_world_draws());
+            lod
         };
-        let objects = self.survival.draw_items(
+        let mut objects = self.survival.draw_items(
             &self.planet,
             &self.terrain,
             &self.streamer,
             &mut self.renderer,
             self.camera.position,
         )?;
-        let ui = self.overlay();
+        self.send_particles(dt as f32);
+        self.flight_draw_items(&mut objects)?;
+        let flight_effects = self.flight_effects(dt as f32);
+        if !flight_effects.is_empty() {
+            let center = self.planet.center;
+            let emitters: Vec<_> = flight_effects
+                .into_iter()
+                .map(|mut e| {
+                    e.origin += center;
+                    e
+                })
+                .collect();
+            self.renderer.emit_particles(&emitters);
+        }
+        let view_model = self.view_model(dt as f32)?;
+        let ui = self.overlay(dt as f32);
         let camera = &self.camera;
-        self.render_stats =
-            self.renderer
-                .render(camera, &params, &draws, &lod, &objects, &ui.vertices)?;
+        self.render_stats = self.renderer.render(
+            camera,
+            &params,
+            &draws,
+            &lod,
+            &objects,
+            view_model,
+            &ui.vertices,
+        )?;
         self.input.end_frame();
 
         // Exponentially smoothed CPU timings (excluding time spent waiting on the GPU).
@@ -533,9 +631,13 @@ impl Game {
     }
 
     fn update(&mut self, dt: f64) {
-        // Keep the camera upright relative to the planet surface below it.
-        let up = (self.camera.position - self.planet.center).as_vec3();
-        self.camera.set_up(up);
+        // Keep the camera upright relative to the planet surface below it (first person;
+        // the chase and map cameras place themselves).
+        if self.first_person() {
+            let (_, up) = self.feet_and_up();
+            self.camera.set_up(up.as_vec3());
+        }
+        let flying = self.flight.boarded.is_some();
 
         // Inventory screens: E opens one; while open they get the mouse and keys.
         let pose = self.pose();
@@ -553,10 +655,13 @@ impl Game {
                 self.close_screen();
             }
         } else {
-            if self.input.pressed(KeyCode::Escape) {
+            if self.input.pressed(KeyCode::Escape) && !self.flight.map {
                 self.set_mouse_grab(false);
             }
-            if self.input.pressed(KeyCode::KeyE) && self.player.mode != GameMode::Spectator {
+            if self.input.pressed(KeyCode::KeyE)
+                && self.player.mode != GameMode::Spectator
+                && !flying
+            {
                 let screen = if creative {
                     Screen::Creative
                 } else {
@@ -590,11 +695,15 @@ impl Game {
             KeyCode::Digit8,
             KeyCode::Digit9,
         ];
-        if !in_screen && let Some(i) = digits.iter().position(|&k| self.input.pressed(k)) {
+        let on_foot = self.first_person();
+        if !in_screen
+            && on_foot
+            && let Some(i) = digits.iter().position(|&k| self.input.pressed(k))
+        {
             self.survival.select(i);
         }
         let scroll = self.input.scroll;
-        if scroll != 0.0 && !in_screen {
+        if scroll != 0.0 && !in_screen && on_foot {
             if self.player.mode == GameMode::Spectator {
                 self.fly_speed = (self.fly_speed * 1.25f64.powf(scroll as f64)).clamp(0.5, 3.0e8);
             } else {
@@ -604,7 +713,7 @@ impl Game {
             }
         }
 
-        if self.mouse_grabbed {
+        if self.mouse_grabbed && on_foot {
             let (dx, dy) = self.input.mouse_delta;
             self.camera.rotate(
                 dx as f32 * MOUSE_SENSITIVITY,
@@ -613,7 +722,7 @@ impl Game {
         }
 
         // Double-tapping jump toggles creative flight.
-        if self.input.pressed(KeyCode::Space) {
+        if self.input.pressed(KeyCode::Space) && !flying {
             let now = Instant::now();
             if self
                 .last_jump_tap
@@ -626,50 +735,45 @@ impl Game {
             }
         }
 
-        let input = self.player_input();
-
-        // Time warp beyond physics speed needs the player landed or in a stable orbit.
-        let physics = Physics {
-            planet: &self.planet,
-            gravity: &self.gravity,
-            drag: self.drag,
+        self.flight_input(dt);
+        let input = if self.flight.map || flying {
+            PlayerInput {
+                spectator_speed: self.fly_speed,
+                ..Default::default()
+            }
+        } else {
+            self.player_input()
         };
-        let frame0 = self.system.planet_frame(self.time);
-        // (The chosen warp is kept; it applies again once possible.)
-        let mut warp = WARP_LEVELS[self.warp];
-        let mut rails = warp > MAX_PHYSICS_WARP;
-        if rails && !self.player.can_rail_warp(&physics, &frame0, self.time) {
-            warp = MAX_PHYSICS_WARP;
-            rails = false;
-            self.message = Some((
-                format!("Time warp limited to x{MAX_PHYSICS_WARP} while moving in the atmosphere"),
-                Instant::now(),
-            ));
+        let start = self.time;
+        if self.flight.boarded.is_some() {
+            self.fly(dt);
+        } else {
+            if self.flight.eva.is_some() {
+                self.float(dt);
+            } else {
+                self.walk_physics(&input, dt);
+                self.start_floating();
+            }
         }
-        self.effective_warp = warp;
-        let (t0, t1) = (self.time, self.time + dt * warp);
-        let world = WorldVoxels {
-            planet: &self.planet,
-            streamer: &self.streamer,
-            terrain: &self.terrain,
-        };
-        let system = &self.system;
-        self.player
-            .update(&physics, &world, &input, (t0, t1), dt, rails, &|t| {
-                system.planet_frame(t)
-            });
-        self.time = t1;
+        self.update_vessels(start);
+        self.follow_craft_world();
+        let warped = self.time - start;
 
-        // The camera rides at the player's eyes.
-        let feet = self
-            .player
-            .body_position(&self.system.planet_frame(self.time));
-        self.camera.position = self.planet.center + feet + feet.normalize() * EYE_HEIGHT;
+        let feet = self.player.body_position(&self.active_frame(self.time));
+        if self.first_person() {
+            // The camera rides at the player's eyes.
+            let (feet, up) = self.feet_and_up();
+            self.camera.position = self.planet.center + feet + up * EYE_HEIGHT;
+        } else {
+            self.place_flight_camera();
+        }
+        self.update_prediction();
 
         // Fall damage, death and respawn.
         let fallen = std::mem::take(&mut self.player.fallen);
         if self.player.mode == GameMode::Survival {
-            let damage = Player::fall_damage(fallen);
+            let g = self.gravity.acceleration(self.player.position).length() / 9.81;
+            let damage = Player::fall_damage(fallen * g);
             let at = self.camera.position - self.planet.center;
             if damage > 0.0 && self.survival.hurt(damage, true, at) {
                 self.respawn();
@@ -690,10 +794,10 @@ impl Game {
             gravity,
             &pose,
             self.player.mode,
-            dt * warp,
+            warped,
         );
         self.survival
-            .spawn_mobs(&self.planet, &self.terrain, &world, &pose, dt * warp);
+            .spawn_mobs(&self.planet, &self.terrain, &world, &pose, warped);
         if let Some(message) = messages.into_iter().last() {
             self.message = Some((message, Instant::now()));
         }
@@ -702,9 +806,46 @@ impl Game {
         }
 
         self.interact(dt as f32);
-        self.walking(&input, feet);
+        if !flying {
+            self.walking(&input, feet);
+        }
         self.survival.apply_lights(&mut self.streamer);
         self.play_sounds();
+    }
+
+    /// The player's own physics (on foot), with time warp.
+    fn walk_physics(&mut self, input: &PlayerInput, dt: f64) {
+        // Time warp beyond physics speed needs the player landed or in a stable orbit.
+        let physics = Physics {
+            planet: &self.planet,
+            gravity: &self.gravity,
+            drag: self.drag,
+        };
+        let frame0 = self.active_frame(self.time);
+        // (The chosen warp is kept; it applies again once possible.)
+        let mut warp = WARP_LEVELS[self.warp];
+        let mut rails = warp > MAX_PHYSICS_WARP;
+        if rails && !self.player.can_rail_warp(&physics, &frame0, self.time) {
+            warp = MAX_PHYSICS_WARP;
+            rails = false;
+            self.message = Some((
+                format!("Time warp limited to x{MAX_PHYSICS_WARP} while moving in the atmosphere"),
+                Instant::now(),
+            ));
+        }
+        self.effective_warp = warp;
+        let (t0, t1) = (self.time, self.time + dt * warp);
+        let world = WorldVoxels {
+            planet: &self.planet,
+            streamer: &self.streamer,
+            terrain: &self.terrain,
+        };
+        let (bodies, active) = (&self.bodies, self.active);
+        self.player
+            .update(&physics, &world, input, (t0, t1), dt, rails, &|t| {
+                bodies.frame(active, t)
+            });
+        self.time = t1;
     }
 
     /// Footsteps and the hunger walking, sprinting and jumping cost.
@@ -741,9 +882,7 @@ impl Game {
 
     /// Where the player stands and looks (planet-relative, body frame).
     fn pose(&self) -> Pose {
-        let feet = self
-            .player
-            .body_position(&self.system.planet_frame(self.time));
+        let feet = self.player.body_position(&self.active_frame(self.time));
         Pose {
             eye: self.camera.position - self.planet.center,
             look: self.camera.forward().as_dvec3(),
@@ -764,7 +903,9 @@ impl Game {
     fn respawn(&mut self) {
         let pose = self.pose();
         self.survival.die(&pose);
-        let frame = self.system.planet_frame(self.time);
+        self.flight.eva = None;
+        self.switch_world(Body::Planet);
+        let frame = self.active_frame(self.time);
         self.player.teleport(self.spawn_feet, &frame);
         self.message = Some(("You died!".to_string(), Instant::now()));
     }
@@ -821,9 +962,10 @@ impl Game {
 
     /// Looking at, breaking and placing blocks.
     fn interact(&mut self, dt: f32) {
-        if self.player.mode == GameMode::Spectator {
+        if self.player.mode == GameMode::Spectator || !self.first_person() {
             self.target = None;
             self.survival.mining = None;
+            self.survival.target_name = None;
             return;
         }
         let creative = self.player.mode == GameMode::Creative;
@@ -835,8 +977,18 @@ impl Game {
         let origin = self.camera.position - self.planet.center;
         let dir = self.camera.forward().as_dvec3();
         self.target = interact::raycast(&self.planet, &self.streamer, origin, dir, reach);
+        // A rocket in front of the block beats it.
+        let rocket = self.rocket_target(reach);
         if self.survival.screen.is_some() || !self.mouse_grabbed {
+            let pose = self.pose();
+            self.survival.aim(&pose, reach, self.target.as_ref());
+            if rocket.is_some() {
+                self.survival.target_name = Some("rocket".to_string());
+            }
             self.survival.mining = None;
+            return;
+        }
+        if rocket.is_none() && self.place_rocket(self.input.button_pressed(MouseButton::Right)) {
             return;
         }
         let pose = self.pose();
@@ -844,17 +996,26 @@ impl Game {
             planet: &self.planet,
             streamer: &mut self.streamer,
         };
+        let target = if rocket.is_some() {
+            None
+        } else {
+            self.target.as_ref()
+        };
         let message = self.survival.interact(
             &mut world,
             &self.input,
             self.player.mode,
             &pose,
-            self.target.as_ref(),
+            target,
             reach,
             dt,
         );
         if let Some(message) = message {
             self.message = Some((message, Instant::now()));
+        }
+        if let Some(i) = rocket {
+            self.survival.target_name = Some("rocket".to_string());
+            self.rocket_clicks(i);
         }
     }
 
@@ -872,8 +1033,11 @@ impl Game {
         let mut words = line.split_whitespace();
         let command = words.next().unwrap_or("").trim_start_matches('/');
         let args: Vec<&str> = words.collect();
+        if self.flight_command(command, &args) {
+            return;
+        }
         let number = |i: usize| args.get(i).and_then(|a| a.parse::<f64>().ok());
-        let frame = self.system.planet_frame(self.time);
+        let frame = self.active_frame(self.time);
         let feet = self.player.body_position(&frame);
         let up = feet.normalize_or(DVec3::Y);
         match command {
@@ -994,6 +1158,10 @@ impl Game {
             "place" => {
                 // Like a right click: uses a crafting table / furnace, or places the held
                 // block.
+                if self.place_rocket(true) {
+                    self.console.print("Placed a rocket");
+                    return;
+                }
                 let mut input = Input::default();
                 input.button_down(MouseButton::Right);
                 let pose = self.pose();
@@ -1089,10 +1257,37 @@ impl Game {
                 self.respawn();
                 self.console.print("Killed the player");
             }
+            "rain" => {
+                self.rain = match (number(0), self.rain) {
+                    (Some(rate), _) if rate > 0.0 => Some((rate as f32, 0.0)),
+                    (None, None) => Some((6000.0, 0.0)),
+                    _ => None,
+                };
+                let state = match self.rain {
+                    Some((rate, _)) => format!("on ({rate} drops/s)"),
+                    None => "off".to_string(),
+                };
+                self.console.print(format!("Test rain {state}"));
+            }
+            "swing" => {
+                if let Some(seconds) = number(0) {
+                    self.view_model.slow_next_swing(seconds as f32);
+                }
+                self.survival.swings += 1;
+            }
             "heal" => {
                 self.survival.health = survival::MAX_HEALTH;
                 self.console.print("Healed");
             }
+            "hurt" => match number(0) {
+                Some(n) => {
+                    let at = self.camera.position - self.planet.center;
+                    if self.survival.hurt(n as f32, true, at) {
+                        self.respawn();
+                    }
+                }
+                None => self.console.print("Usage: hurt <amount>"),
+            },
             "open" => {
                 let screen = match args.first().copied() {
                     Some("creative") => Some(Screen::Creative),
@@ -1118,11 +1313,78 @@ impl Game {
         }
     }
 
+    /// Sends this frame's particle effects to the renderer, each lit by the block and sky
+    /// light at its spot.
+    fn send_particles(&mut self, dt: f32) {
+        for e in &mut self.survival.effects.queue {
+            let cell = self.planet.cell_at(e.origin);
+            let block = cell.map_or(0, |c| self.streamer.light(c)) as u32;
+            e.light = (
+                block,
+                survival::sky_light(&self.planet, &self.terrain, cell),
+            );
+        }
+        // The test rain is lit by the open sky (no terrain lookup every frame).
+        if let Some((rate, carry)) = &mut self.rain {
+            let drops = *rate * dt + *carry;
+            *carry = drops.fract();
+            let around = self.camera.position - self.planet.center;
+            let up = around.normalize_or(DVec3::Y);
+            self.survival
+                .effects
+                .push(effects::rain(around, up, drops as u32));
+        }
+        if self.survival.effects.queue.is_empty() {
+            return;
+        }
+        let emitters = self.survival.effects.flush(self.planet.center);
+        self.renderer.emit_particles(&emitters);
+    }
+
+    /// Animates the first-person arm and held item and uploads this frame's mesh.
+    fn view_model(&mut self, dt: f32) -> Result<Option<DrawItem>> {
+        let frame = self.active_frame(self.time);
+        let input = ViewInput {
+            item: self.survival.held().map(|s| s.item),
+            swings: self.survival.swings,
+            uses: self.survival.uses,
+            mining: self.survival.mining.is_some(),
+            eating: self.survival.eating > 0.0,
+            ground_speed: self.player.relative_velocity(&frame).length() as f32,
+            on_ground: self.player.on_ground,
+            look: (self.camera.yaw, self.camera.pitch),
+        };
+        self.view_model.update(&input, dt);
+        let cell = self
+            .planet
+            .cell_at(self.camera.position - self.planet.center);
+        let sky = match (cell, self.view_sky) {
+            (Some(c), Some((cached, sky))) if c == cached => sky,
+            _ => {
+                let sky = survival::sky_light(&self.planet, &self.terrain, cell);
+                self.view_sky = cell.map(|c| (c, sky));
+                sky
+            }
+        };
+        let light = Light {
+            sky,
+            block: cell.map_or(0, |c| self.streamer.light(c)) as u32,
+        };
+        let visible = self.player.mode != GameMode::Spectator && self.first_person();
+        self.view_model.draw(
+            &mut self.renderer,
+            self.camera.position,
+            self.camera.orientation(),
+            light,
+            visible,
+        )
+    }
+
     /// The HUD, hotbar and console for this frame.
-    fn overlay(&mut self) -> Ui {
+    fn overlay(&mut self, dt: f32) -> Ui {
         let (w, h) = self.renderer.screen_size();
         let mut ui = Ui::new(w, h);
-        let frame = self.system.planet_frame(self.time);
+        let frame = self.active_frame(self.time);
         let feet = self.player.body_position(&frame);
         let altitude = feet.length() - self.planet.sea_radius;
         let physics = Physics {
@@ -1138,12 +1400,38 @@ impl Game {
                 let (pe, ap) = o.apsides();
                 (pe - self.planet.sea_radius, ap - self.planet.sea_radius)
             });
+        let mut orbital_speed = self.player.velocity.length();
+        let mut gravity = self.gravity.acceleration(self.player.position).length();
+        let (mut altitude, mut surface_speed, mut apsides) = (altitude, surface_speed, apsides);
+        // Floating near the moon (or the sun): telemetry relative to it.
+        if let Some(e) = &self.flight.eva
+            && e.body != self.active
+        {
+            let radius = self.bodies.radius(e.body);
+            let frame = self.bodies.frame(e.body, self.time);
+            altitude = e.position.length() - radius;
+            surface_speed = frame.relative_velocity(e.position, e.velocity).length();
+            orbital_speed = e.velocity.length();
+            gravity = self.bodies.gravity(e.body, e.position).length();
+            let conic = crate::space::conic::Conic::from_state(
+                self.bodies.mu(e.body),
+                e.position,
+                e.velocity,
+            );
+            apsides = conic
+                .apoapsis()
+                .filter(|&ap| ap < self.bodies.soi(e.body))
+                .map(|ap| (conic.periapsis() - radius, ap - radius));
+        }
         if self
             .message
             .as_ref()
-            .is_some_and(|(_, t)| t.elapsed().as_secs_f32() > 3.0)
+            .is_some_and(|(_, t)| t.elapsed().as_secs_f32() > hud::MESSAGE_TIME)
         {
             self.message = None;
+        }
+        if !self.first_person() {
+            self.flight_overlay(&mut ui, dt);
         }
         let up = feet.normalize_or(DVec3::Y);
         let info = HudInfo {
@@ -1152,9 +1440,9 @@ impl Game {
             time_of_day: self.system.local_time(self.time, up),
             warp: self.effective_warp,
             surface_speed,
-            orbital_speed: self.player.velocity.length(),
+            orbital_speed,
             altitude,
-            gravity: self.gravity.acceleration(self.player.position).length(),
+            gravity,
             apsides,
             hotbar: &self.survival.inventory.slots[..inventory::HOTBAR],
             selected: self.survival.selected,
@@ -1165,12 +1453,17 @@ impl Game {
             food: self.survival.food,
             armor: self.survival.armor_points(),
             target: self.survival.target_name.clone(),
-            message: self.message.as_ref().map(|(m, _)| m.as_str()),
+            message: self
+                .message
+                .as_ref()
+                .map(|(m, t)| (m.as_str(), t.elapsed().as_secs_f32())),
             console: &self.console,
             screen_open: self.survival.screen.is_some(),
+            flight: !self.first_person(),
         };
-        hud::draw(&mut ui, &info);
-        self.survival.draw_screen(&mut ui, self.input.cursor);
+        hud::draw(&mut ui, &info, &mut self.hud_anim, dt);
+        self.survival
+            .draw_screen(&mut ui, self.input.cursor, &mut self.screen_anim, dt);
         ui
     }
 
@@ -1181,10 +1474,15 @@ impl Game {
     /// Scene parameters for this frame, and whether the camera is underground.
     fn frame_params(&mut self, dt: f64) -> (FrameParams, bool) {
         let rel = self.camera.position - self.planet.center;
-        let up = rel.try_normalize().unwrap_or(DVec3::Y);
 
         // The sun is wherever the orbit and the planet's spin put it.
-        let sun = self.system.star_in_body_frame(self.time);
+        let sun = self.star_view() - rel;
+        // The atmosphere is home's, whichever world is loaded.
+        let home_rel = rel
+            - self
+                .bodies
+                .view(self.active, Body::Planet, DVec3::ZERO, self.time);
+        let home_up = home_rel.try_normalize().unwrap_or(DVec3::Y);
         let sun_dir = sun.normalize();
         let sun_angular_radius = (self.system.star.radius / sun.length()).asin() as f32;
 
@@ -1204,8 +1502,8 @@ impl Game {
         // the atmosphere (or the planet's shadow) and the sky. Above the atmosphere only
         // whether the camera itself is in sunlight matters (the lit planet fills the view).
         let a = &self.atmosphere;
-        let r = rel.length() as f32;
-        let mu_s = up.dot(sun_dir) as f32;
+        let r = home_rel.length() as f32;
+        let mu_s = home_up.dot(sun_dir) as f32;
         let height = a.top_radius - a.bottom_radius;
         let space = smoothstep(0.4 * height, 1.2 * height, r - a.bottom_radius);
         let sun_t = a.sun_transmittance(&self.atmosphere_luts, r, mu_s);
@@ -1246,11 +1544,12 @@ impl Game {
         });
 
         let params = FrameParams {
-            camera_planet: rel,
+            camera_planet: home_rel,
+            gravity_center: self.planet.center,
             sun_dir: sun_dir.as_vec3(),
             sun_angular_radius,
             sun_illuminance: Vec3::splat(SUN_ILLUMINANCE),
-            star_rotation: self.system.planet_rotation_matrix(self.time).as_mat3(),
+            star_rotation: self.active_rotation(),
             exposure,
             // Stars stand out more above the atmosphere (artistic, KSP-like).
             star_boost: 1.0 + 4.0 * space,
@@ -1261,6 +1560,13 @@ impl Game {
             // Overlap a little with the loaded chunks so no sky shows through at the seam.
             far_discard_radius: (self.streamer.loaded_radius() - 32.0).max(0.0),
             target: block_target,
+            gravity: self
+                .gravity
+                .acceleration(self.camera.position - self.planet.center)
+                .length() as f32,
+            wind: Vec3::ZERO,
+            // Game time (warp speeds particles up too), in steps they can take.
+            particle_dt: (dt * self.effective_warp.min(MAX_PHYSICS_WARP)).min(0.1) as f32,
         };
         (params, underground)
     }

@@ -21,6 +21,7 @@ and eventually go interstellar.
 cargo run --release              # play (debug builds work too, but worldgen is ~5x slower)
 cargo test --release             # unit tests (planet seams, mesh validity, biome distribution)
 cargo test --release locate_biomes -- --ignored --nocapture   # prints an ASTRO_SPAWN for every biome
+cargo test --release write_sounds -- --ignored --nocapture    # writes every sound effect to target/sounds/*.wav
 cargo clippy --release --all-targets && cargo fmt               # keep both clean
 ```
 
@@ -36,7 +37,7 @@ or `glslc` is needed. A single source can produce several variants through defin
     flight in creative (Space/Shift to rise and sink).
   - Spectator: free fly through terrain. Space/Shift move along the radial "up", Ctrl gives
     10x speed, and the scroll wheel scales the fly speed.
-- **Blocks and items (Minecraft's controls):**
+- **Blocks and items:**
   - Left click breaks a block (in survival this takes time and depends on the tool), or
     swings at nothing.
   - Right click places the held block, or uses a crafting table, furnace or chest (hold Shift
@@ -58,6 +59,17 @@ or `glslc` is needed. A single source can produce several variants through defin
   - 1-9 over a slot swaps it with that hotbar slot. Q over a slot drops from it.
   - **Middle click sorts the inventory.** Clicking outside the panel drops the held stack.
 - **Time warp:** `.` and `,` raise and lower it (x1 up to x1,000,000), as in KSP.
+- **Rockets** (test rocket, infinite fuel: `give rocket`, or `rocket` in the console):
+  - Right click with it on top of a block stands it there; right click a rocket to get in,
+    left click a landed one to pick it up.
+  - Inside, the mouse is free (for the HUD's buttons): right-drag turns the camera, the wheel
+    zooms. Shift / Ctrl throttle up / down, Z full, X cut. W/S pitch, A/D yaw, Q/E roll
+    (yaw right tips it east on the pad). T toggles SAS; its modes are buttons above the
+    attitude ball. F gets out, anywhere: in space you float beside the rocket on your own
+    orbit (look around, but no moving); right click the rocket to get back in.
+  - **M opens the map** (on foot too): right-drag and the wheel move its camera, Tab cycles
+    the focus (craft, home, moon). Click your path to add a maneuver; its panel edits it.
+    Delete removes the selected one.
 - **On screen:** the HUD shows mode, time, warp, altitude, surface and orbital speed, gravity,
   Pe/Ap and the targeted block. The window title shows:
   - FPS and CPU / streaming / GPU-wait timings
@@ -73,7 +85,7 @@ or `glslc` is needed. A single source can produce several variants through defin
 | `ASTRO_WARP=<factor>` | Initial time warp. |
 | `ASTRO_FACE_SUN=1` | Turn the camera towards the sun's compass direction (sunset shots). |
 | `ASTRO_MODE=<mode>` | Starting game mode: survival (default), creative or spectator. **Use `spectator` for camera captures**: in survival you fall. |
-| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). For survival tests: `aim <pitch> [yaw]`, `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative`, `summon <cow|pig|sheep>`. Captures are silent (no audio device is opened). |
+| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). For survival tests: `aim <pitch> [yaw]`, `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Captures are silent (no audio device is opened). |
 | `ASTRO_CONSOLE=1` | Start with the console open. |
 | `ASTRO_VSYNC=0` | Uncapped framerate (IMMEDIATE present mode) for profiling. |
 | `ASTRO_AUTOFLY=<m/s>` | Camera flies forward on its own (streaming stress test). |
@@ -93,34 +105,48 @@ src/
   interact.rs       ray cast to the targeted block, its outline matrix
   survival.rs       Survival: inventory, armor, held item, mining/placing, torches, drops, models, furnaces, chests,
                     mobs (spawning, combat), screens' click rules (drag, double-click), health, hunger, sound events
-  mobs.rs           passive animals (cow, pig, sheep): wander / panic AI, physics, hits, loot
+  mobs.rs           passive animals (cow, pig, sheep): wander / graze / panic AI, physics, hits, loot
+  mob_models.rs     the animals' box models (many small tinted boxes, tiled coats) and their animation
   audio.rs          sound effects synthesized in code; a small mixer on a cpal stream, panned by position
   items.rs          Item, ItemStack, tools (kind x tier), Minecraft mining rules, block drops, fuel, smelting
   inventory.rs      36-slot Inventory, add/sort, Minecraft slot clicks
   crafting.rs       shaped recipes (mirroring, "any planks")
   furnace.rs        Furnace: fuel and smelting, steps from event to event (works under time warp)
   drops.rs          items lying in the world: physics, pickup radius, despawn
-  models.rs         box models (crafting table, furnace, chest, torch, dropped items, mobs) -> ChunkMesh
-  screen.rs         inventory (with armor) / crafting / furnace / chest / creative screens: layout, drawing, tooltips
+  effects.rs        particle effects: block debris, mining chips, placing dust, the test rain, rocket flame / smoke / plasma / explosions (emitters for render::particles)
+  models.rs         box models (crafting table, furnace, chest, torch, dropped items, the first-person arm and held item) -> ChunkMesh
+  screen.rs         inventory (suit + assemble) / workbench / furnace / storage / catalog screens: layout, drawing, details card
   console.rs        debug console (line editor, history, help text)
-  hud.rs, ui.rs     overlay: HUD, hotbar, hearts, console; immediate-mode quads, text, isometric block icons, sprites
-  camera.rs         f64 position + planet-relative "up" frame (handles flips at the centre), reverse-Z projection
+  hud.rs, ui.rs     overlay in the minimal flat style: telemetry text, vitals as number + line, hotbar row, console;
+                    immediate-mode quads, outlined text, flat block tiles, sprites, fading/shifting quad groups
+  anim.rs           UI motion helpers: approach / ease_out, item pops, vitals with damage trails
+  viewmodel.rs      first-person arm + held item: pose and animations (swing, use, switch, eat, bob, sway, landing)
+  vessel.rs         Vessel: the test rocket's physics (thrust, reaction wheels, SAS, drag, fins, reentry heat, landing, crashing, SOI changes, rails)
+  rocket_model.rs   the rocket's box model (glows when hot)
+  flight_hud.rs     flight HUD: attitude ball with direction markers, throttle and heat gauges, SAS buttons, telemetry; `Pointer` + `button` widgets
+  map_view.rs       map overlay: patched-conic trajectories, markers, the maneuver planner (`Planner`) and its node panel
+  app/worlds.rs     the two block worlds (home, the moon): which is active, switching, the other one's far terrain
+  camera.rs         f64 position + planet-relative "up" frame (handles flips at the centre), reverse-Z projection (+ the view model's squeezed-depth variant)
   input.rs          per-frame key/mouse state
   util.rs           FxHash FastMap/FastSet (use these for hot hash maps keyed by ChunkKey etc.)
   space/
     mod.rs          SolarSystem (star, planet orbit/spin/tilt), RotatingFrame (body <-> inertial), local time
     orbit.rs        Keplerian orbits: elements <-> state vectors (Kepler's equation)
+    bodies.rs       Body (sun, home, moon), Bodies: gravity, SOIs, positions, rotating frames (the moon is tidally locked)
+    conic.rs        universal-variable Kepler propagation (any conic), Conic geometry (apsides, anomalies, times)
+    trajectory.rs   patched-conic prediction (SOI encounters, exits, impacts, maneuver nodes) and rails propagation
     gravity.rs      PlanetGravity: layered-density gravity inside and out, air density
   render/
     mod.rs          Renderer: frames in flight, uploads, culling, scene passes, atmosphere pass, overlay, screenshots
     atmosphere.rs   Atmosphere model + CPU-precomputed LUTs (transmittance, multiple scattering, sky irradiance)
     starfield.rs    Milky Way map (precomputed equirectangular texture)
-    font.rs         built-in 5x7 bitmap font atlas
+    font.rs         Astro Block's own pixel font: condensed, square-cornered, 4x8 glyphs in 5x9 cells
     context.rs      instance/device (Vulkan 1.3: dynamic rendering + synchronization2), submit_and_wait
     swapchain.rs    swapchain, D32 reverse-Z depth buffer (sampled), HDR colour target (RGBA16F)
     pipeline.rs     opaque / water / far (LOD + fading chunks) / sky (full-screen) / ui pipelines, one layout
     arena.rs        VertexArena (mesh memory in 64 MiB pages, power-of-two blocks) + StagingRing
-    mesh.rs         BlockVertex (12 bytes), UiVertex, PushConstants (96 bytes), ChunkMesh, DrawItem, Fade
+    particles.rs    GPU particles: ring buffer, emitters, anchor re-basing, per-frame batch for the compute shaders
+    mesh.rs         BlockVertex (12 bytes), UiVertex, PushConstants (112 bytes: + a rotation), ChunkMesh, DrawItem, Fade
     texture.rs      block texture array with CPU-generated mips; single-mip 2D textures (LUTs, font)
     frustum.rs      frustum planes for camera-relative bounding spheres
   world/
@@ -139,7 +165,10 @@ shaders/
   block.vert/.frag  blocks and models (variants WATER, FAR; FAR also does cutout sprites); HDR lighting from the atmosphere LUTs; target outline
   atmosphere.glsl   shared: frame uniforms, LUT access, medium (#include'd; build.rs resolves includes)
   fullscreen.vert + sky.frag   atmosphere ray march, stars, sun, glare, exposure + ACES tone mapping
-  ui.vert/.frag     overlay: font atlas, isometric block icons or item sprites, alpha blended over the final image
+  ui.vert/.frag     overlay: font atlas, block tiles or item sprites, alpha blended over the final image
+  particle.glsl, particle_batch.glsl   particle struct + flags; the compute shaders' per-frame batch (header + emitters)
+  particles_emit.comp, particles_sim.comp   spawn new particles; gravity, drag, depth-buffer collision
+  particles.vert/.frag   camera-facing quads or velocity streaks, lit like blocks (variant BLEND)
 ```
 
 ### Core invariants: don't break these
@@ -157,14 +186,14 @@ shaders/
    `k` is radial and starts at the planet's centre (`k = 0`), with
    `layer_radius(k) = sea_radius + (k - sea_layer)`; `sea_layer = floor(sea_radius)`, and there
    are `HEIGHT_LIMIT` layers above sea level.
-   - **Shells:** columns are mapped equiangularly (tangent) onto the sphere, and the grid
+   - **Shells:** columns are mapped onto the sphere by the face map (see "Block shape"), and the grid
      resolution depends on depth (`Planet::shells`). The surface shell has
      `face_blocks = chunks_per_face * 32` columns per face edge. Each deeper shell halves the
      resolution (2x2 columns become 1) where blocks have shrunk to about 0.5 m, so widths stay
      about 0.5-1 m down to the small innermost shell, which tapers to the centre.
    - **Shell boundaries** are multiples of 32 layers, so a chunk belongs to exactly one shell.
      Always get the resolution from `res_at(k)`, and pass `n` explicitly to `dir`,
-     `corner_dir`, `wrap_column`, `grid_to_cube` and `cube_to_grid`. `column_dir` means
+     `corner_dir` and `wrap_column`. `column_dir` means
      surface columns. `locate` returns `u` and `v` in the grid units of the shell at that
      radius.
    - **Neighbours across a shell boundary:** a coarse chunk has 4 finer chunks above it, and a
@@ -172,19 +201,44 @@ shaders/
      coincide bit-exactly with every other corner of the finer grid above it.
    - **Handedness:** the `(u, v, k)` frame is right-handed (`s x t = normal`).
    - **Face edges:** neighbours across face edges have rotated grids, so always go through
-     `wrap_column` / `chunk_neighbors`. `grid_to_cube` is computed symmetrically and
-     `corner_dir` is exact at edges, which makes shared vertices bit-identical across faces.
+     `wrap_column` / `chunk_neighbors`. The face map is evaluated from |x| and y^2 (mirrored
+     coordinates give bit-identical results) and keeps A(+-1, y) = +-1 exactly. Edge points
+     use `edge_to_cube` on both faces. `corner_dir` is exact at edges, which makes shared
+     vertices bit-identical across faces.
    - **Block shape:** blocks are always 1 m tall, but no grid can cover a sphere with equal
-     cubes. The mapping (`MAP_ANGLE` = 38 degrees, plus the radius chosen in `Planet::new`)
-     balances the width error:
-     - Surface blocks are 0.84-1.19 m wide: widest at face centres, narrowest along face edges.
-       They are 9% off on average, and 61% are within 10% of 1 m.
-     - The plain equiangular map was 0.71-1.0 m wide.
-     - Away from a face's centre lines, blocks are also skewed (9 degrees on average), up to
-       120-degree diamonds at the 8 cube corners. The grid lines are great circles, so no
-       separable mapping changes that.
-     - `find_spawn` picks land where blocks are within a few percent of 1 m cubes.
-     - Tests: `surface_blocks_are_nearly_cubes`, `spawn_blocks_are_square`.
+     squares. At the 8 cube corners only 3 columns meet, so the grid has to bend somewhere.
+     - **The face map** (`Planet::face_to_cube` / `cube_to_face`, coefficients `MAP_Q`):
+       face coordinates (x, y) become cube coordinates (A(x, y), A(y, x)), with
+       A = x (1 + (1 - x^2) Q(x^2, y^2)).
+       - Q was fitted by least squares to be nearly *conformal* (square blocks), except
+         within 0.3 face half-widths of a corner, with a limited spread of sizes.
+       - The inverse is a Newton iteration inside the face and exact outside it.
+       - Past a face edge the map continues in angle (atan(a) linear in x), so far-away grid
+         coordinates stay bounded, as the old tan map's did. Without that, collision sweeps
+         through far grid space become enormous (a test took 10 minutes).
+     - **Results:** 92% of surface blocks are within 1 degree of square (96% within 3).
+       Widths are within 10% of the median for 80% of blocks and within 20% for 91%, from
+       1.08x the median at face centres down to about 0.5x at the corners.
+     - **Median width:** `BLOCK_WIDTH` = 1 m, so the home planet (65,536 columns per face
+       edge) has a 43.9 km radius. Widths run from 0.5 to 1.08 m. `find_spawn` looks for
+       blocks within a few percent of 1 m squares. `Planet::new` derives the radius from
+       `BLOCK_WIDTH` and `MAP_MEDIAN_SCALE`.
+     - **Valid sizes:** every shell's resolution must stay divisible by 32. With 1 m blocks
+       that allows 1024, 1536, 2048, 3072, 4096 or 6144 chunks per face edge (22.0, 32.9,
+       43.9, 65.9, 87.9 or 131.8 km), then doubling from there.
+     - **Before:** the separable tan(38 deg) map made grid lines great circles. Only 28% of
+       blocks were within 3 degrees of square, and 9% were 20-30 degrees off.
+     - **Corner seas** (`TerrainGenerator::corner_sea`): the distorted 5% of the surface lies
+       under round, deep seas, full within 11 degrees of a corner with the coast by about 15
+       degrees, ragged. Distorted means skew > 5 degrees or width off the median by > 20%; all of it is
+       within 10 degrees of a corner.
+     - `find_spawn` picks open land (no tree within 3 columns) where blocks are within a few
+       percent of 1 m squares.
+     - The fitting tool isn't in the repo. To refit: least squares (Levenberg-Marquardt) of
+       skew, log aspect ratio and log size spread over a face quadrant, with Q of degree 4.
+     - Tests: `face_map_is_exact_symmetric_and_invertible`, `cube_to_face_converges_quickly`,
+       `surface_blocks_are_nearly_cubes`, `distorted_blocks_are_under_the_corner_seas`,
+       `spawn_blocks_are_square`.
    - Tests cover all of the above.
 4. **Determinism.** Generation is a pure function of (seed, position). Any thread can generate any
    chunk, and neighbours must agree on their shared border:
@@ -237,6 +291,10 @@ shaders/
     exists only in the FAR variant, so models and drops are drawn with the clip pipeline
     (`objects` in `Renderer::render`), and the main opaque pipeline keeps early-z.
   - Bits 28-31: block light 0-15 (torches; see `world::light`). Models and mobs carry it too.
+- Push constant `params.z < 0` marks the first-person view model (no target outline).
+- Push constant `rotation` (quaternion) turns a mesh about its origin (`DrawItem::rotation`);
+  identity for everything but the other world's terrain (home seen from the moon, or the
+  moon from home), drawn turned into the active world's frame.
 - `ChunkMesh` has three sections: `opaque`, `water` and `cutout` (glass; alpha-tested, drawn
   with the clip pipeline after the opaque pass).
 - The texture layer reaches the fragment shader as a `flat uint`. If it were an interpolated
@@ -249,7 +307,7 @@ shaders/
 - Texture alpha is the biome tint mask for opaque blocks and opacity for water. For item
   sprites (`Tex::Stick` onwards) it is transparency.
 - UI vertices: layer `u32::MAX` means the font atlas. Otherwise bits 0-7 are the layer, bits
-  8-15 a brightness (isometric icon faces), and bit 31 marks a sprite (`ui.rs` and `ui.frag`
+  8-15 a brightness (0 = full), and bit 31 marks a sprite (`ui.rs` and `ui.frag`
   must agree).
 
 ### World generation overview (terrain.rs)
@@ -291,6 +349,8 @@ shaders/
 
 ### Streaming (streaming.rs)
 - Load radius is 12 chunks (384 m). The desired set is a flood fill from the camera's chunk.
+  (From the *focus*, really: the camera on foot, the rocket when flying. The LOD tiles are
+  chosen for the render camera, which differs in the map view.)
   Chunks below the local terrain floor get a distance penalty (`UNDERGROUND_PENALTY`), so only
   about 130 m of caves load beneath you.
 - A pending queue (nearest first) feeds a bounded number of in-flight jobs on `cores - 2` worker
@@ -341,6 +401,12 @@ shaders/
   2. fading chunks and LOD tiles (inner radius `loaded_radius() - 32 m`)
   3. LOD water (same inner radius)
   4. chunk water (outer radius = that same radius)
+  After the models (step 2), rendering pauses for the particle compute work (simulate +
+  spawn against the world's depth), then resumes. Cut-out particles come next, blended
+  particles after the water (step 4).
+  5. the first-person view model (clip pipeline, `Camera::view_model_projection`: the same
+     picture with depth squeezed into 0.6..1, so it is always in front of the world, which
+     is never nearer than 8 cm, and never pokes into walls)
 
   Chunk water and LOD water therefore meet at one radius and never stack (stacking showed up as
   a band in the ocean). LOD is not drawn while the camera is underground; the radius is then
@@ -357,8 +423,9 @@ shaders/
   with `planet_rotation`, so the stars turn across the night sky.
 - Universal time `Game::time` advances by `dt * WARP_LEVELS[warp]`. Epoch 0 is the March
   equinox.
-- When ships and other bodies arrive, this needs real reference-frame switching (inertial frame
-  in space, rotating frame near the surface). Keep the f64 + camera-relative rules.
+- Flight uses patched conics around the sun, home and the moon (`space::bodies`, see "Flight").
+  Everything is still drawn in the home planet's body frame, converted at the current time.
+  Keep the f64 + camera-relative rules.
 
 ### Lighting and atmosphere (render/atmosphere.rs, shaders/)
 - **HDR pipeline:**
@@ -491,11 +558,23 @@ shaders/
 - **Animals** (`mobs.rs`): cows, pigs and sheep.
   - Spawning: in groups of 1-3 on grass, 20-56 m from the player, up to 10 around. They're
     forgotten beyond 128 m.
-  - Behaviour: they wander, step up single blocks, and panic for 5 s when hit, with
-    knockback and a red flash (0.5 s of invulnerability).
+  - Behaviour: they wander, graze while standing, step up single blocks, and panic for 5 s
+    when hit, with a red flash (0.5 s of invulnerability).
+  - They fall at `WEIGHT` (2x) gravity, like the player's hops. A hit *replaces* their
+    velocity with a short hop away (`KNOCKBACK` 3.2 m/s, lift 3 m/s): about 1.3 m in all.
+    (It used to add 5 + 4 m/s under plain gravity, and they flew several metres.)
   - Loot: leather and beef, porkchops, wool and mutton.
-  - Models are rebuilt every frame, since their legs animate, and they use the player's
-    collision sweep. A ray against their box beats the block behind them for targeting.
+  - Models (`mob_models.rs`) are the game's own, sculpted from many small boxes: barrel
+    body with ridge, belly, chest and rump; a neck; a head with muzzle or snout, eyes, ears
+    (horns on cows); a tail; legs with hooves. Coats are near-white seamless textures
+    (`Tex::Fur`, `Patches`, `Wool`, `Hide`) tiled at block texel density and coloured per
+    part by vertex tints (`Quad::tint`), with 4 coat variants per animal. Nothing is stretched.
+  - Motion (`MobPose`): legs swing in diagonal pairs, body bob and head nod with the walk;
+    standing animals lower their heads to graze (the neck stretches down), look around,
+    swish their tails and flick their ears.
+  - Models are rebuilt every frame and they use the player's collision sweep. A ray
+    against their box (longer in front, where the head is: `MobKind::length`) beats the
+    block behind them for targeting.
 - **Hunger** (Minecraft's rules): food 0-20 plus hidden saturation. Exhaustion costs a point
   of saturation, then food, per 4. It comes from sprinting 0.1/m, jumping 0.05 (sprint-jump
   0.2), hits 0.1, mining 0.005 and healing 6.
@@ -507,19 +586,220 @@ shaders/
   bypass it. Only attacks would use it, and nothing attacks yet.
 - **Chests:** 27 slots (`Survival::chests`), spilled when broken.
 - **Sound** (`audio.rs`): every sound is synthesized: footsteps per material every 1.6 m
-  walked, mining hits, break and place, eat, burp, pickup pop, hurt, and the animals' calls
-  and hurt sounds. 4 variants each, cached; volume falls off over 24 m and they are panned by
-  direction. Survival code only pushes `(Sound, position)` events; the app plays them.
+  walked, mining hits (`Dig`), break and place, eat, burp, pickup pop, putting on armor
+  (`Equip`), hurt, and the animals' calls and hurt sounds. 4 takes each at slightly
+  different pitches, cached; volume falls off over 24 m, panning is limited to 80%, and the
+  mix is soft-limited (tanh). Survival code only pushes `(Sound, position)` events; the app
+  plays them.
+  - Kept low and soft (the first version was bright filtered noise, 2-5 kHz, and sounded
+    thin and high-pitched). Building blocks: `thump` (a pitch-dropping sine, the weight of an
+    impact; 95-170 Hz so laptop speakers still play it), `ring` (decaying modes: stone, wood,
+    glass), `rustle` (band-passed noise in grains: crunch, rustle) and `voiced` (a Rosenberg
+    glottal pulse through three vowel formants, with breath and a subharmonic growl: moo,
+    grunts, bleat, the player's "oof").
+  - Per material, `impact(strength)` mixes these; a step is light and dull, a dig medium,
+    placing heavy, and breaking adds a few smaller pieces settling (and tinkles for glass).
+  - The test `sounds_are_short_soft_and_in_range` checks every take's length, peak and
+    brightness (RMS frequency under 1.6 kHz, glass 3 kHz).
+    `cargo test --release write_sounds -- --ignored --nocapture` writes them all as WAV
+    files into `target/sounds` to listen to.
 - **Drops** (`drops.rs`) fall and slide in the body frame, are picked up within 1.6 m (after
   a short delay when thrown), and despawn after 5 minutes. Blocks render as small cubes,
   items as crossed cutout sprites.
 - **Furnaces** keep working when nobody watches, and under time warp (`Furnace::update`
   steps from event to event). Fuel: coal 80 s, logs and planks 15 s, sticks 5 s. Smelting
   takes 10 s per item.
-- **Screens** are Minecraft's layouts (176 GUI pixels wide, 1 GUI pixel = `Ui::scale`), drawn
-  by `screen.rs`. The click rules (`Survival::click`, `inventory::click`) and the crafting
+- **Screens** (`screen.rs`) use the game's own minimal flat style: no panel, the world dims
+  behind a grid of faintly outlined cells (20 GUI-pixel pitch, 1 GUI pixel = `Ui::scale`),
+  with small lowercase section labels ("suit", "assemble", "backpack", ...), thin progress
+  lines and an amber outline on result cells. The click rules (`Survival::click`, `inventory::click`) and the crafting
   grid live in `Survival`. Closing a screen puts the grid and the held stack back into the
   inventory. Mouse drags (`Drag`) spread the held stack. Double-click gathers matching items.
+
+
+### Look and feel (UI)
+- Astro Block's own **minimal flat** style, chosen by the owner. It must not look like
+  Minecraft (see the top of this file).
+  - No panels or bevels; text is lowercase in the game's own condensed pixel font, with a
+    soft outline (no drop shadow).
+  - Crosshair: a dot. Mining, eating and recharging show as a short line under it.
+  - Vitals: a number (0-100) plus a thin line, health on the left and food on the right
+    above the hotbar. Armor is a faint second line. They turn red when low.
+  - Hotbar: items in a quiet row, a dot for empty slots, an underline under the selection.
+  - Blocks show as flat tiles in the UI, not isometric cubes. The targeted block gets a soft
+    light edge, not a dark outline.
+  - Palette: off-white text, dim blue-grey labels, an amber accent for results and food.
+- **Motion:** the UI is immediate-mode, so animation state lives in `hud::HudAnim` and
+  `screen::ScreenAnim` (owned by `Game`), built on `anim.rs`.
+  - Helpers: `approach` (exponential, frame-rate independent), `ease_out`, `Pop` (a slot
+    grows briefly when it *gains* items) and `Vital` (eases, with a held-then-draining trail
+    after a loss).
+  - Groups of quads are animated after drawing them normally: `Ui::fade_from(start, alpha,
+    dx, dy)` scales alpha and shifts everything since vertex `start`. Shifts snap to whole
+    pixels so the font stays crisp.
+  - HUD:
+    - The hotbar underline slides between slots. The selected item lifts and the others dim.
+    - Pickups pop.
+    - Vitals count and ease. Damage leaves a red trail, flashes and shakes the health number,
+      and flashes the screen edges red. Healing brightens it. Low health pulses.
+    - On a target, four corner ticks close in around the dot. The progress line fades in and
+      out.
+    - Item names, messages and the console fade and slide.
+  - Screens:
+    - Opening fades the dim in and lifts the content into place (0.18 s).
+    - Closing replays the last frame's vertices fading and sinking (0.12 s).
+    - Hover glows trail behind the mouse, and the details card fades in.
+    - Slots pop when items land in them, and a ready result breathes.
+  - Everything runs on real frame time, never warped time.
+
+### Particles (render/particles.rs, effects.rs, shaders/particle*)
+- **GPU particles.** A ring buffer of `CAPACITY` (262,144) particles, 64 bytes each, lives
+  on the GPU. Compute shaders spawn and simulate them, so weather (rain, snow, sand, storm
+  debris) can use hundreds of thousands without CPU cost.
+  - **Spawning:** the CPU only sends `Emitter` requests (`Renderer::emit_particles`): a count,
+    a spawn box, velocity (base + outward burst + random spread), life and size ranges,
+    gravity scale, drag towards the wind, bounciness, a texture rect (or a random
+    `piece` of it), a tint, flags and light. `particles_emit.comp` writes the new particles
+    after the newest ones, overwriting the oldest when the ring is full. Up to 256 emitters
+    and 65,536 new particles per frame.
+  - **Simulation** (`particles_sim.comp`, with the spawning) runs in the middle of the scene
+    pass (`Renderer::particle_compute`; rendering pauses and resumes with load ops). It runs
+    after the world (chunks, LOD, models, mobs, drops) and before particles, water and the
+    arm, so particles collide with the world only. They used to collide with their own
+    quads, and debris climbed towards the camera. Particles are drawn the same frame:
+    - radial gravity (`FrameParams::gravity`) and drag towards `FrameParams::wind`
+    - collision with the finished depth buffer, only when a particle *crosses* a visible
+      surface: it was in front of what the camera saw at its spot and is now just behind it.
+      A particle that is already hidden keeps falling. Pushing hidden particles onto the
+      surface in front of them threw debris upwards: it spawns inside the broken block,
+      whose mesh is still drawn for a frame or two, and falls behind the rim of the hole.
+      The normal comes from neighbouring pixels.
+      `BOUNCE` particles bounce and then settle (`RESTING`, and they stay while something is
+      under them). `DIE_ON_HIT` particles vanish.
+    - Particles off screen don't collide. That is fine for debris and weather; anything
+      needing exact block collision would be done on the CPU.
+  - **Drawing:** 6 vertices per ring slot of the live range, with no vertex buffer; dead
+    particles collapse.
+    - Cut-out particles (alpha test, depth write) are drawn with the scene. `BLEND` particles
+      are drawn after the water without writing depth.
+    - `STRETCH` makes a streak along the velocity (rain), `ROUND` a soft disc, `TINT_MASK`
+      reads a block texture's alpha as the biome tint mask.
+    - `GLOW` particles light themselves (rocket flames, reentry plasma, explosions): their
+      colour times the sun's illuminance, unaffected by sun or shadow.
+    - Lighting is like the blocks (sun, sky, night, torches) from the emitter's light.
+    - Cut-out particles shrink away at the end of their life, blended ones fade.
+    - Everything shrinks away within a metre of the eye.
+  - **Precision:** positions are f32 relative to an *anchor* near the camera. Past 256 m the
+    anchor moves to the camera and the next simulation step shifts every particle
+    (`shift`). Draws use the anchor the buffer is in.
+  - **Live range:** the CPU tracks spawned ranges and their latest expiry
+    (`ParticleFrame`), so draws and simulation cover only slots that may be alive.
+  - **Time step:** game time, capped at x10 warp and 0.1 s.
+- **Effects** (`effects.rs`), kept deliberately gentle (the owner found a burst towards the
+  camera bad):
+  - On breaking: 24 small crumbs of the block's side texture, starting inside its cell,
+    popping up a little and falling.
+  - While mining: four chips per tick, hopping a little off the face and falling.
+  - On placing: a little dust.
+  - Nothing should fly at the player.
+  - Survival queues them in `Survival::effects`. The app lights each one with the block and
+    sky light at its spot and sends them on.
+  - `rain [n/s]` is a test shower around the camera (blended streaks that die on impact),
+    not the weather system.
+- **Cost:** about 0.2 ms for roughly 85k live rain drops, 0.4 ms for a full ring
+  (RTX 3060 Laptop).
+
+### Flight (vessel.rs, space/, app/flight.rs, flight_hud.rs, map_view.rs)
+- **Bodies** (`space::bodies`): the sun, home (43.9 km, 9.81 m/s^2, atmosphere to 9 km)
+  and the moon: an 11 km block world, 1.63 m/s^2, 880 km out (20 home radii, like KSP's Mun), in
+  home's equatorial plane, tidally locked (its +X faces home). SOIs by Laplace's formula:
+  moon about 150 km, home about 17,000 km. Low home orbit is about 520 m/s, and the moon
+  transfer from 30 km is about 180 m/s.
+- **Patched conics:** a craft's state is relative to its reference body (`Vessel::body`) in
+  shared inertial axes; only that body pulls. Crossing an SOI boundary re-expresses it
+  (`Vessel::change_soi`, `trajectory::transfer`).
+  - `conic::propagate` is universal-variable Kepler (ellipses and hyperbolas alike,
+    Laguerre-Conway); `Conic` gives apsides, anomalies and times.
+  - `trajectory::predict` chains segments: SOI entries are found by sampling (400 per
+    segment) and bisection; surface impacts and SOI exits exactly from the conic's radius
+    crossings; maneuver nodes split segments and apply their burn. About 1.5 ms/frame with
+    the map open.
+  - `trajectory::advance` moves a craft on rails during time warp and stops where physics
+    has to take over (entering an atmosphere, `RAILS_CLEARANCE` above an airless surface).
+- **The rocket** (`vessel.rs`): 3 t, 60 kN (TWR 2 at home), 8 m tall, infinite fuel. Axes:
+  +Y nose, +X right, +Z dorsal; on the pad right points east.
+  - Steering by reaction wheels; SAS holds an attitude or turns towards prograde /
+    retrograde / normal / antinormal / radial / the next maneuver. Low down (home < 12 km,
+    moon < 4 km) these are relative to the surface.
+  - Drag on the velocity relative to the turning air, far larger side-on; fins weathervane
+    the nose into the airflow.
+  - Reentry heat: flux 0.05 x sqrt(air density) x speed^3 above ~300 m/s (gameplay-tuned:
+    speeds here are a tenth of Earth's), radiative and convective cooling. Burns up at
+    1,700 K. Steep returns at 950 m/s burn up, shallow ones and 850 m/s returns don't.
+  - Ground: on home the player's voxel sweep (an upright 2 x 4 m box at the engine), on the
+    moon the moon's (`vessel::Ground`: whichever block world is loaded). Faster than 12 m/s is a crash; settling more than ~50 degrees off
+    vertical tips it over. Landed, it stands upright and turns with the body.
+  - Tests: pad then gravity turn to orbit, reentry heating, landing on the moon.
+- **Game side** (`app/flight.rs`): `Flight` holds the rockets, the boarded one, the cameras,
+  the `Planner` (maneuver nodes) and the prediction.
+  - While boarded, the player's physics is off and it rides along; streaming loads chunks
+    around the rocket (`stream_focus`). The LOD terrain is chosen for the render camera
+    (`WorldStreamer::update(focus, lod_camera)`), so the map sees the whole planet.
+  - Chase camera: around the rocket in its local horizon frame. Map camera: around the
+    focus in *inertial* axes (the planet turns under the orbit, as in KSP).
+  - Maneuver nodes: (prograde, normal, radial) dv at a time. While burning near a node,
+    the dv the engine delivers (`Vessel::burned`) is subtracted in the node's frame, so the
+    planned path stays put; it completes below 0.1 m/s or on overshoot. "Warp to" picks
+    the fastest warp that won't overshoot.
+  - Getting out (`Eva` in app/flight.rs): landed on home you stand beside the rocket.
+    Anywhere else you float 4 m to its right with its velocity, following your conic
+    exactly like the rocket (patched conics, rails, SOI changes, `trajectory::advance`), so
+    the two stay together. Coming down into home's air, or near the moon's blocks, hands
+    over to the player's own physics (walking); on foot above them (`launch`, or a big
+    jump off the moon) you start floating. Telemetry is then relative to the body you float around.
+  - Empty rockets landed ride the turning ground; others coast on rails, with physics
+    only in the air (they can crash unattended).
+  - Chase camera drags: right moves the view right (orbits like the map).
+  - Effects: exhaust flame (glowing) and smoke in air, reentry plasma, explosions (fire,
+    smoke, hull debris); an engine rumble replayed while burning.
+- **HUD** (`flight_hud.rs`): an attitude ball (sky / ground, horizon, pitch rings, compass
+  letters, the direction markers), throttle and hull temperature lines, SAS buttons,
+  telemetry, the next burn's countdown. **Map overlay** (`map_view.rs`): paths, apsides,
+  encounters, impacts, body names and rings, the moon's orbit, nodes and their panel.
+- **Rendering:** rockets are rebuilt every frame (`rocket_model`).
+
+### Two worlds: home and the moon (app/worlds.rs)
+- **The moon is a block world** like home: its own `Planet` grid (512 chunks per face edge,
+  16,384 columns, an 11 km datum radius, 512 layers above it), `TerrainGenerator::moon`,
+  `WorldStreamer` (chunks + LOD) and `PlanetGravity::airless` (1.63 m/s^2, no air, not even
+  in caves). You walk, mine and build there exactly as at home.
+- **One world is active**: `Game::planet`, `terrain`, `streamer` and `gravity` are its, and
+  all block code (player physics and collision, interaction, survival, mobs, drops,
+  particles) works on it unchanged. Its rotating frame is the frame the game draws in, with
+  its centre at `PLANET_CENTER` (both grids are built there); the player's state is relative
+  to it.
+- **The other world** (`Game::other`) streams no chunks but keeps LOD tiles chosen for the
+  camera (converted into its frame), drawn turned into the active frame
+  (`DrawItem::rotation`, carried through the far pass): home with its atmosphere in the
+  moon's sky, the moon (a bright disc) in home's. Its survival state (models, chests,
+  furnaces, drops, animals) waits in `OtherWorld::state` (`Survival::swap_world`).
+- **Switching** follows the player's craft (`follow_craft_world`): when the rocket or the
+  floating player changes sphere of influence, the worlds swap, the player's state is
+  rebased (`Bodies::rebase`) and the view turned (`Camera::rotate_frame`). Dying respawns at
+  home.
+- Frames: `Bodies::view` / `view_velocity` / `view_rotation` turn any body's positions into
+  the active frame. The sky and lighting stay home's: `FrameParams::camera_planet` is the
+  camera relative to *home*, the sun direction and star rotation are the active frame's, and
+  particles fall towards `gravity_center` (the active world's centre). Moon surfaces are
+  lit by the sun (with home's shadow as an eclipse), without sky light.
+- **Lunar terrain** (`TerrainGenerator::lunar_column`): dark maria (low basalt plains) and
+  pale highlands, craters at four scales (cells of 3.2 km, 1.1 km, 360 m, 110 m: basins down
+  to dimples) - bowl, rim and ejecta, hashed per cell of a 3D grid and kept within the
+  neighbouring cells so columns always agree. Regolith over moon rock (highlands) or basalt
+  (maria), ilmenite (titanium) patches in the maria, lava-tube caves; no water, no trees.
+  New blocks: `Regolith`, `MoonRock`, `Basalt`. The LOD tiles show them too.
+- Fall damage scales with local gravity (a 7 m moon jump lands like a 1 m one at home).
+- Test: `moon_is_grey_dry_and_cratered`.
 
 ### Camera
 - The camera sits at the player's eyes (`EYE_HEIGHT` above the feet).
@@ -527,6 +807,30 @@ shaders/
   flips (more than 60 degrees in one step, e.g. flying through the planet's centre), it keeps
   the world-space view direction and re-derives yaw/pitch instead. Guard against normalizing a
   zero vector at the exact centre (`try_normalize`).
+
+### First-person view (viewmodel.rs)
+- In survival and creative, the player's own arm shows at the lower right: deliberately plain and
+  blocky (owner's wish), one skin block for hand and forearm and a dark slate shirt sleeve. The
+  owner wants a regular hand for now; a space suit can replace it later, when one is worn.
+  - It holds the selected item. Sprites (tools, food, ingots...) are extruded one pixel
+    thick: a cut-out front and back, plus a rim face per exposed pixel edge. Blocks are a
+    small cube. Model blocks (table, furnace, chest, torch) are their box models.
+  - It is not drawn in spectator mode.
+- The pose is rebuilt every frame in camera space and turned into camera-relative world
+  space, so the shader's lighting is right: sun, sky, torches and the camera cell's light.
+  The mesh uses `models::VIEW_UNIT` (1/16384 m) so it doesn't jitter. Its parts:
+  - arm units = `ARM_UNIT` m, posed at `REST`
+  - gestures rotate about the far (shoulder) end, plus a wrist turn for the item
+  - `grip` places the item in the hand
+- **Animations** (all real time):
+  - Swing: a wind-up, a strike that is mostly wrist so the hand stays in view, then a
+    recovery. It runs on `Survival::swings` and repeats while mining, with or
+    without an item (no separate punch).
+  - Use: a push. It runs on `Survival::uses` (placing, opening, putting on).
+  - Switching items: the old item lowers out of view, then the new one rises.
+  - Eating: the food comes up to the visor and bobs.
+  - Also a walk bob, sway behind turning, a dip on landing and breathing.
+  - Gestures survive item switches.
 
 ## Reference numbers (RTX 3060 Laptop, release, 2000x1125)
 - With LOD to the horizon and the atmosphere pass: about 355 FPS uncapped at spawn (CPU about
@@ -542,9 +846,13 @@ shaders/
 - Deep underground (2.5-38 km), about 1.6-3.6k chunks are loaded, at 550-720 FPS, using
   roughly 60-200 MB of mesh VRAM (LOD is not drawn underground). A 5 km/s
   autofly straight through the core works, but streaming falls behind at that speed.
-- The planet has 46,944 layers and 10 shells (surface radius 45.9 km).
+- The planet has 44,960 layers and 10 shells (surface radius 43.9 km).
 
 ## Known limitations / likely next steps
+- Particles: no GPU-side spawning yet (rain splashes, sparks that make sparks), no
+  collision off screen, and blended particles take the aerial perspective of what is behind
+  them (they write no depth). A wind field (rather than one wind vector) and soft
+  particles would come with the weather system.
 - LOD tiles are a heightfield (one terrain sample per cell), so overhangs and caves don't
   show at distance, and there can be a small visible step where real chunks take over. LOD jobs
   share the worker threads with chunk generation.
@@ -553,16 +861,27 @@ shaders/
   Shadow maps or a sky-light flood fill would be the next lighting steps.
 - The atmosphere is ray-marched per pixel at full resolution. Hillaire's sky-view and
   aerial-perspective LUTs would make it about 3x cheaper if needed. Exposure is a CPU estimate,
-  not a luminance histogram. There is no moon yet.
+  not a luminance histogram.
 - Survival is missing these Minecraft parts:
   - hostile mobs (so armor never gets used), shearing, breeding, saplings
   - lava
-  - a player model in the inventory screen and a held item in first person
+  - a player model in the inventory screen
   - armor drawn on the player
 - Water doesn't flow. Nothing is saved to disk: edits, inventory, furnaces and drops live in
   memory. Edited cells don't update the fake sky light, and LOD tiles don't show edits.
-- The player is the only physics body. Rockets will need rigid bodies made of blocks, and
-  KSP-style reference-frame switching once things fly far from the planet.
+- Flight is a first test: one built-in rocket with infinite fuel, no staging, fuel or
+  parts. Rockets made of blocks would replace it (rigid bodies built from the grid).
+  - It collides as an upright box at its engine:
+    tipping over is a rule (more than ~50 degrees off vertical), not physics. Water isn't
+    solid for it.
+  - Only the boarded rocket gets full physics; empty ones coast on rails (physics only in
+    the air). Floating outside you can't move (no jetpack).
+  - Only one block world is loaded at a time: the other keeps far terrain only, its
+    furnaces pause, and edits there stay in memory until you come back.
+  - Patched conics only (as KSP): no n-body effects. Map paths around the moon are drawn
+    around where the moon is at the encounter.
+  - No parachutes or landing legs; the heat model is gameplay-tuned.
+
 - The desired-set recompute runs on the main thread; it could move to a worker.
 - Vulkan validation layers are only active if the LunarG SDK is installed. Install it before
   debugging rendering issues.

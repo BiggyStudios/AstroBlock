@@ -13,6 +13,7 @@ layout(push_constant) uniform Push {
     mat4 mvp;     // projection * view-rotation * translate(mesh origin - camera)
     vec4 offset;  // xyz: mesh origin relative to camera, w: inner discard radius
     vec4 params;  // x: meters per position unit, y: outer discard radius, zw: fade
+    vec4 rotation; // the mesh's rotation about its origin (quaternion xyzw)
 } pc;
 
 layout(location = 0) out vec3 v_rel;    // camera-relative position
@@ -24,6 +25,8 @@ layout(location = 3) out vec3 v_light;  // x: ambient occlusion, y: sky light, z
 
 void main() {
     vec3 position = vec3(in_position.xyz) * pc.params.x;
+    vec4 q = pc.rotation;
+    position += 2.0 * cross(q.xyz, cross(q.xyz, position) + q.w * position);
     gl_Position = pc.mvp * vec4(position, 1.0);
     v_rel = position + pc.offset.xyz;
 

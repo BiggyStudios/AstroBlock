@@ -1,8 +1,9 @@
-//! Passive animals: cows, pigs and sheep, as in Minecraft. They wander around grassland,
-//! step up single blocks, panic and run when hit, and drop leather, meat or wool.
+//! Passive animals: cows, pigs and sheep. They wander around grassland, graze, step up
+//! single blocks, hop away and panic when hit, and drop leather, meat or wool. Their models
+//! are in `mob_models`.
 //!
-//! Like dropped items, mobs live in the planet's body (rotating) frame with plain local
-//! gravity, and collide with blocks using the player's sweep (`player::collide`).
+//! Like dropped items, mobs live in the planet's body (rotating) frame with local gravity
+//! (times `WEIGHT`), and collide with blocks using the player's sweep (`player::collide`).
 
 use glam::DVec3;
 
@@ -12,6 +13,15 @@ use crate::{
     render::MeshHandle,
     world::{block::Block, planet::Planet},
 };
+
+/// Animals fall this many times faster than real gravity (like the player's hops), so
+/// hops and knockback are brisk rather than floaty.
+const WEIGHT: f64 = 2.0;
+/// Take-off speed of a hop up one block under `WEIGHT` x gravity (about 1.2 m high).
+const HOP_SPEED: f64 = 6.9;
+/// A hit knocks an animal this fast away (m/s) in a low hop (0.3 s): about 1.3 m in all.
+const KNOCKBACK: f64 = 3.2;
+const KNOCKBACK_LIFT: f64 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MobKind {
@@ -36,6 +46,15 @@ impl MobKind {
             MobKind::Cow => (0.45, 1.4),
             MobKind::Pig => (0.45, 0.9),
             MobKind::Sheep => (0.45, 1.3),
+        }
+    }
+
+    /// The body's length along its heading for hits: half the length and how far its middle
+    /// is ahead of the feet (m). The head sticks out in front (see `mob_models`).
+    fn length(self) -> (f64, f64) {
+        match self {
+            MobKind::Cow => (1.06, 0.3),
+            _ => (0.83, 0.14),
         }
     }
 
@@ -78,6 +97,22 @@ impl MobKind {
     }
 }
 
+/// The animation state a model is posed from (see `mob_models`).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MobPose {
+    /// Walk cycle phase (radians) and how strongly the legs swing (0..1).
+    pub walk: f32,
+    pub swing: f32,
+    /// Flashing red after a hit.
+    pub hurt: bool,
+    /// Head down grazing (0..1).
+    pub graze: f32,
+    /// Seconds alive, for idle motion.
+    pub age: f32,
+    /// Coat colour variant (0..3).
+    pub coat: u8,
+}
+
 pub struct Mob {
     pub kind: MobKind,
     /// Feet position and velocity (body frame, planet-relative).
@@ -97,6 +132,13 @@ pub struct Mob {
     pub walk: f32,
     pub swing: f32,
     on_ground: bool,
+    /// Seconds alive (with a random start), for idle motion: tail, ears, looking around.
+    pub age: f32,
+    /// How far the head is down grazing (0..1), and whether it wants to graze.
+    pub graze: f32,
+    grazing: bool,
+    /// Coat colour variant.
+    pub coat: u8,
     pub mesh: Option<MeshHandle>,
     rng: u64,
 }
@@ -118,10 +160,16 @@ impl Mob {
             walk: 0.0,
             swing: 0.0,
             on_ground: false,
+            age: 0.0,
+            graze: 0.0,
+            grazing: false,
+            coat: 0,
             mesh: None,
             rng: seed | 1,
         };
         mob.goal_time = mob.random() as f32 * 3.0;
+        mob.age = mob.random() as f32 * 100.0;
+        mob.coat = (mob.random() * 4.0) as u8;
         mob
     }
 
@@ -151,8 +199,22 @@ impl Mob {
         let up = self.position.normalize_or(DVec3::Y);
         let away = self.position - from;
         let away = (away - up * away.dot(up)).normalize_or(self.heading);
-        self.velocity += away * 5.0 + up * 4.0;
+        // A short hop away (replacing its own motion, so hits don't add up to a flight).
+        self.velocity = away * KNOCKBACK + up * KNOCKBACK_LIFT;
+        self.grazing = false;
         self.health <= 0.0
+    }
+
+    /// What the model needs to pose it.
+    pub fn pose(&self) -> MobPose {
+        MobPose {
+            walk: self.walk,
+            swing: self.swing,
+            hurt: self.hurt > 0.0,
+            graze: self.graze,
+            age: self.age,
+            coat: self.coat,
+        }
     }
 
     /// Where it is in the middle (planet-relative).
@@ -167,8 +229,9 @@ impl Mob {
         let right = forward.cross(up);
         let (half_width, height) = self.kind.size();
         // Animals are longer than they are wide.
-        let half = [half_width, half_width * 1.8, height * 0.5];
-        let rel = origin - self.center();
+        let (half_length, ahead) = self.kind.length();
+        let half = [half_width, half_length, height * 0.5];
+        let rel = origin - (self.center() + forward * ahead);
         let axes = [right, forward, up];
         let (mut t0, mut t1) = (0.0f64, reach);
         for (axis, h) in axes.iter().zip(half) {
@@ -195,6 +258,8 @@ impl Mob {
         self.hurt = (self.hurt - dt as f32).max(0.0);
         self.panic = (self.panic - dt as f32).max(0.0);
         self.goal_time -= dt as f32;
+        self.age += dt as f32;
+        let gravity = gravity * WEIGHT;
 
         // Decide where to go.
         if self.goal_time <= 0.0 {
@@ -207,8 +272,19 @@ impl Mob {
             } else {
                 self.goal = None;
                 self.goal_time = 3.0 + self.random() as f32 * 5.0;
+                // Standing still is mostly grazing.
+                self.grazing = self.random() < 0.7;
+            }
+            if self.goal.is_some() {
+                self.grazing = false;
             }
         }
+        let head_down = if self.grazing && self.panic <= 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        self.graze += (head_down - self.graze) * (dt as f32 * 2.5).min(1.0);
         let speed = self.kind.speed() * if self.panic > 0.0 { 2.0 } else { 1.0 };
         let desired = match self.goal {
             Some(goal) => {
@@ -240,7 +316,7 @@ impl Mob {
         self.on_ground = blocked.down;
         // Bumped into a step: hop up it.
         if self.on_ground && (blocked.u || blocked.v) && desired != DVec3::ZERO {
-            self.velocity += up * 5.4;
+            self.velocity += up * (HOP_SPEED - self.velocity.dot(up));
             self.on_ground = false;
         }
 

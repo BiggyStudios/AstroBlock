@@ -75,6 +75,80 @@ impl Ui {
         self.quad((x, y, w, h), (mid, mid), color, FONT_LAYER);
     }
 
+    /// A rectangle with its own colour at each corner (top-left, top-right, bottom-right,
+    /// bottom-left), blended across it.
+    pub fn gradient(&mut self, x: f32, y: f32, w: f32, h: f32, colors: [[u8; 4]; 4]) {
+        let (a, b) = font::glyph_uv(font::SOLID);
+        let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+        let points = [[x, y], [x + w, y], [x + w, y + h], [x, y + h]];
+        for (pos, color) in points.into_iter().zip(colors) {
+            self.vertices.push(UiVertex {
+                pos,
+                uv: mid,
+                color,
+                layer: FONT_LAYER,
+            });
+        }
+    }
+
+    /// Any quad with its own colour at each corner (solid, no texture).
+    pub fn poly(&mut self, points: [[f32; 2]; 4], colors: [[u8; 4]; 4]) {
+        let (a, b) = font::glyph_uv(font::SOLID);
+        let mid = [(a[0] + b[0]) * 0.5, (a[1] + b[1]) * 0.5];
+        for (pos, color) in points.into_iter().zip(colors) {
+            self.vertices.push(UiVertex {
+                pos,
+                uv: mid,
+                color,
+                layer: FONT_LAYER,
+            });
+        }
+    }
+
+    /// A straight line `width` pixels wide.
+    pub fn line(&mut self, a: [f32; 2], b: [f32; 2], width: f32, color: [u8; 4]) {
+        let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-3 {
+            return;
+        }
+        let (nx, ny) = (-dy / len * width / 2.0, dx / len * width / 2.0);
+        self.poly(
+            [
+                [a[0] + nx, a[1] + ny],
+                [b[0] + nx, b[1] + ny],
+                [b[0] - nx, b[1] - ny],
+                [a[0] - nx, a[1] - ny],
+            ],
+            [color; 4],
+        );
+    }
+
+    /// A circle outline.
+    pub fn circle(&mut self, center: [f32; 2], radius: f32, width: f32, color: [u8; 4]) {
+        let n = ((radius * 0.8) as usize).clamp(10, 64);
+        let point = |i: usize| {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            [center[0] + radius * a.cos(), center[1] + radius * a.sin()]
+        };
+        for i in 0..n {
+            self.line(point(i), point(i + 1), width, color);
+        }
+    }
+
+    /// Fades (multiplies the alpha) and moves everything drawn since vertex `start`: how a
+    /// group of quads is animated after being drawn as usual. Moves snap to whole pixels so
+    /// the pixel font stays crisp.
+    pub fn fade_from(&mut self, start: usize, alpha: f32, dx: f32, dy: f32) {
+        let alpha = alpha.clamp(0.0, 1.0);
+        let (dx, dy) = (dx.round(), dy.round());
+        for v in &mut self.vertices[start..] {
+            v.color[3] = (v.color[3] as f32 * alpha).round() as u8;
+            v.pos[0] += dx;
+            v.pos[1] += dy;
+        }
+    }
+
     /// A rectangle outline `t` pixels thick.
     pub fn frame(&mut self, x: f32, y: f32, w: f32, h: f32, t: f32, color: [u8; 4]) {
         self.rect(x, y, w, t, color);
@@ -155,7 +229,12 @@ impl Ui {
         };
         // See-through blocks (glass) are drawn as sprites: alpha is transparency.
         let sprite = if block.is_cutout() { SPRITE } else { 0 };
-        self.quad((x, y, size, size), ([0.0; 2], [1.0; 2]), tint, tex as u32 | sprite);
+        self.quad(
+            (x, y, size, size),
+            ([0.0; 2], [1.0; 2]),
+            tint,
+            tex as u32 | sprite,
+        );
         let edge = (self.scale).max(1.0);
         self.rect(x, y, size, edge, [255, 255, 255, 40]);
         self.rect(x, y + size - edge, size, edge, [0, 0, 0, 70]);
@@ -174,7 +253,12 @@ impl Ui {
         if stack.count > 1 {
             let text = stack.count.to_string();
             let (w, h) = (self.text_width(&text), self.char_size().1);
-            self.text(x + size - w + s, y + size - h + 2.0 * s, &text, [235, 240, 245, 255]);
+            self.text(
+                x + size - w + s,
+                y + size - h + 2.0 * s,
+                &text,
+                [235, 240, 245, 255],
+            );
         }
         if let Some(left) = stack.durability()
             && stack.wear > 0

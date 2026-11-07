@@ -103,13 +103,6 @@ textures! {
     IronSword,
     GoldenSword,
     DiamondSword,
-    // Interface.
-    Heart,
-    HeartHalf,
-    HeartEmpty,
-    Flame,
-    FlameOff,
-    Arrow,
     // Added with the light / chest / mob update.
     Glass,
     TorchSide,
@@ -143,20 +136,21 @@ textures! {
     IronBoots,
     GoldenBoots,
     DiamondBoots,
-    Food,
-    FoodHalf,
-    FoodEmpty,
-    ArmorIcon,
-    ArmorHalf,
-    ArmorEmpty,
-    // Mob skins (alpha 255: the whole skin takes the tint, used for the red hurt flash).
-    CowSkin,
-    CowFace,
-    PigSkin,
-    PigFace,
-    SheepWool,
-    SheepFace,
-    SheepSkin,
+    // Animal coats: near-white and seamless, tiled at one texel per model unit and coloured
+    // by each part's tint (alpha 255 = tinted; `Patches` leaves its light patches untinted).
+    Fur,
+    Patches,
+    Wool,
+    Hide,
+    // The player's arm, seen in first person (alpha 0: never tinted).
+    Skin,
+    Sleeve,
+    // Craft.
+    Rocket,
+    // The moon.
+    Regolith,
+    MoonRock,
+    Basalt,
 }
 
 impl Tex {
@@ -171,6 +165,11 @@ impl Tex {
     pub fn armor(piece: usize, tier: usize) -> Tex {
         Tex::ALL[Tex::LeatherHelmet as usize + piece * 4 + tier]
     }
+}
+
+/// The RGBA pixels of one texture (row-major, 16x16), e.g. to extrude a sprite into 3D.
+pub fn pixels(t: Tex) -> Vec<[u8; 4]> {
+    make(t).px
 }
 
 pub fn generate() -> TextureArrayData {
@@ -670,51 +669,6 @@ fn make(t: Tex) -> Img {
                 [40, 170, 170]
             })
         }),
-        Tex::Heart | Tex::HeartHalf | Tex::HeartEmpty => {
-            let fill = |x: f32| match t {
-                Tex::Heart => true,
-                Tex::HeartHalf => x < 7.5,
-                _ => false,
-            };
-            sprite(|x, y| {
-                // (x^2 + y^2 - 1)^3 - x^2 y^3 < 0, scaled to the sprite.
-                let (hx, hy) = ((x - 7.5) / 6.5, (8.5 - y) / 6.5 + 0.15);
-                let f = (hx * hx + hy * hy - 1.0).powi(3) - hx * hx * hy.powi(3);
-                (f < 0.0).then(|| {
-                    if !fill(x) {
-                        [52, 18, 18]
-                    } else if hy > 0.55 && hx < -0.25 {
-                        [255, 150, 150]
-                    } else {
-                        [226, 32, 32]
-                    }
-                })
-            })
-        }
-        Tex::Flame | Tex::FlameOff => sprite(|x, y| {
-            let (dx, dy) = (x - 7.5, y - 10.0);
-            let width = if dy < 0.0 {
-                5.0 * (1.0 + dy / 9.0)
-            } else {
-                5.0
-            };
-            if dx.abs() > width || dx * dx + (dy * 1.3).max(0.0).powi(2) > 25.0 || dy < -9.0 {
-                return None;
-            }
-            Some(if t == Tex::FlameOff {
-                [120, 120, 120]
-            } else if dx.abs() < width * 0.45 && dy > -3.0 {
-                [255, 236, 120]
-            } else {
-                [250, 140, 30]
-            })
-        }),
-        Tex::Arrow => sprite(|x, y| {
-            let (dx, dy) = (x - 8.0, (y - 8.0).abs());
-            let shaft = dx < 2.0 && dx > -6.5 && dy < 1.5;
-            let head = (2.0..6.5).contains(&dx) && dy < 6.5 - dx;
-            (shaft || head).then_some([255, 255, 255])
-        }),
         Tex::Glass => {
             // Clear (alpha 0) with a pale frame and a few glints.
             let mut img = Img {
@@ -800,108 +754,119 @@ fn make(t: Tex) -> Img {
                 }
             })
         }),
-        Tex::Food | Tex::FoodHalf | Tex::FoodEmpty => {
-            let fill = |x: f32| match t {
-                Tex::Food => true,
-                Tex::FoodHalf => x < 7.5,
-                _ => false,
-            };
-            sprite(|x, y| {
-                let meat = (x - 6.0).powi(2) + (y - 6.5).powi(2) < 22.0;
-                let bone = (x - y).abs() < 1.5 && x > 8.0 && x < 14.5;
-                let knob = (x - 13.0).powi(2) + (y - 14.0).powi(2) < 3.0
-                    || (x - 14.0).powi(2) + (y - 12.5).powi(2) < 3.0;
-                if meat {
-                    Some(if !fill(x) {
-                        [48, 30, 22]
-                    } else if x + y < 10.0 {
-                        [214, 132, 60]
-                    } else {
-                        [176, 96, 40]
-                    })
-                } else if bone || knob {
-                    Some(if fill(x) {
-                        [236, 228, 214]
-                    } else {
-                        [60, 56, 52]
-                    })
-                } else {
-                    None
-                }
-            })
-        }
-        Tex::ArmorIcon | Tex::ArmorHalf | Tex::ArmorEmpty => {
-            let fill = |x: f32| match t {
-                Tex::ArmorIcon => true,
-                Tex::ArmorHalf => x < 7.5,
-                _ => false,
-            };
-            sprite(|x, y| {
-                armor_shape(1, x, y).then(|| {
-                    if fill(x) {
-                        [214, 214, 220]
-                    } else {
-                        [52, 52, 56]
-                    }
-                })
-            })
-        }
-        Tex::CowSkin => {
-            let mut img = noisy(r, [92, 62, 40], 0.08, 255);
-            for _ in 0..4 {
-                let (cx, cy, rad) = (r.f() * 16.0, r.f() * 16.0, 2.0 + r.f() * 2.5);
+        Tex::Fur => fur(r),
+        Tex::Patches => {
+            // Fur with a few cream patches (untinted), wrapping around the tile edges.
+            let mut img = fur(r);
+            for _ in 0..3 {
+                let (cx, cy, rad) = (r.f() * 16.0, r.f() * 16.0, 2.5 + r.f() * 2.0);
+                let wobble = [r.f() * 6.3, r.f() * 6.3];
                 for y in 0..TEX_SIZE {
                     for x in 0..TEX_SIZE {
-                        if (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2) < rad * rad {
-                            img.set(x, y, scale([236, 234, 228], 1.0 + r.signed() * 0.04), 255);
+                        let wrap = |d: f32| (d + 8.0).rem_euclid(16.0) - 8.0;
+                        let (dx, dy) = (wrap(x as f32 - cx), wrap(y as f32 - cy));
+                        let edge = rad
+                            * (1.0
+                                + 0.25 * (dy.atan2(dx) * 3.0 + wobble[0]).sin()
+                                + 0.12 * (dy.atan2(dx) * 5.0 + wobble[1]).sin());
+                        if dx * dx + dy * dy < edge * edge {
+                            img.set(x, y, scale([238, 232, 222], 1.0 + r.signed() * 0.03), 0);
                         }
                     }
                 }
             }
             img
         }
-        Tex::CowFace => {
-            let mut img = noisy(r, [92, 62, 40], 0.06, 255);
-            face_eyes(&mut img, 5);
-            for y in 10..16 {
-                for x in 3..13 {
-                    img.set(x, y, scale([214, 170, 150], 1.0 + r.signed() * 0.04), 255);
-                }
-            }
-            img.set(5, 12, [60, 40, 36], 255);
-            img.set(10, 12, [60, 40, 36], 255);
-            img
-        }
-        Tex::PigSkin => noisy(r, [238, 164, 164], 0.05, 255),
-        Tex::PigFace => {
-            let mut img = noisy(r, [238, 164, 164], 0.05, 255);
-            face_eyes(&mut img, 5);
-            for y in 9..13 {
-                for x in 5..11 {
-                    img.set(x, y, [214, 128, 132], 255);
-                }
-            }
-            img.set(6, 10, [110, 56, 60], 255);
-            img.set(9, 10, [110, 56, 60], 255);
-            img
-        }
-        Tex::SheepWool => {
-            let mut img = noisy(r, [226, 226, 220], 0.05, 255);
-            for _ in 0..40 {
+        Tex::Wool => {
+            // Soft lumps: rounded tufts, slightly shaded on their lower side.
+            let mut img = noisy(r, [236, 234, 228], 0.02, 255);
+            for _ in 0..22 {
                 let (x, y) = (r.below(16), r.below(16));
-                img.shade(x, y, 0.86);
+                img.shade(x, y, 1.04);
+                img.shade((x + 1) % 16, y, 1.03);
+                img.shade(x, (y + 1) % 16, 0.93);
+                img.shade((x + 1) % 16, (y + 1) % 16, 0.95);
             }
             img
         }
-        Tex::SheepSkin => noisy(r, [172, 160, 142], 0.06, 255),
-        Tex::SheepFace => {
-            let mut img = noisy(r, [172, 160, 142], 0.05, 255);
-            face_eyes(&mut img, 6);
-            for x in 6..10 {
-                img.set(x, 12, [120, 100, 90], 255);
+        Tex::Hide => noisy(r, [240, 236, 232], 0.025, 255),
+        Tex::Skin => noisy(r, [204, 154, 118], 0.03, 0),
+        Tex::Sleeve => {
+            // A plain work shirt: dark slate cotton with a faint weave.
+            let mut img = noisy(r, [74, 88, 100], 0.05, 0);
+            for y in 0..TEX_SIZE {
+                for x in 0..TEX_SIZE {
+                    if (x + y) % 4 == 0 {
+                        img.shade(x, y, 0.94);
+                    }
+                }
             }
             img
         }
+        Tex::Regolith => {
+            // Fine grey dust with a scatter of small pebbles.
+            let mut img = noisy(r, [138, 136, 132], 0.06, 0);
+            for _ in 0..14 {
+                let (x, y) = (r.below(16), r.below(16));
+                let g = 100 + r.below(70) as u8;
+                img.set(x, y, [g, g, g.saturating_sub(3)], 0);
+            }
+            img
+        }
+        Tex::MoonRock => {
+            // Pale anorthosite with bright feldspar specks.
+            let mut img = noisy(r, [176, 174, 170], 0.08, 0);
+            for _ in 0..18 {
+                let (x, y) = (r.below(16), r.below(16));
+                img.shade(x, y, 1.16);
+            }
+            for _ in 0..6 {
+                let (x, y) = (r.below(15), r.below(16));
+                img.shade(x, y, 0.82);
+                img.shade(x + 1, y, 0.86);
+            }
+            img
+        }
+        Tex::Basalt => {
+            // Dark mare basalt with small gas bubbles.
+            let mut img = noisy(r, [72, 72, 76], 0.08, 0);
+            for _ in 0..12 {
+                let (x, y) = (r.below(16), r.below(16));
+                img.shade(x, y, 0.62);
+            }
+            img
+        }
+        Tex::Rocket => sprite(|x, y| {
+            let (x, y) = (x as i32, y as i32);
+            let body = (6..=9).contains(&x) && (3..=11).contains(&y);
+            let nose = (y == 1 && (7..=8).contains(&x)) || (y == 2 && (6..=9).contains(&x));
+            let fin = ((x == 5 || x == 10) && (8..=12).contains(&y))
+                || ((x == 4 || x == 11) && (10..=12).contains(&y));
+            let flame = (7..=8).contains(&x) && (12..=14).contains(&y);
+            if nose {
+                Some([235, 120, 40])
+            } else if body {
+                Some(if (7..=8).contains(&x) && y == 5 {
+                    [60, 100, 150]
+                } else if y == 8 {
+                    [235, 120, 40]
+                } else if x == 9 {
+                    [196, 198, 204]
+                } else {
+                    [240, 240, 236]
+                })
+            } else if fin {
+                Some([200, 52, 40])
+            } else if flame {
+                Some(if y == 12 {
+                    [255, 230, 140]
+                } else {
+                    [250, 150, 50]
+                })
+            } else {
+                None
+            }
+        }),
         _ if t as usize >= Tex::LeatherHelmet as usize => {
             let i = t as usize - Tex::LeatherHelmet as usize;
             let (piece, tier) = (i / 4, i % 4);
@@ -962,19 +927,6 @@ fn meat(r: &mut Rng, base: Rgb, fat: Rgb) -> Img {
         }
     }
     img
-}
-
-/// Eyes on a mob face, `y` rows down.
-fn face_eyes(img: &mut Img, y: usize) {
-    for (x, c) in [
-        (3, [240, 240, 240]),
-        (4, [20, 20, 20]),
-        (11, [20, 20, 20]),
-        (12, [240, 240, 240]),
-    ] {
-        img.set(x, y, c, 255);
-        img.set(x, y + 1, c, 255);
-    }
 }
 
 /// Armor piece silhouettes: 0 helmet, 1 chestplate, 2 leggings, 3 boots.
@@ -1163,4 +1115,20 @@ fn ingot(base: Rgb) -> Img {
             None
         }
     })
+}
+
+/// Short animal hair, near white (the tint gives the colour): faint strands along the tile.
+fn fur(r: &mut Rng) -> Img {
+    let mut img = noisy(r, [238, 234, 228], 0.035, 255);
+    for _ in 0..26 {
+        let (x, y) = (r.below(16), r.below(16));
+        for i in 0..2 + r.below(2) {
+            img.shade(x, (y + i) % 16, 0.9);
+        }
+    }
+    for _ in 0..10 {
+        let (x, y) = (r.below(16), r.below(16));
+        img.shade(x, y, 1.05);
+    }
+    img
 }

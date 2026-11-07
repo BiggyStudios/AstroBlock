@@ -163,6 +163,8 @@ pub enum Item {
     CookedMutton,
     Leather,
     Armor(ArmorPiece, ArmorTier),
+    /// A test rocket (infinite fuel): placed on the ground, then boarded.
+    Rocket,
 }
 
 /// How an item looks in the inventory and on the ground.
@@ -214,6 +216,7 @@ impl Item {
         for piece in ArmorPiece::ALL {
             items.extend(ArmorTier::ALL.iter().map(|&t| Item::Armor(piece, t)));
         }
+        items.push(Item::Rocket);
         items
     }
 
@@ -249,7 +252,7 @@ impl Item {
 
     pub fn max_stack(self) -> u8 {
         match self {
-            Item::Tool(..) | Item::Armor(..) => 1,
+            Item::Tool(..) | Item::Armor(..) | Item::Rocket => 1,
             _ => 64,
         }
     }
@@ -277,6 +280,7 @@ impl Item {
             Item::CookedMutton => Icon::Sprite(Tex::CookedMutton),
             Item::Leather => Icon::Sprite(Tex::Leather),
             Item::Armor(piece, tier) => Icon::Sprite(Tex::armor(piece as usize, tier as usize)), // Torches show as their sprite, not a cube.
+            Item::Rocket => Icon::Sprite(Tex::Rocket),
         }
     }
 
@@ -431,7 +435,9 @@ pub fn mining(block: Block) -> Mining {
         Air | Water => m(0.0, None, None),
         OakLeaves | SpruceLeaves | JungleLeaves => m(0.2, None, None),
         Snow => m(0.2, Some(Shovel), None),
-        Dirt | Sand | RedSand | IlmeniteSand => m(0.5, Some(Shovel), None),
+        Dirt | Sand | RedSand | IlmeniteSand | Regolith => m(0.5, Some(Shovel), None),
+        MoonRock => m(1.5, Some(Pickaxe), Some(0)),
+        Basalt => m(1.8, Some(Pickaxe), Some(0)),
         Grass | SnowyGrass | Gravel => m(0.6, Some(Shovel), None),
         Ice => m(0.5, Some(Pickaxe), None),
         Cactus => m(0.4, None, None),

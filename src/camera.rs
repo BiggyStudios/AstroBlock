@@ -2,6 +2,9 @@
 
 use glam::{DVec3, Mat4, Quat, Vec3, camera::rh::proj};
 
+/// View-model depth mapping (see `Camera::view_model_projection`): depth = a + b / distance.
+const VIEW_MODEL_DEPTH: (f32, f32) = (0.6, 0.032);
+
 pub struct Camera {
     /// Absolute world position in meters. f64 so it stays precise at interplanetary
     /// (and, with per-system reference frames later, interstellar) distances.
@@ -67,6 +70,27 @@ impl Camera {
         self.orientation() * Vec3::X
     }
 
+    /// Turns the whole view by `q` (moving to another world's frame).
+    pub fn rotate_frame(&mut self, q: Quat) {
+        self.frame = (q * self.frame).normalize();
+    }
+
+    /// Points the camera along `forward` with `up` as the screen's up (chase and map
+    /// cameras). Yaw and pitch become zero: the whole orientation is in the frame.
+    pub fn look_at(&mut self, forward: Vec3, up: Vec3) {
+        let Some(f) = forward.try_normalize() else {
+            return;
+        };
+        let r = f
+            .cross(up)
+            .try_normalize()
+            .unwrap_or_else(|| f.any_orthonormal_vector());
+        let u = r.cross(f);
+        self.frame = Quat::from_mat3(&glam::Mat3::from_cols(r, u, -f)).normalize();
+        self.yaw = 0.0;
+        self.pitch = 0.0;
+    }
+
     pub fn rotate(&mut self, d_yaw: f32, d_pitch: f32) {
         let limit = 89.9f32.to_radians();
         self.yaw = (self.yaw + d_yaw).rem_euclid(std::f32::consts::TAU);
@@ -80,5 +104,42 @@ impl Camera {
         // The `vulkan` variant also flips Y to match Vulkan's Y-down clip space.
         let proj = proj::vulkan::perspective_infinite_reverse(self.fov_y, aspect, self.near);
         proj * Mat4::from_quat(self.orientation().inverse())
+    }
+
+    /// `view_projection` for the first-person view model: the same picture, but its depth
+    /// is squeezed into 0.6..1 (depth = 0.6 + 0.032 / distance, so 1 at 8 cm). Everything
+    /// in the world is further than 8 cm and so has depth below 0.6 (`near` / distance):
+    /// the arm is always in front and never pokes into walls, yet still depth-sorts itself.
+    pub fn view_model_projection(&self, aspect: f32) -> Mat4 {
+        let mut proj = proj::vulkan::perspective_infinite_reverse(self.fov_y, aspect, self.near);
+        // clip.z = 0.6 * w + 0.032, where w = -z_view is the distance along the view.
+        proj.z_axis.z = -VIEW_MODEL_DEPTH.0;
+        proj.w_axis.z = VIEW_MODEL_DEPTH.1;
+        proj * Mat4::from_quat(self.orientation().inverse())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_model_depth_stays_in_front() {
+        let camera = Camera::new(DVec3::ZERO, Vec3::Y);
+        let depth = |m: Mat4, d: f32| {
+            let clip = m * (camera.forward() * d).extend(1.0);
+            clip.z / clip.w
+        };
+        let world = camera.view_projection(1.5);
+        let arm = camera.view_model_projection(1.5);
+        assert!((depth(world, 0.5) - camera.near / 0.5).abs() < 1e-5);
+        assert!((depth(arm, 0.3) - (0.6 + 0.032 / 0.3)).abs() < 1e-5);
+        assert!(depth(arm, 0.081) <= 1.0, "visible from 8 cm");
+        // Nearer than any wall can be (the player keeps 0.3 m from walls).
+        assert!(depth(arm, 1.0) > depth(world, 0.083));
+        // And the same picture on screen.
+        let p = Vec3::new(0.2, -0.1, -0.4);
+        let (a, b) = (world * p.extend(1.0), arm * p.extend(1.0));
+        assert!((a.x / a.w - b.x / b.w).abs() < 1e-6 && (a.y / a.w - b.y / b.w).abs() < 1e-6);
     }
 }

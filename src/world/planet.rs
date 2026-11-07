@@ -6,8 +6,9 @@
 //!
 //! * Blocks are slightly wedge-shaped but look and behave like cubes, and "up" is always
 //!   radial - so building works the same everywhere on the planet.
-//! * The equiangular (tangent) mapping keeps blocks close to the same width over a whole
-//!   face, instead of the naive normalized-cube mapping which squashes them near corners.
+//! * Each face's grid is mapped onto the sphere by a fitted, nearly *conformal* map (see
+//!   [`MAP_Q`]): blocks stay square almost everywhere, and the distortion no grid can avoid
+//!   gathers round the 8 cube corners (which terrain generation covers with sea).
 //! * At face edges, neighbours live on another face with a rotated grid;
 //!   [`Planet::wrap_column`] handles that.
 //!
@@ -20,26 +21,64 @@
 //! boundaries are aligned to chunk layers, so every chunk lies in exactly one shell.
 //! Layer 0 starts at the centre of the planet.
 
+use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
+
 use glam::DVec3;
 
 use super::chunk::{BlockCell, ChunkKey};
 
 pub const CHUNK_SIZE: i32 = 32;
 
-/// The cube-to-sphere mapping: a grid coordinate x in [-1, 1] across a face becomes the cube
-/// coordinate tan(MAP_ANGLE * x) / tan(MAP_ANGLE).
+/// The cube-to-sphere mapping of a face: grid coordinates (x, y) in [-1, 1]^2 across the face
+/// become cube-face coordinates (a, b) = (A(x, y), A(y, x)), and the direction is
+/// normalize(normal + a s + b t), with
 ///
-/// No grid of blocks can cover a sphere with equal cubes. 45 degrees would be the classic
-/// equiangular map: perfect cubes at face centres, but 29% narrower along face edges. 38
-/// degrees, together with the radius chosen in [`Planet::new`], spreads the width error
-/// evenly instead. Surface blocks are 0.84-1.19 m wide everywhere, 9% off on average, and 61%
-/// of them are within 10% of 1 m (equiangular: 0.71-1.0 m, 12%, 44%).
+///     A(x, y) = x (1 + (1 - x^2) Q(x^2, y^2)),   Q = sum of MAP_Q[(i, j)] X^i Y^j.
 ///
-/// Away from the face's centre lines blocks are also skewed (parallelograms, 9 degrees on
-/// average), up to 120-degree diamonds at the 8 cube corners. That comes from the grid lines
-/// being great circles, so no mapping of this kind can change it.
-pub const MAP_ANGLE: f64 = 0.663_225_115_757_845_3; // 38 degrees
-const TAN_MAP_ANGLE: f64 = 0.781_285_626_506_717_4;
+/// No grid of blocks can cover a sphere with equal squares. At the 8 cube corners only 3
+/// blocks meet, so the grid has to bend somewhere. A separable map (each axis on its own, like
+/// the earlier tan(38 deg x) / tan(38 deg)) makes every grid line a great circle. That skews
+/// blocks into parallelograms over much of the planet: only 28% were within 3 degrees of
+/// square, and 9% were 20-30 degrees off.
+///
+/// Q was fitted (least squares over the face) to make the map close to *conformal*, i.e.
+/// angle-preserving, so blocks are squares. Skew and aspect ratio are ignored only within
+/// 0.3 face half-widths of a corner, and the spread of sizes is kept small. The distortion
+/// therefore gathers round the corners, under the corner seas of `terrain`:
+/// - 92% of surface blocks are within 1 degree of square (96% within 3).
+/// - Widths are within 10% of the median ([`BLOCK_WIDTH`]) for 80% of blocks and within 20% for
+///   91%. They run from 1.08x the median at face centres down to about 0.5x right at a corner. A square grid on a sphere
+///   must change size somewhere, and this map does it towards the corners.
+///
+/// The form keeps every face edge on the cube's edge (A(+-1, y) = +-1 exactly). A is odd in x
+/// and even in y, evaluated from |x| and y^2, so mirrored grid coordinates give bit-identical
+/// results. That is what keeps shared face edges and shell corners exact.
+const MAP_Q: [(usize, usize, f64); 15] = [
+    (0, 0, -1.918_645_132_814_316e-1),
+    (0, 1, 1.394_210_225_478_188e-1),
+    (1, 0, -2.126_439_194_195_621e-2),
+    (0, 2, 1.130_755_627_275_867e-1),
+    (1, 1, -1.695_998_201_029_859e-1),
+    (2, 0, -1.075_030_746_475_712_8e-1),
+    (0, 3, -2.297_133_060_893_893_2e-2),
+    (1, 2, 1.454_508_432_355_709e-1),
+    (2, 1, 4.277_364_501_907_745_5e-1),
+    (3, 0, 8.949_901_050_811_3e-2),
+    (0, 4, 2.124_748_826_587_190_6e-2),
+    (1, 3, 1.552_390_955_706_102_5e-1),
+    (2, 2, -1.896_547_852_310_150_3e-1),
+    (3, 1, -2.626_134_224_530_901e-1),
+    (4, 0, -2.647_286_755_190_688e-2),
+];
+
+/// The median surface block width on the unit sphere, per unit of grid coordinate x (from the
+/// same fit). It sets the radius at which the median block is 1 m wide.
+const MAP_MEDIAN_SCALE: f64 = 0.745_944_293_749_470_1;
+
+/// The median surface block width (m). The home planet (65,536 columns per face edge) then has
+/// a 43.9 km radius; widths run from about 0.5 m (corners) to 1.08 m (face centres), almost all
+/// within a few percent of this.
+pub const BLOCK_WIDTH: f64 = 1.0;
 
 /// One of the 6 cube faces: 0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -101,15 +140,13 @@ pub struct Planet {
 }
 
 impl Planet {
-    /// `chunks_per_face` sets the size: the sea-level radius is chosen so surface blocks are
-    /// ~1 m wide (0.84-1.19 m, see [`MAP_ANGLE`]). `height_limit` is how many layers exist
+    /// `chunks_per_face` sets the size: the sea-level radius is chosen so the median surface
+    /// block is [`BLOCK_WIDTH`] wide (see [`MAP_Q`]). `height_limit` is how many layers exist
     /// above sea level.
     pub fn new(center: DVec3, chunks_per_face: i32, height_limit: i32, seed: u64) -> Self {
         let face_blocks = chunks_per_face * CHUNK_SIZE;
-        // Blocks at a face centre are R * (2 / N) * MAP_ANGLE / tan(MAP_ANGLE) wide, the
-        // widest anywhere. Blocks on a face edge are 1/sqrt(2) of that along the edge, the
-        // narrowest. Balance the two around 1 m: centre 2^(1/4) = 1.19 m, edge 0.84 m.
-        let sea_radius = face_blocks as f64 * 2f64.powf(0.25) * TAN_MAP_ANGLE / (2.0 * MAP_ANGLE);
+        // A block spans 2 / N of x, so it is R * (2 / N) * scale wide.
+        let sea_radius = face_blocks as f64 * BLOCK_WIDTH / (2.0 * MAP_MEDIAN_SCALE);
         let sea_layer = sea_radius.floor() as i32;
         let layers = (sea_layer + height_limit + CHUNK_SIZE - 1) / CHUNK_SIZE * CHUNK_SIZE;
 
@@ -168,19 +205,16 @@ impl Planet {
         r - self.sea_radius + self.sea_layer as f64
     }
 
-    /// Grid coordinate (0..=n, fractional allowed) on a face with `n` columns per edge ->
-    /// cube-face coordinate in [-1, 1]. Computed symmetrically so mirrored coordinates give
-    /// bit-identical results, which keeps vertices on shared face edges exactly equal.
-    pub fn grid_to_cube(g: f64, n: i32) -> f64 {
+    /// Grid position (0..=n, fractional allowed) on a face with `n` columns per edge -> the
+    /// face coordinate in [-1, 1].
+    fn grid_coord(g: f64, n: i32) -> f64 {
         let n = n as f64;
-        let x = (2.0 * g - n) / n;
-        if x.abs() == 1.0 {
-            return x;
-        }
-        ((x.abs() * MAP_ANGLE).tan() / TAN_MAP_ANGLE).copysign(x)
+        (2.0 * g - n) / n
     }
 
-    fn grid_to_cube_exact(g: i32, n: i32) -> f64 {
+    /// [`grid_coord`](Self::grid_coord) of an integer grid line, exact at the face's edges and
+    /// centre line.
+    fn grid_coord_exact(g: i32, n: i32) -> f64 {
         if g == 0 {
             -1.0
         } else if g == n {
@@ -188,13 +222,130 @@ impl Planet {
         } else if 2 * g == n {
             0.0
         } else {
-            Self::grid_to_cube(g as f64, n)
+            Self::grid_coord(g as f64, n)
         }
     }
 
-    /// Inverse of [`grid_to_cube`](Self::grid_to_cube).
-    pub fn cube_to_grid(a: f64, n: i32) -> f64 {
-        ((a * TAN_MAP_ANGLE).atan() / MAP_ANGLE + 1.0) * 0.5 * n as f64
+    /// Face coordinate in [-1, 1] -> grid position (0..=n).
+    fn coord_grid(x: f64, n: i32) -> f64 {
+        (x + 1.0) * 0.5 * n as f64
+    }
+
+    /// A(x, y) of the face map (see [`MAP_Q`]) and its partial derivatives (dA/dx, dA/dy).
+    ///
+    /// Beyond the face (|x| > 1 or |y| > 1, where physics keeps one face's grid while crossing
+    /// an edge) the polynomial would run away. There the map continues *in angle*: the angle
+    /// atan(a) grows linearly with x from the edge (pi/4) with the edge's slope, and y's
+    /// influence is frozen at the edge. That matches value and slope at the edge, and grid
+    /// coordinates stay bounded towards the far side of the planet (like the old tan map), so
+    /// sweeps through far-away grid space stay short.
+    fn map_axis(x: f64, y: f64) -> (f64, f64, f64) {
+        let outside = x.abs() - 1.0;
+        let ax = x.abs().min(1.0);
+        let inside_y = y.abs() <= 1.0;
+        let (xx, yy) = (ax * ax, if inside_y { y * y } else { 1.0 });
+        let mut xp = [1.0; 5];
+        let mut yp = [1.0; 5];
+        for i in 1..5 {
+            xp[i] = xp[i - 1] * xx;
+            yp[i] = yp[i - 1] * yy;
+        }
+        let (mut q, mut qx, mut qy) = (0.0, 0.0, 0.0);
+        for &(i, j, c) in &MAP_Q {
+            q += c * xp[i] * yp[j];
+            if i > 0 {
+                qx += c * i as f64 * xp[i - 1] * yp[j];
+            }
+            if j > 0 {
+                qy += c * j as f64 * xp[i] * yp[j - 1];
+            }
+        }
+        let qy = if inside_y { qy } else { 0.0 };
+        let da_dx = 1.0 + (1.0 - 3.0 * xx) * q + 2.0 * xx * (1.0 - xx) * qx;
+        if outside > 0.0 {
+            // At the edge A = 1, and (1 - x^2) = 0 leaves dA/dx = 1 - 2 Q: the angle's slope is
+            // half that (d atan(a) = da / (1 + a^2), a = 1).
+            let slope = 0.5 * da_dx;
+            let angle = (FRAC_PI_4 + outside * slope).min(FRAC_PI_2 - 1e-9);
+            let a = angle.tan();
+            let sec2 = 1.0 + a * a;
+            // d slope / dy = -dQ/dy = -2 y Q_Y.
+            let da_dy = sec2 * outside * (-2.0 * y * qy);
+            return (a.copysign(x), sec2 * slope, da_dy * x.signum());
+        }
+        let a = if ax == 1.0 {
+            1.0
+        } else {
+            ax * (1.0 + (1.0 - xx) * q)
+        };
+        let da_dy = 2.0 * x * y * (1.0 - xx) * qy;
+        (a.copysign(x), da_dx, da_dy)
+    }
+
+    /// Face coordinates (x, y) in [-1, 1]^2 -> cube-face coordinates (a, b).
+    pub fn face_to_cube(x: f64, y: f64) -> (f64, f64) {
+        (Self::map_axis(x, y).0, Self::map_axis(y, x).0)
+    }
+
+    /// Inverse of [`face_to_cube`](Self::face_to_cube), by Newton's method (also a little
+    /// beyond the face, where the map continues smoothly).
+    pub fn cube_to_face(a: f64, b: f64) -> (f64, f64) {
+        // Outside the face the map decouples (see `map_axis`): invert it directly.
+        let (out_a, out_b) = (a.abs() > 1.0, b.abs() > 1.0);
+        if out_a || out_b {
+            // The angle continuation, given the other coordinate (frozen at the edge if it is
+            // outside too).
+            let beyond = |c: f64, other: f64| {
+                let slope = 0.5 * Self::map_axis(1.0, other.clamp(-1.0, 1.0)).1;
+                (1.0 + (c.abs().atan() - FRAC_PI_4) / slope).copysign(c)
+            };
+            return match (out_a, out_b) {
+                (true, true) => (beyond(a, 1.0), beyond(b, 1.0)),
+                (true, false) => {
+                    let y = Self::cube_to_edge(b);
+                    (beyond(a, y), y)
+                }
+                _ => {
+                    let x = Self::cube_to_edge(a);
+                    (x, beyond(b, x))
+                }
+            };
+        }
+        let (mut x, mut y) = (a, b);
+        for _ in 0..40 {
+            let (fa, ax, ay) = Self::map_axis(x, y);
+            let (fb, by, bx) = Self::map_axis(y, x);
+            let (ra, rb) = (fa - a, fb - b);
+            let det = ax * by - ay * bx;
+            let dx = (ra * by - ay * rb) / det;
+            let dy = (ax * rb - bx * ra) / det;
+            x -= dx;
+            y -= dy;
+            // Converged to (relative) rounding level.
+            if dx.abs() + dy.abs() <= 4e-16 * (1.0 + x.abs() + y.abs()) {
+                break;
+            }
+        }
+        (x, y)
+    }
+
+    /// The cube coordinate along a face edge (the other coordinate is +-1) at face coordinate
+    /// `x`, and its inverse. Both faces sharing the edge use these, so they agree exactly.
+    fn edge_to_cube(x: f64) -> f64 {
+        Self::map_axis(x, 1.0).0
+    }
+
+    fn cube_to_edge(c: f64) -> f64 {
+        let mut x = c;
+        for _ in 0..40 {
+            let (f, dx, _) = Self::map_axis(x, 1.0);
+            let step = (f - c) / dx;
+            x -= step;
+            if step.abs() <= 4e-16 * (1.0 + x.abs()) {
+                break;
+            }
+        }
+        x
     }
 
     /// Footprint of the surface block in direction `dir`: its widths along u and v (m) and
@@ -215,7 +366,8 @@ impl Planet {
     /// Unit direction through grid position (u, v) on a face with `n` columns per edge.
     pub fn dir(&self, face: Face, u: f64, v: f64, n: i32) -> DVec3 {
         let (normal, s, t) = face.basis();
-        (normal + s * Self::grid_to_cube(u, n) + t * Self::grid_to_cube(v, n)).normalize()
+        let (a, b) = Self::face_to_cube(Self::grid_coord(u, n), Self::grid_coord(v, n));
+        (normal + s * a + t * b).normalize()
     }
 
     /// Unit direction through an integer grid corner. Exact on face edges, so neighbouring
@@ -223,8 +375,8 @@ impl Planet {
     /// exactly with every other corner of the finer shell above it.
     pub fn corner_dir(&self, face: Face, u: i32, v: i32, n: i32) -> DVec3 {
         let (normal, s, t) = face.basis();
-        (normal + s * Self::grid_to_cube_exact(u, n) + t * Self::grid_to_cube_exact(v, n))
-            .normalize()
+        let (a, b) = Self::face_to_cube(Self::grid_coord_exact(u, n), Self::grid_coord_exact(v, n));
+        (normal + s * a + t * b).normalize()
     }
 
     /// Direction through the centre of surface column (u, v).
@@ -240,8 +392,8 @@ impl Planet {
         let k = self.layer_at_radius(rel.length());
         let n = self.res_at((k.floor() as i32).clamp(0, self.layers - 1));
         let dn = rel.dot(normal).max(1e-12);
-        let u = Self::cube_to_grid(rel.dot(s) / dn, n);
-        let v = Self::cube_to_grid(rel.dot(t) / dn, n);
+        let (x, y) = Self::cube_to_face(rel.dot(s) / dn, rel.dot(t) / dn);
+        let (u, v) = (Self::coord_grid(x, n), Self::coord_grid(y, n));
         (face, u, v, k)
     }
 
@@ -252,8 +404,8 @@ impl Planet {
         let (normal, s, t) = face.basis();
         let k = self.layer_at_radius(rel.length());
         let dn = rel.dot(normal).max(1e-12);
-        let u = Self::cube_to_grid(rel.dot(s) / dn, n);
-        let v = Self::cube_to_grid(rel.dot(t) / dn, n);
+        let (x, y) = Self::cube_to_face(rel.dot(s) / dn, rel.dot(t) / dn);
+        let (u, v) = (Self::coord_grid(x, n), Self::coord_grid(y, n));
         (u, v, k)
     }
 
@@ -341,9 +493,11 @@ impl Planet {
         let (_, s2, t2) = new_face.basis();
 
         // A point on the shared edge, at the centre of the shared column coordinate.
-        let p = normal + new_normal + shared_axis * Self::grid_to_cube(shared as f64 + 0.5, n);
+        let along = Self::edge_to_cube(Self::grid_coord(shared as f64 + 0.5, n));
+        let p = normal + new_normal + shared_axis * along;
         let edge_cell = |c: f64| if c > 0.0 { n - depth } else { depth - 1 };
-        let shared_cell = |c: f64| (Self::cube_to_grid(c, n).floor() as i32).clamp(0, n - 1);
+        let shared_cell =
+            |c: f64| (Self::coord_grid(Self::cube_to_edge(c), n).floor() as i32).clamp(0, n - 1);
 
         if s2.dot(normal).abs() > 0.5 {
             (new_face, edge_cell(p.dot(s2)), shared_cell(p.dot(t2)))
@@ -426,34 +580,80 @@ mod tests {
         Planet::new(DVec3::ZERO, 64, 128, 1)
     }
 
+    /// The inverse map is on hot paths (collision, streaming): it must converge in a few steps.
     #[test]
-    fn mapping_constants() {
-        assert_eq!(MAP_ANGLE, 38f64.to_radians());
-        assert!((TAN_MAP_ANGLE - MAP_ANGLE.tan()).abs() < 1e-15);
-        for n in [64, 4096] {
-            for g in [
-                0.0,
-                0.3,
-                1.0,
-                17.5,
-                n as f64 / 2.0,
-                n as f64 - 0.25,
-                n as f64,
-            ] {
-                let back = Planet::cube_to_grid(Planet::grid_to_cube(g, n), n);
-                assert!((back - g).abs() < 1e-9, "{g} -> {back}");
+    fn cube_to_face_converges_quickly() {
+        let start = std::time::Instant::now();
+        let mut sum = 0.0;
+        for i in 0..200_000 {
+            let t = i as f64 * 0.000_013;
+            let (x, y) = Planet::cube_to_face(t.sin(), (t * 1.7).cos() * 0.9);
+            sum += x + y;
+        }
+        assert!(sum.is_finite());
+        let per_call = start.elapsed().as_secs_f64() / 200_000.0;
+        assert!(per_call < 2e-6, "{:.2} us per inverse", per_call * 1e6);
+    }
+
+    #[test]
+    fn face_map_is_exact_symmetric_and_invertible() {
+        // Edges stay on the cube's edges, the centre lines stay put.
+        for y in [-1.0, -0.7, 0.0, 0.3, 0.999, 1.0] {
+            assert_eq!(Planet::face_to_cube(1.0, y).0, 1.0);
+            assert_eq!(Planet::face_to_cube(-1.0, y).0, -1.0);
+            assert_eq!(Planet::face_to_cube(0.0, y).0, 0.0);
+        }
+        // Mirrored coordinates give bit-identical (mirrored) results.
+        for (x, y) in [(0.3, 0.8), (0.91, 0.12), (0.5, 1.0), (1.0, 0.77)] {
+            let (a, b) = Planet::face_to_cube(x, y);
+            assert_eq!(Planet::face_to_cube(-x, y), (-a, b));
+            assert_eq!(Planet::face_to_cube(x, -y), (a, -b));
+            assert_eq!(Planet::face_to_cube(y, x), (b, a));
+        }
+        // Inverse, also a little beyond the face; monotonic along both axes.
+        for i in -10..=10 {
+            for j in -10..=10 {
+                let (x, y) = (i as f64 * 0.101, j as f64 * 0.101);
+                let (a, b) = Planet::face_to_cube(x, y);
+                let (x2, y2) = Planet::cube_to_face(a, b);
+                assert!((x2 - x).abs() < 1e-12 && (y2 - y).abs() < 1e-12, "{x},{y}");
+                let (a2, _) = Planet::face_to_cube(x + 1e-3, y);
+                assert!(a2 > a);
             }
-            assert_eq!(Planet::grid_to_cube(n as f64, n), 1.0);
-            assert_eq!(Planet::grid_to_cube(0.0, n), -1.0);
+        }
+        // Far beyond the face (physics near edges, fast or far bodies) it stays invertible.
+        for (a, b) in [
+            (3.0, 0.2),
+            (-40.0, 7.0),
+            (1.5, 1.5),
+            (0.3, -12.0),
+            (1e4, -2e4),
+        ] {
+            let (x, y) = Planet::cube_to_face(a, b);
+            let (a2, b2) = Planet::face_to_cube(x, y);
+            assert!(
+                (a2 - a).abs() < 1e-9 * a.abs().max(1.0),
+                "{a},{b} -> {a2},{b2}"
+            );
+            assert!(
+                (b2 - b).abs() < 1e-9 * b.abs().max(1.0),
+                "{a},{b} -> {a2},{b2}"
+            );
+        }
+        for x in [-1.0, -0.4, 0.0, 0.25, 0.999, 1.0] {
+            let c = Planet::edge_to_cube(x);
+            assert!((Planet::cube_to_edge(c) - x).abs() < 1e-12);
         }
     }
 
-    /// Surface blocks stay within 0.84-1.19 m wide everywhere and are mostly close to 1 m.
+    /// Surface blocks are almost all square and close to 1 m (see [`MAP_Q`]); the rest are
+    /// round the cube corners.
     #[test]
     fn surface_blocks_are_nearly_cubes() {
         let p = Planet::new(DVec3::ZERO, 2048, 1024, 1);
         let (mut lo, mut hi, mut close, mut total) = (f64::MAX, 0f64, 0, 0);
         let (mut close_widths, mut deviation, mut skew) = (0, 0.0, 0.0);
+        let mut squares = 0;
         let steps = 120;
         for i in 0..steps {
             for j in 0..steps {
@@ -468,9 +668,14 @@ mod tests {
                 lo = lo.min(wu).min(wv);
                 hi = hi.max(wu).max(wv);
                 total += 1;
-                let worst = (wu - 1.0).abs().max((wv - 1.0).abs());
+                let worst = (wu / BLOCK_WIDTH - 1.0)
+                    .abs()
+                    .max((wv / BLOCK_WIDTH - 1.0).abs());
                 deviation += worst;
                 skew += (angle - 90.0).abs();
+                if (angle - 90.0).abs() < 3.0 {
+                    squares += 1;
+                }
                 if worst < 0.1 {
                     close_widths += 1;
                     if (angle - 90.0).abs() < 10.0 {
@@ -488,13 +693,23 @@ mod tests {
             share * 100.0,
             close_widths as f64 / total as f64 * 100.0
         );
-        // The equiangular map (45 degrees) was 0.71..1.0 m, 12% mean deviation, 44% within 10%.
-        assert!(lo > 0.84 && hi < 1.19, "widths {lo}..{hi}");
-        assert!(deviation / (total as f64) < 0.095);
-        assert!(close_widths as f64 / total as f64 > 0.55);
-        // Skew comes from the grid lines being great circles; no warp of the grid changes it.
-        assert!(skew / (total as f64) < 9.0);
-        assert!(share > 0.3);
+        // The earlier separable map (tan 38 deg) was 0.84..1.19 m wide, skewed 9 deg on average
+        // (up to 30 near corners) and 61% within 10% of 1 m and 10 deg of square.
+        assert!(
+            lo > 0.45 * BLOCK_WIDTH && hi < 1.1 * BLOCK_WIDTH,
+            "widths {lo}..{hi}"
+        );
+        assert!(close_widths as f64 / total as f64 > 0.75);
+        assert!(
+            skew / (total as f64) < 1.5,
+            "mean skew {}",
+            skew / total as f64
+        );
+        assert!(share > 0.75);
+        assert!(
+            squares as f64 / total as f64 > 0.94,
+            "within 3 deg: {squares}"
+        );
     }
 
     #[test]
@@ -621,8 +836,8 @@ mod tests {
                 let (f2, _, _) = p.wrap_column(face, -1, i.min(n - 1), n);
                 let (n2, s2, t2) = f2.basis();
                 let dn = d.dot(n2);
-                let gu = Planet::cube_to_grid(d.dot(s2) / dn, n);
-                let gv = Planet::cube_to_grid(d.dot(t2) / dn, n);
+                let (x, y) = Planet::cube_to_face(d.dot(s2) / dn, d.dot(t2) / dn);
+                let (gu, gv) = (Planet::coord_grid(x, n), Planet::coord_grid(y, n));
                 let d2 = p.corner_dir(f2, gu.round() as i32, gv.round() as i32, n);
                 assert_eq!(d, d2);
             }

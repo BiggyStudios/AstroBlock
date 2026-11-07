@@ -4,7 +4,7 @@ use std::mem::{offset_of, size_of};
 
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
-use glam::{DVec3, Mat4, Vec4};
+use glam::{DVec3, Mat4, Quat, Vec4};
 
 use super::arena::ArenaAlloc;
 
@@ -124,6 +124,8 @@ pub struct PushConstants {
     /// x: meters per position unit, y: outer discard radius, z: fade progress, w: fade
     /// direction (1 in, -1 out, 0 none). y/z/w are only used by the clip pipelines.
     pub params: Vec4,
+    /// The mesh's rotation (a quaternion, xyzw) about its origin, applied before `mvp`.
+    pub rotation: Vec4,
 }
 
 /// CPU-side mesh made of quads (4 vertices each, drawn with the shared quad index buffer).
@@ -169,6 +171,9 @@ pub struct MeshHandle(pub(super) usize);
 pub struct DrawItem {
     pub mesh: MeshHandle,
     pub origin: DVec3,
+    /// Rotation of the mesh about `origin` (world axes). Identity for almost everything;
+    /// the moon turns.
+    pub rotation: Quat,
     /// Bounding sphere radius around `origin`, for frustum culling.
     pub radius: f32,
     pub fade: Fade,

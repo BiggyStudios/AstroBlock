@@ -11,7 +11,6 @@ use glam::DVec3;
 
 use crate::{
     items::{Icon, Item},
-    mobs::MobKind,
     render::{BlockVertex, ChunkMesh},
     world::{
         block::{Block, Tint},
@@ -51,7 +50,7 @@ pub struct ModelState {
 /// Texture coordinates follow the box's position in the block (like Minecraft's models),
 /// or span each whole face when `full_uv` is set.
 #[derive(Clone, Copy)]
-struct ModelBox {
+pub(crate) struct ModelBox {
     from: [f32; 3],
     to: [f32; 3],
     top: Tex,
@@ -63,7 +62,7 @@ struct ModelBox {
     full_uv: bool,
 }
 
-fn cuboid(from: [f32; 3], to: [f32; 3], top: Tex, side: Tex, bottom: Tex) -> ModelBox {
+pub(crate) fn cuboid(from: [f32; 3], to: [f32; 3], top: Tex, side: Tex, bottom: Tex) -> ModelBox {
     ModelBox {
         from,
         to,
@@ -76,7 +75,7 @@ fn cuboid(from: [f32; 3], to: [f32; 3], top: Tex, side: Tex, bottom: Tex) -> Mod
     }
 }
 
-/// A box with one texture stretched over every face (mobs).
+/// A box with one texture stretched over every face (the first-person arm).
 fn skin(from: [f32; 3], to: [f32; 3], tex: Tex) -> ModelBox {
     ModelBox {
         full_uv: true,
@@ -210,13 +209,15 @@ fn torch() -> ModelBox {
 type BoxFace<'a> = ([[f32; 3]; 4], Tex, &'a dyn Fn([f32; 3]) -> [f32; 2]);
 
 /// A face as 4 corners (model units, counter-clockwise seen from outside) with texel uvs.
-struct Quad {
-    corners: [[f32; 3]; 4],
-    uv: [[f32; 2]; 4],
-    tex: Tex,
+pub(crate) struct Quad {
+    pub corners: [[f32; 3]; 4],
+    pub uv: [[f32; 2]; 4],
+    pub tex: Tex,
+    /// This face's own linear RGBA tint, or 0 for the mesh's.
+    pub tint: u32,
 }
 
-fn box_quads(b: &ModelBox, out: &mut Vec<Quad>) {
+pub(crate) fn box_quads(b: &ModelBox, out: &mut Vec<Quad>) {
     let ([x0, y0, z0], [x1, y1, z1]) = (b.from, b.to);
     // Texel coordinates of a point on a face: (horizontal, from the top).
     let span = |v: f32, lo: f32, hi: f32| {
@@ -268,19 +269,20 @@ fn box_quads(b: &ModelBox, out: &mut Vec<Quad>) {
             corners,
             uv: corners.map(uv),
             tex,
+            tint: 0,
         });
     }
 }
 
 /// Moves a group of quads (their corners) with `f`.
-fn transform(quads: &mut [Quad], f: impl Fn([f32; 3]) -> [f32; 3]) {
+pub(crate) fn transform(quads: &mut [Quad], f: impl Fn([f32; 3]) -> [f32; 3]) {
     for q in quads {
         q.corners = q.corners.map(&f);
     }
 }
 
 /// Rotates `p` about the x axis through (y, z) = `pivot` by `angle` radians.
-fn pitch(p: [f32; 3], pivot: [f32; 2], angle: f32) -> [f32; 3] {
+pub(crate) fn pitch(p: [f32; 3], pivot: [f32; 2], angle: f32) -> [f32; 3] {
     let (s, c) = angle.sin_cos();
     let (dy, dz) = (p[1] - pivot[0], p[2] - pivot[1]);
     [p[0], pivot[0] + dy * c - dz * s, pivot[1] + dy * s + dz * c]
@@ -288,7 +290,7 @@ fn pitch(p: [f32; 3], pivot: [f32; 2], angle: f32) -> [f32; 3] {
 
 /// Turns quads into mesh vertices. `place` maps model units to planet-relative meters;
 /// positions are stored relative to `origin`.
-fn build(
+pub(crate) fn build(
     quads: &[Quad],
     place: impl Fn([f32; 3]) -> DVec3,
     origin: DVec3,
@@ -296,11 +298,29 @@ fn build(
     tint: u32,
     cutout: bool,
 ) -> ChunkMesh {
-    let mut mesh = ChunkMesh::new(POSITION_UNIT as f32);
-    let tint = BlockVertex::tint565(tint);
+    build_with_unit(quads, place, origin, light, tint, cutout, POSITION_UNIT)
+}
+
+/// `build` with `unit` meters per position unit.
+fn build_with_unit(
+    quads: &[Quad],
+    place: impl Fn([f32; 3]) -> DVec3,
+    origin: DVec3,
+    light: Light,
+    tint: u32,
+    cutout: bool,
+    unit: f64,
+) -> ChunkMesh {
+    let mut mesh = ChunkMesh::new(unit as f32);
+    let mesh_tint = BlockVertex::tint565(tint);
     for q in quads {
+        let tint = if q.tint != 0 {
+            BlockVertex::tint565(q.tint)
+        } else {
+            mesh_tint
+        };
         for (corner, uv) in q.corners.iter().zip(q.uv) {
-            let p = (place(*corner) - origin) / POSITION_UNIT;
+            let p = (place(*corner) - origin) / unit;
             let texel = |t: f32| (t.round().max(0.0) as u32).min(31);
             let data = q.tex as u32
                 | (3 << 10)
@@ -438,7 +458,12 @@ pub fn drop_model(item: Item, (east, north, up): Frame, light: Light) -> ChunkMe
                     let u = if h0 < h1 { h } else { 16.0 - h };
                     [u, 16.0 - p[2]]
                 });
-                quads.push(Quad { corners, uv, tex });
+                quads.push(Quad {
+                    corners,
+                    uv,
+                    tex,
+                    tint: 0,
+                });
             }
             (0.4, true, 0xffff_ffff)
         }
@@ -450,90 +475,182 @@ pub fn drop_model(item: Item, (east, north, up): Frame, light: Light) -> ChunkMe
     build(&quads, place, DVec3::ZERO, light, tint, cutout)
 }
 
-/// A mob's mesh around its feet, facing `forward` (with `up`), legs swung by `walk` (the
-/// walk cycle's phase, radians), flashing red while `hurt`. Units are Minecraft pixels.
-pub fn mob_model(
-    kind: MobKind,
-    walk: f32,
-    swing: f32,
-    hurt: bool,
-    (forward, up): (DVec3, DVec3),
-    light: Light,
-) -> ChunkMesh {
-    use Tex::*;
-    let right = forward.cross(up);
-    let (body, head, legs, face, leg_height) = match kind {
-        MobKind::Cow => (
-            skin([-6.0, -9.0, 12.0], [6.0, 9.0, 22.0], CowSkin),
-            skin([-4.0, 9.0, 16.0], [4.0, 15.0, 24.0], CowSkin),
-            CowSkin,
-            CowFace,
-            12.0,
-        ),
-        MobKind::Pig => (
-            skin([-5.0, -8.0, 6.0], [5.0, 8.0, 14.0], PigSkin),
-            skin([-4.0, 8.0, 7.0], [4.0, 16.0, 15.0], PigSkin),
-            PigSkin,
-            PigFace,
-            6.0,
-        ),
-        MobKind::Sheep => (
-            skin([-6.0, -8.0, 11.0], [6.0, 8.0, 21.0], SheepWool),
-            skin([-3.0, 8.0, 16.0], [3.0, 15.0, 23.0], SheepSkin),
-            SheepSkin,
-            SheepFace,
-            12.0,
-        ),
-    };
-    let mut quads = Vec::new();
-    box_quads(&body, &mut quads);
-    // The face is on the head's front (+y, the way the mob walks).
-    box_quads(&ModelBox { back: face, ..head }, &mut quads);
-    if kind == MobKind::Cow {
-        // Horns.
-        for x in [-5.0, 4.0] {
-            box_quads(
-                &skin([x, 11.0, 24.0], [x + 1.0, 12.0, 26.0], SheepWool),
-                &mut quads,
-            );
+/// Meters per position unit of first-person meshes: fine, since they're seen from a few
+/// centimetres (`POSITION_UNIT` would make them jitter by about a pixel as you turn).
+pub const VIEW_UNIT: f64 = 1.0 / 16384.0;
+
+/// The player's arm in its own units (`viewmodel::ARM_UNIT` m each): x right, y along the arm
+/// towards the hand, z up. Deliberately plain and blocky: one skin block for hand and forearm
+/// (its grip at the origin), running back along -y into a shirt sleeve. (A suit can replace it
+/// later.)
+fn bare_arm() -> Vec<ModelBox> {
+    vec![
+        skin([-3.0, -18.0, -2.6], [3.0, 3.5, 3.0], Tex::Skin),
+        skin([-3.4, -46.0, -3.0], [3.4, -18.0, 3.4], Tex::Sleeve),
+    ]
+}
+
+/// How a held item is shaped, in model units (0..16 = one block).
+pub enum HeldShape {
+    /// A block as a cube, or a model block (table, furnace, chest, torch) as its model.
+    Block(Block),
+    /// A flat sprite extruded one pixel thick, lying in the x-z plane (x right, z up, the
+    /// image's top at z = 16) between y = 7.5 and 8.5. Its pixels come along.
+    Sprite(Tex, Vec<[u8; 4]>),
+}
+
+impl HeldShape {
+    pub fn of(item: Item) -> HeldShape {
+        match (item.block(), item.icon()) {
+            (Some(block), _) if block.is_model() => HeldShape::Block(block),
+            (_, Icon::Block(block)) => HeldShape::Block(block),
+            (_, Icon::Sprite(tex)) => HeldShape::Sprite(tex, crate::world::textures::pixels(tex)),
         }
     }
-    if kind == MobKind::Pig {
-        box_quads(
-            &skin([-2.0, 16.0, 8.0], [2.0, 17.0, 11.0], PigFace),
-            &mut quads,
-        );
+}
+
+/// The first-person view: the arm (mapped by `arm` from arm units) and the held item
+/// (mapped by `held` from model units), both to camera-relative meters.
+pub fn view_model(
+    shape: Option<&HeldShape>,
+    arm: impl Fn([f32; 3]) -> DVec3,
+    held: impl Fn([f32; 3]) -> DVec3,
+    light: Light,
+) -> ChunkMesh {
+    let mut quads = Vec::new();
+    for b in bare_arm() {
+        box_quads(&b, &mut quads);
     }
-    let (x_in, y_in) = match kind {
-        MobKind::Pig => (5.0, 7.0),
-        _ => (6.0, 8.0),
-    };
-    for (i, (x, y)) in [
-        (-x_in, y_in - 4.0),
-        (x_in - 4.0, y_in - 4.0),
-        (-x_in, -y_in),
-        (x_in - 4.0, -y_in),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut leg = Vec::new();
-        box_quads(
-            &skin([x, y, 0.0], [x + 4.0, y + 4.0, leg_height], legs),
-            &mut leg,
-        );
-        // Diagonal pairs swing together, like Minecraft's quadrupeds.
-        let sign = if i == 0 || i == 3 { 1.0 } else { -1.0 };
-        let angle = walk.sin() * 0.7 * swing * sign;
-        transform(&mut leg, |p| pitch(p, [y + 2.0, leg_height], angle));
-        quads.extend(leg);
+    let mut mesh = build_with_unit(
+        &quads,
+        arm,
+        DVec3::ZERO,
+        light,
+        0xffff_ffff,
+        false,
+        VIEW_UNIT,
+    );
+    let Some(shape) = shape else { return mesh };
+
+    let mut quads = Vec::new();
+    let mut edges = Vec::new();
+    let mut tint = 0xffff_ffff;
+    let mut cutout = false;
+    match shape {
+        HeldShape::Block(block) => {
+            let boxes = match block {
+                Block::CraftingTable => crafting_table(),
+                Block::Furnace => furnace(false),
+                Block::Chest => chest().into_iter().map(|(b, _)| b).collect(),
+                Block::Torch => vec![torch()],
+                _ => {
+                    let [top, side, bottom] = block.textures();
+                    tint = match block.tint() {
+                        Tint::Grass | Tint::Foliage => 0xff_3c9a4c,
+                        Tint::Spruce => 0xff_3c5a3c,
+                        _ => 0xffff_ffff,
+                    };
+                    cutout = block.is_cutout();
+                    vec![ModelBox {
+                        full_uv: true,
+                        ..cuboid([0.0; 3], [16.0; 3], top, side, bottom)
+                    }]
+                }
+            };
+            for b in &boxes {
+                box_quads(b, &mut quads);
+            }
+        }
+        HeldShape::Sprite(tex, pixels) => {
+            let tex = *tex;
+            cutout = true;
+            let (y0, y1) = (7.5, 8.5);
+            let full = [[0.0, 16.0], [16.0, 16.0], [16.0, 0.0], [0.0, 0.0]];
+            // Front and back: the whole image, transparent pixels cut out.
+            quads.push(Quad {
+                corners: [
+                    [0.0, y0, 0.0],
+                    [16.0, y0, 0.0],
+                    [16.0, y0, 16.0],
+                    [0.0, y0, 16.0],
+                ],
+                uv: full,
+                tex,
+                tint: 0,
+            });
+            quads.push(Quad {
+                corners: [
+                    [16.0, y1, 0.0],
+                    [0.0, y1, 0.0],
+                    [0.0, y1, 16.0],
+                    [16.0, y1, 16.0],
+                ],
+                uv: [[16.0, 16.0], [0.0, 16.0], [0.0, 0.0], [16.0, 0.0]],
+                tex,
+                tint: 0,
+            });
+            // The rim: a one-pixel face wherever an opaque pixel borders a clear one,
+            // coloured by that pixel.
+            let solid = |x: i32, y: i32| {
+                (0..16).contains(&x)
+                    && (0..16).contains(&y)
+                    && pixels[(y * 16 + x) as usize][3] >= 128
+            };
+            for py in 0..16 {
+                for px in 0..16 {
+                    if !solid(px, py) {
+                        continue;
+                    }
+                    let (x0, x1) = (px as f32, px as f32 + 1.0);
+                    let (z0, z1) = (15.0 - py as f32, 16.0 - py as f32);
+                    let (u0, u1, v0, v1) = (x0, x1, py as f32, py as f32 + 1.0);
+                    let uv = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
+                    if !solid(px - 1, py) {
+                        let corners = [[x0, y1, z0], [x0, y0, z0], [x0, y0, z1], [x0, y1, z1]];
+                        edges.push(Quad {
+                            corners,
+                            uv,
+                            tex,
+                            tint: 0,
+                        });
+                    }
+                    if !solid(px + 1, py) {
+                        let corners = [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]];
+                        edges.push(Quad {
+                            corners,
+                            uv,
+                            tex,
+                            tint: 0,
+                        });
+                    }
+                    if !solid(px, py - 1) {
+                        let corners = [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]];
+                        edges.push(Quad {
+                            corners,
+                            uv,
+                            tex,
+                            tint: 0,
+                        });
+                    }
+                    if !solid(px, py + 1) {
+                        let corners = [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]];
+                        edges.push(Quad {
+                            corners,
+                            uv,
+                            tex,
+                            tint: 0,
+                        });
+                    }
+                }
+            }
+        }
     }
-    let s = 1.0 / 16.0;
-    let place = |[x, y, z]: [f32; 3]| {
-        right * (x as f64 * s) + forward * (y as f64 * s) + up * (z as f64 * s)
-    };
-    let tint = if hurt { 0xff_6060ff } else { 0xffff_ffff };
-    build(&quads, place, DVec3::ZERO, light, tint, false)
+    let item = build_with_unit(&quads, &held, DVec3::ZERO, light, tint, cutout, VIEW_UNIT);
+    mesh.opaque.extend(item.opaque);
+    // Rim faces sample a single texel each; no cutout (mipmaps could fade them out).
+    let rim = build_with_unit(&edges, &held, DVec3::ZERO, light, tint, false, VIEW_UNIT);
+    mesh.opaque.extend(rim.opaque);
+    mesh
 }
 
 #[cfg(test)]
@@ -590,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    fn drops_and_mobs_are_small() {
+    fn drops_are_small() {
         let frame = (DVec3::X, DVec3::Z, DVec3::Y);
         for item in [Item::Block(Block::Dirt), Item::Stick] {
             let mesh = drop_model(item, frame, Light::default());
@@ -602,24 +719,6 @@ mod tests {
                     .max()
                     .unwrap();
                 assert!((size as f64) * POSITION_UNIT <= 0.41);
-            }
-        }
-        for kind in [MobKind::Cow, MobKind::Pig, MobKind::Sheep] {
-            let mesh = mob_model(
-                kind,
-                1.0,
-                1.0,
-                false,
-                (DVec3::X, DVec3::Y),
-                Light::default(),
-            );
-            for v in &mesh.opaque {
-                let p = DVec3::new(
-                    v.position[0] as f64,
-                    v.position[1] as f64,
-                    v.position[2] as f64,
-                ) * POSITION_UNIT;
-                assert!(p.length() < 2.0, "{kind:?} vertex at {p}");
             }
         }
     }

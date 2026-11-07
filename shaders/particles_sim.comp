@@ -1,0 +1,141 @@
+#version 450
+
+// Moves every live particle one step: radial gravity, drag towards the wind, and collision
+// with the depth buffer (what the camera sees this frame: terrain, blocks, models, mobs).
+//
+// A particle only collides when it *crosses* a visible surface: it was in front of what the
+// camera sees at its spot last step and is just behind it now. A particle that was already
+// hidden (inside a block whose mesh hasn't updated yet, or behind the rim of a hole it
+// falls into) just keeps falling; teleporting it onto the surface in front of it would
+// throw it upwards. Particles off screen don't collide; resting ones stay put there.
+
+layout(local_size_x = 64) in;
+
+#include "particle.glsl"
+#include "particle_batch.glsl"
+
+layout(std430, set = 0, binding = 11) buffer Particles {
+    Particle particles[];
+};
+
+layout(set = 0, binding = 2) uniform sampler u_linear;
+layout(set = 0, binding = 8) uniform texture2D u_depth; // reverse-Z (0 = sky)
+
+const int OFF_SCREEN = -1;
+const int SKY = 0;
+const int SURFACE = 1;
+
+float depth_at(ivec2 px) {
+    return texelFetch(sampler2D(u_depth, u_linear), px, 0).r;
+}
+
+// Camera-relative position of the surface seen at pixel `px`.
+vec3 surface_at(ivec2 px, vec2 size) {
+    vec2 ndc = (vec2(px) + 0.5) / size * 2.0 - 1.0;
+    vec4 h = b_inv_view_proj * vec4(ndc, depth_at(px), 1.0);
+    return h.xyz / h.w;
+}
+
+// What the camera sees where the camera-relative point `rel` is: `behind` is how far the
+// point is behind that surface along the view (negative: in front of it, i.e. visible).
+int probe(vec3 rel, out float behind, out ivec2 px) {
+    behind = -1e9;
+    px = ivec2(0);
+    vec4 clip = b_view_proj * vec4(rel, 1.0);
+    if (clip.w < 0.1) {
+        return OFF_SCREEN;
+    }
+    vec2 ndc = clip.xy / clip.w;
+    if (abs(ndc.x) >= 0.995 || abs(ndc.y) >= 0.995) {
+        return OFF_SCREEN;
+    }
+    ivec2 isize = textureSize(sampler2D(u_depth, u_linear), 0);
+    px = clamp(ivec2((ndc * 0.5 + 0.5) * vec2(isize)), ivec2(1), isize - 2);
+    float d = depth_at(px);
+    if (d <= 0.0) {
+        return SKY;
+    }
+    behind = clip.w - b_wind.w / d; // near / depth = the surface's distance along the view
+    return SURFACE;
+}
+
+// The surface normal at pixel `px` (facing the camera), from the neighbouring pixels'
+// surface points (the shorter difference on each axis, so it doesn't straddle an edge).
+vec3 normal_at(ivec2 px, vec3 rel) {
+    vec2 size = vec2(textureSize(sampler2D(u_depth, u_linear), 0));
+    vec3 c = surface_at(px, size);
+    vec3 r = surface_at(px + ivec2(1, 0), size) - c;
+    vec3 l = c - surface_at(px - ivec2(1, 0), size);
+    vec3 d = surface_at(px + ivec2(0, 1), size) - c;
+    vec3 u = c - surface_at(px - ivec2(0, 1), size);
+    vec3 n = cross(dot(r, r) < dot(l, l) ? r : l, dot(d, d) < dot(u, u) ? d : u);
+    float len = length(n);
+    n = len > 1e-12 ? n / len : -normalize(rel);
+    return dot(n, rel) > 0.0 ? -n : n;
+}
+
+void main() {
+    if (gl_GlobalInvocationID.x >= b_sim.y) {
+        return;
+    }
+    uint i = (b_sim.x + gl_GlobalInvocationID.x) % b_info.w;
+    Particle p = particles[i];
+    if (p.pos_age.w >= p.vel_life.w) {
+        return;
+    }
+    float dt = b_anchor.w;
+    vec3 pos = p.pos_age.xyz - b_shift.xyz;
+    vec3 vel = p.vel_life.xyz;
+    float life = p.vel_life.w;
+    uint flags = (p.look.x >> 8u) & 255u;
+    float size = p.phys.z;
+    vec3 down = normalize(b_planet.xyz - pos);
+    float behind;
+    ivec2 px;
+
+    if ((flags & P_RESTING) != 0u) {
+        // Settled: stays while the surface it lies on is still there (just below it).
+        vec3 below = pos + b_anchor.xyz + down * (size * 0.5 + 0.08);
+        int seen = probe(below, behind, px);
+        if (seen == SKY || (seen == SURFACE && (behind < 0.0 || behind > 0.5))) {
+            flags &= ~P_RESTING;
+        }
+    } else {
+        // Where it was: visible (in front of the surface there, or against the sky)?
+        int was = probe(pos + b_anchor.xyz, behind, px);
+        bool visible = was == SKY || (was == SURFACE && behind <= 0.02);
+
+        vel += down * (b_planet.w * p.phys.x * dt);
+        vel += (b_wind.xyz - vel) * (1.0 - exp(-p.phys.y * dt));
+        vec3 next = pos + vel * dt;
+        if (visible && (flags & (P_BOUNCE | P_DIE_ON_HIT)) != 0u) {
+            vec3 rel = next + b_anchor.xyz;
+            float reach = 0.1 + length(vel) * dt * 2.0;
+            if (probe(rel, behind, px) == SURFACE && behind > 0.0 && behind < reach) {
+                if ((flags & P_DIE_ON_HIT) != 0u) {
+                    life = 0.0;
+                } else {
+                    vec3 normal = normal_at(px, rel);
+                    float vn = dot(vel, normal);
+                    if (vn < 0.0) {
+                        // Bounce off (losing most of it), with friction along the surface.
+                        vel = (vel - vn * normal) * 0.6 - vn * normal * p.phys.w;
+                    }
+                    // Back onto the surface, along the view ray.
+                    vec4 clip = b_view_proj * vec4(rel, 1.0);
+                    vec3 surface = rel * ((clip.w - behind) / clip.w);
+                    next = surface - b_anchor.xyz + normal * (size * 0.5);
+                    if (length(vel) < 0.6 && dot(normal, -down) > 0.5) {
+                        vel = vec3(0.0);
+                        flags |= P_RESTING;
+                    }
+                }
+            }
+        }
+        pos = next;
+    }
+
+    particles[i].pos_age = vec4(pos, p.pos_age.w + dt);
+    particles[i].vel_life = vec4(vel, life);
+    particles[i].look.x = (p.look.x & ~(255u << 8u)) | (flags << 8u);
+}

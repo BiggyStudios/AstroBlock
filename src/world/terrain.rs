@@ -50,6 +50,10 @@ pub enum Biome {
     Savanna,
     Jungle,
     Mountains,
+    /// The moon's pale, cratered uplands.
+    Highlands,
+    /// The moon's dark basalt plains.
+    Mare,
 }
 
 impl Biome {
@@ -69,6 +73,8 @@ impl Biome {
             Biome::Savanna => "Savanna",
             Biome::Jungle => "Jungle",
             Biome::Mountains => "Mountains",
+            Biome::Highlands => "Highlands",
+            Biome::Mare => "Mare",
         }
     }
 }
@@ -198,6 +204,8 @@ pub struct TerrainGenerator {
     cave_b: Noise,
     cavern: Noise,
     provinces: [Noise; ORE_COUNT],
+    /// The moon: craters and maria instead of continents and climate; no water or trees.
+    pub lunar: bool,
     cache: Mutex<FastMap<(Face, i32, i32), Arc<CacheEntry>>>,
     epoch: AtomicU32,
 }
@@ -231,9 +239,18 @@ impl TerrainGenerator {
             cave_b: n(15),
             cavern: n(16),
             provinces: std::array::from_fn(|i| n(100 + i as u64)),
+            lunar: false,
             cache: Mutex::new(FastMap::default()),
             epoch: AtomicU32::new(0),
             planet,
+        }
+    }
+
+    /// A generator for a moon: grey, cratered, airless (see `lunar_column`).
+    pub fn moon(planet: Arc<Planet>) -> Self {
+        Self {
+            lunar: true,
+            ..Self::new(planet)
         }
     }
 
@@ -242,11 +259,16 @@ impl TerrainGenerator {
     // ------------------------------------------------------------------------------------
 
     pub fn sample_column(&self, dir: DVec3) -> ColumnSample {
+        if self.lunar {
+            return self.lunar_column(dir);
+        }
         // Noise coordinates in meters on the sea-level sphere.
         let p = dir * self.planet.sea_radius;
 
-        // Continents and ocean basins.
+        // Continents and ocean basins. The 8 cube corners lie under round seas (see
+        // `corner_sea`).
         let c = self.continent.fbm(p / 12_000.0, 6) * 1.7 - 0.08;
+        let c = lerp(c, -0.7, self.corner_sea(dir));
         let land = smoothstep(-0.05, 0.1, c);
         let mut h = spline(
             c,
@@ -359,6 +381,76 @@ impl TerrainGenerator {
             ilmenite,
             strata,
         }
+    }
+
+    /// A column of the moon: broad dark maria (low basalt plains) between pale highlands,
+    /// and craters at four scales, from basins kilometres across down to dimples a few
+    /// metres wide. Each crater is a bowl, a raised rim and ejecta fading outside, hashed
+    /// per cell of a 3D grid and never reaching beyond the cells next to its own, so nearby
+    /// columns always agree.
+    fn lunar_column(&self, dir: DVec3) -> ColumnSample {
+        let p = dir * self.planet.sea_radius;
+        let mare = smoothstep(0.05, 0.3, self.continent.fbm(p / 9_000.0, 3));
+        let mut h = -120.0 * mare + self.hills.fbm(p / 1_500.0, 4) * 45.0 * (1.0 - 0.6 * mare);
+        h += self.detail.fbm(p / 90.0, 2) * 1.5;
+        for (cell, density, salt) in [
+            (3_200.0, 0.5, 1),
+            (1_100.0, 0.55, 2),
+            (360.0, 0.5, 3),
+            (110.0, 0.45, 4),
+        ] {
+            h += self.crater_field(p, cell, density, salt);
+        }
+        // Titanium-rich patches in the maria.
+        let ilmenite = mare > 0.5 && self.placer.fbm(p / 400.0, 2) > 0.22;
+        ColumnSample {
+            height: h,
+            biome: if mare > 0.5 {
+                Biome::Mare
+            } else {
+                Biome::Highlands
+            },
+            temperature: 0.0,
+            humidity: 0.0,
+            ilmenite,
+            strata: (self.strata.fbm(p / 120.0, 2) * 5.0) as i32,
+        }
+    }
+
+    /// Height (m) the craters of one grid of `cell`-metre cells add at `p`.
+    fn crater_field(&self, p: DVec3, cell: f64, density: f64, salt: u64) -> f64 {
+        let base = (p / cell).floor();
+        let mut h = 0.0;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    let c = base + DVec3::new(dx as f64, dy as f64, dz as f64);
+                    let hash = hash3(self.planet.seed ^ salt, c.x as i64, c.y as i64, c.z as i64);
+                    if unit(hash) > density {
+                        continue;
+                    }
+                    let jitter = DVec3::new(
+                        unit(mix64(hash ^ 1)),
+                        unit(mix64(hash ^ 2)),
+                        unit(mix64(hash ^ 3)),
+                    );
+                    // At most a third of a cell across times 3 (its ejecta): the 3x3x3 cells
+                    // around `p` hold every crater that reaches it.
+                    let radius = cell * (0.1 + 0.22 * unit(mix64(hash ^ 4)));
+                    let d = (p - (c + jitter) * cell).length() / radius;
+                    if d > 3.0 {
+                        continue;
+                    }
+                    let profile = if d < 1.0 {
+                        d * d - 0.75
+                    } else {
+                        0.25 * (-(d - 1.0) * 3.0).exp() * smoothstep(3.0, 2.0, d)
+                    };
+                    h += profile * radius * 0.2;
+                }
+            }
+        }
+        h
     }
 
     /// Column data for a chunk column, from the cache or freshly generated. Concurrent
@@ -561,7 +653,12 @@ impl TerrainGenerator {
         let cols = entry.data.get().expect("initialized by columns()");
 
         // Open sky: nothing to generate, nothing to draw (unless blocks were placed).
-        if k0 - 1 > cols.max_top.max(self.planet.sea_layer) && !edits.touches(&self.planet, key) {
+        let sky_from = if self.lunar {
+            cols.max_top
+        } else {
+            cols.max_top.max(self.planet.sea_layer)
+        };
+        if k0 - 1 > sky_from && !edits.touches(&self.planet, key) {
             return ChunkResult {
                 key,
                 blocks: ChunkBlocks::Uniform(Block::Air),
@@ -635,12 +732,12 @@ impl TerrainGenerator {
                 // Padding columns beyond the face edge belong to another face.
                 let wrapped = (!(0..n).contains(&gu) || !(0..n).contains(&gv))
                     .then(|| planet.wrap_column(key.face, gu, gv, n));
-                let ocean_column = col.height < sea + 3;
+                let ocean_column = !self.lunar && col.height < sea + 3;
 
                 for kl in -1..=CHUNK_SIZE {
                     let k = k0 + kl;
                     let block = if k > col.height {
-                        if k <= sea && col.height < sea {
+                        if !self.lunar && k <= sea && col.height < sea {
                             if k == sea && col.temperature < 0.0 {
                                 Block::Ice
                             } else {
@@ -773,10 +870,30 @@ impl TerrainGenerator {
         let d = col.height - k;
         let rock = if k < sea - 64 + col.strata {
             Block::Deepstone
+        } else if self.lunar {
+            Block::MoonRock
         } else {
             Block::Stone
         };
         match col.biome {
+            Biome::Highlands => {
+                if d < 3 && !(col.steep && d == 0) {
+                    Block::Regolith
+                } else {
+                    rock
+                }
+            }
+            Biome::Mare => {
+                if d == 0 && col.ilmenite && !col.steep {
+                    Block::IlmeniteSand
+                } else if d < 2 && !col.steep {
+                    Block::Regolith
+                } else if d < 40 {
+                    Block::Basalt
+                } else {
+                    rock
+                }
+            }
             Biome::Ocean | Biome::DeepOcean | Biome::FrozenOcean => {
                 if d < 3 {
                     if col.biome == Biome::Ocean && col.temperature > 0.25 {
@@ -1136,9 +1253,21 @@ impl TerrainGenerator {
         }
     }
 
-    /// A pleasant spawn point: temperate land where the blocks are as close to 1 m cubes as
-    /// the cube-sphere allows (see `planet::MAP_ANGLE`). Those spots lie on a ring around each
-    /// face centre: blocks get wider towards the centre and narrower towards the edges.
+    /// How much of a corner sea covers `dir` (0..1). At the 8 cube corners only 3 block columns
+    /// meet, and the grid has to bend round them: blocks there are skewed and smaller (see
+    /// `planet::MAP_Q`). Each corner lies under a round, deep sea with a ragged coast, so the
+    /// distorted blocks are seabed nobody builds on.
+    pub fn corner_sea(&self, dir: DVec3) -> f64 {
+        // Angle to the nearest corner, (+-1, +-1, +-1) / sqrt(3).
+        let cos = (dir.x.abs() + dir.y.abs() + dir.z.abs()) / 3f64.sqrt();
+        let angle = cos.min(1.0).acos().to_degrees();
+        let coast = self.hills.fbm(dir * self.planet.sea_radius / 2_500.0, 3) * 2.0;
+        smoothstep(CORNER_SEA_OUTER, CORNER_SEA_INNER, angle + coast)
+    }
+
+    /// A pleasant spawn point: temperate land where the blocks are as close to 1 m cubes as the
+    /// cube-sphere allows (see `planet::MAP_Q`). Blocks are square almost everywhere; their
+    /// width is 1 m on a ring around each face centre (wider inside it, narrower outside).
     pub fn find_spawn(&self) -> DVec3 {
         // About 0.5 km apart.
         let mut candidates: Vec<(f64, DVec3)> = fibonacci_sphere(100_000)
@@ -1160,8 +1289,15 @@ impl TerrainGenerator {
 
     fn good_spawn(&self, dir: DVec3) -> bool {
         let s = self.sample_column(dir);
-        (4.0..40.0).contains(&s.height)
-            && matches!(s.biome, Biome::Plains | Biome::Forest | Biome::Savanna)
+        if !(4.0..40.0).contains(&s.height)
+            || !matches!(s.biome, Biome::Plains | Biome::Forest | Biome::Savanna)
+        {
+            return false;
+        }
+        // Not in or under a tree (crowns reach 3 columns out).
+        let (face, u, v, _) = self.planet.locate(dir * self.planet.sea_radius);
+        let (u, v) = (u.floor() as i32, v.floor() as i32);
+        (-3..=3).all(|du| (-3..=3).all(|dv| self.tree_at(face, u + du, v + dv).is_none()))
     }
 
     /// Fallback: temperate land anywhere near `preferred` (a unit direction).
@@ -1177,6 +1313,11 @@ impl TerrainGenerator {
 }
 
 /// `count` evenly spread unit directions.
+/// Corner seas (see `TerrainGenerator::corner_sea`): full sea within this many degrees of a
+/// cube corner, the coast by the outer radius (+- a couple of degrees of ragged coastline).
+const CORNER_SEA_INNER: f64 = 11.0;
+const CORNER_SEA_OUTER: f64 = 15.0;
+
 fn fibonacci_sphere(count: usize) -> impl Iterator<Item = DVec3> {
     let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
     (0..count).map(move |i| {
@@ -1535,8 +1676,102 @@ mod tests {
         assert!((4.0..40.0).contains(&s.height), "spawn height {}", s.height);
         let (wu, wv, angle) = planet.block_shape(spawn);
         println!("spawn {spawn:?}: {wu:.3} x {wv:.3} m, {angle:.2} deg");
+        let (face, u, v, _) = planet.locate(spawn * planet.sea_radius);
+        assert!(
+            generator.tree_at(face, u as i32, v as i32).is_none(),
+            "spawned in a tree"
+        );
         assert!((wu - 1.0).abs() < 0.05 && (wv - 1.0).abs() < 0.05);
         assert!((angle - 90.0).abs() < 2.0);
+    }
+
+    /// Every surface block that is visibly off (skewed more than 5 degrees, or more than 20%
+    /// narrower or wider than 1 m) lies under a corner sea.
+    #[test]
+    fn distorted_blocks_are_under_the_corner_seas() {
+        use crate::world::planet::BLOCK_WIDTH;
+        let planet = Arc::new(Planet::new(DVec3::ZERO, 2048, 1024, 0x5eed_a57b));
+        let generator = TerrainGenerator::new(planet.clone());
+        let (mut bad, mut uncovered, mut worst) = (0, 0, 0f64);
+        let mut sea = 0.0;
+        let count = 200_000;
+        for dir in fibonacci_sphere(count) {
+            let cover = generator.corner_sea(dir);
+            sea += cover;
+            let (wu, wv, angle) = planet.block_shape(dir);
+            let off = (angle - 90.0).abs() > 5.0
+                || [wu, wv]
+                    .iter()
+                    .any(|w| !(0.8..1.2).contains(&(w / BLOCK_WIDTH)));
+            if off {
+                bad += 1;
+                let corner = ((dir.x.abs() + dir.y.abs() + dir.z.abs()) / 3f64.sqrt())
+                    .min(1.0)
+                    .acos()
+                    .to_degrees();
+                worst = worst.max(corner);
+                if cover < 0.5 {
+                    uncovered += 1;
+                }
+            }
+        }
+        println!(
+            "distorted blocks: {:.1}% of the surface, up to {worst:.1} deg from a corner; corner seas cover {:.1}%",
+            bad as f64 / count as f64 * 100.0,
+            sea / count as f64 * 100.0
+        );
+        assert_eq!(uncovered, 0, "{uncovered} distorted blocks on land");
+    }
+
+    /// The moon: only lunar biomes, real craters (a spread of heights), no water and no
+    /// trees, regolith over rock.
+    #[test]
+    fn moon_is_grey_dry_and_cratered() {
+        let planet = Arc::new(Planet::new(DVec3::ZERO, 512, 512, 7));
+        let moon = TerrainGenerator::moon(planet.clone());
+        let (mut lo, mut hi, mut mare) = (f64::MAX, f64::MIN, 0);
+        let mut low_dir = DVec3::X;
+        for dir in fibonacci_sphere(3000) {
+            let s = moon.sample_column(dir);
+            assert!(matches!(s.biome, Biome::Highlands | Biome::Mare));
+            mare += (s.biome == Biome::Mare) as i32;
+            if s.height < lo {
+                (lo, low_dir) = (s.height, dir);
+            }
+            hi = hi.max(s.height);
+        }
+        assert!(hi - lo > 150.0, "heights {lo}..{hi}");
+        assert!((300..2700).contains(&mare), "{mare} mare columns of 3000");
+        // The lowest spot is well below the datum: still no water there.
+        let (face, u, v, _) = planet.locate(low_dir * planet.sea_radius);
+        let (cu, cv) = (u as i32 / CHUNK_SIZE, v as i32 / CHUNK_SIZE);
+        let cols = moon.build_columns(face, cu, cv);
+        assert!(cols.trees.is_empty());
+        let col = *cols.get(u as i32 % CHUNK_SIZE, v as i32 % CHUNK_SIZE);
+        let key = ChunkKey {
+            face,
+            cu,
+            cv,
+            ck: col.height.div_euclid(CHUNK_SIZE),
+        };
+        let mut blocks = PaddedBlocks::new();
+        moon.fill_terrain(key, &cols, &mut blocks);
+        let mut seen = Vec::new();
+        for k in 0..CHUNK_SIZE {
+            for v in 0..CHUNK_SIZE {
+                for u in 0..CHUNK_SIZE {
+                    let b = blocks.get(u, v, k);
+                    assert!(!matches!(
+                        b,
+                        Block::Water | Block::Ice | Block::Grass | Block::Dirt
+                    ));
+                    if !seen.contains(&b) {
+                        seen.push(b);
+                    }
+                }
+            }
+        }
+        assert!(seen.contains(&Block::Regolith), "{seen:?}");
     }
 
     /// The LOD system draws trees from `tree_at`; they must be exactly the chunk's trees.
@@ -1546,7 +1781,7 @@ mod tests {
         let generator = TerrainGenerator::new(planet.clone());
         let mut total = 0;
         // Forest and jungle (see `locate_biomes`).
-        for (lat, lon) in [(-62.0f64, 21.0f64), (-43.0, 2.0)] {
+        for (lat, lon) in [(-60.0f64, 7.0f64), (-45.0, 122.0)] {
             let (la, lo) = (lat.to_radians(), lon.to_radians());
             let dir = DVec3::new(la.cos() * lo.cos(), la.sin(), la.cos() * lo.sin());
             let (face, u, v, _) = planet.locate(dir * planet.sea_radius);
