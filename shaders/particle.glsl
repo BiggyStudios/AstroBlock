@@ -25,3 +25,6 @@ const uint P_TINT_MASK = 32u;  // block texture: alpha is the tint mask, not tra
 const uint P_GLOW = 64u;       // emits its own light (flames, plasma): not lit by the sun
 const uint P_RESTING = 128u;   // (internal) settled on a surface
 
+// Bits 24-31 of look.x.
+const uint P2_ROOFED = 1u;     // weather: stops at the highest block above it (the roof map)
+

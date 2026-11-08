@@ -3,7 +3,7 @@
 //! the rocket's effects and sounds, and the console commands for testing all of it.
 //!
 //! - Physics, SAS and heating: `vessel`. Orbits and predictions: `space::trajectory`.
-//! - Drawing: `rocket_model`, `flight_hud`, `map_view`.
+//! - Drawing: `flight::rocket_model`, `flight::hud`, `flight::map_view`.
 //!
 //! In a rocket the mouse is free (for the HUD's buttons and the map); the right button drags
 //! the camera around and the wheel zooms.
@@ -17,22 +17,22 @@ use winit::{event::MouseButton, keyboard::KeyCode};
 use super::{Game, MAX_PHYSICS_WARP, WARP_LEVELS, WorldVoxels};
 use crate::{
     audio::Sound,
-    camera::Camera,
     effects,
-    flight_hud::{self, Attitude, FlightAction, FlightInfo, Pointer},
-    items::{Item, ItemStack},
-    map_view::{self, MapContext, Planner, View},
-    models::Light,
+    flight::{
+        hud::{self, Attitude, FlightAction, FlightInfo, Pointer},
+        map_view::{self, MapContext, Planner, View},
+        rocket_model::rocket_model,
+        vessel::{self, COM_HEIGHT, Controls, FUEL_CAPACITY, SasMode, Vessel},
+    },
     player::{EYE_HEIGHT, GameMode},
-    render::{DrawItem, Fade, ParticleEmitter},
-    rocket_model::rocket_model,
+    render::{DrawItem, Fade, ParticleEmitter, camera::Camera, models::Light},
     space::{
         bodies::Body,
         conic::propagate,
-        trajectory::{self, Segment, burn_vector, orbit_axes},
+        trajectory::{self, ManeuverNode, Segment, burn_vector, orbit_axes},
     },
+    survival::items::{Item, ItemStack},
     ui::Ui,
-    vessel::{self, COM_HEIGHT, Controls, MASS, SasMode, THRUST, Vessel},
     world::block::Material,
 };
 
@@ -57,6 +57,7 @@ enum Focus {
 /// The player floating outside, above the air (after getting out in space, or drifting up
 /// there). Like an empty rocket it follows its conic exactly (patched conics, so the moon
 /// and the sun pull too); you can look around but not move.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct Eva {
     pub body: Body,
     /// Feet, relative to `body`, inertial axes.
@@ -115,6 +116,33 @@ impl Default for Flight {
             pending: Vec::new(),
             time: 0.0,
         }
+    }
+}
+
+/// The flying side of a saved game.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct SavedFlight {
+    vessels: Vec<Vessel>,
+    boarded: Option<usize>,
+    eva: Option<Eva>,
+    nodes: Vec<ManeuverNode>,
+}
+
+impl Flight {
+    pub(super) fn saved(&self) -> SavedFlight {
+        SavedFlight {
+            vessels: self.vessels.clone(),
+            boarded: self.boarded,
+            eva: self.eva.clone(),
+            nodes: self.planner.nodes.clone(),
+        }
+    }
+
+    pub(super) fn restore(&mut self, saved: SavedFlight) {
+        self.boarded = saved.boarded.filter(|&i| i < saved.vessels.len());
+        self.vessels = saved.vessels;
+        self.eva = saved.eva;
+        self.planner.nodes = saved.nodes;
     }
 }
 
@@ -410,13 +438,16 @@ impl Game {
             self.time = t1;
         }
 
+        if std::mem::take(&mut vessel.flameout) {
+            self.message = Some(("out of fuel".to_string(), Instant::now()));
+        }
         // The next maneuver counts down with what the engine delivers.
         let burned = std::mem::take(&mut vessel.burned);
         let (body, r, v) = (vessel.body, vessel.position, vessel.velocity);
         if burned.length() > 0.0
             && let Some(node) = self.flight.planner.nodes.first_mut()
         {
-            let burn = node.dv.length() / (THRUST / MASS);
+            let burn = node.dv.length() / vessel.acceleration();
             if (node.time - self.time).abs() < burn + 120.0 {
                 let (rn, vn) = propagate(self.bodies.mu(body), r, v, node.time - self.time);
                 let (p, n, rad) = orbit_axes(rn, vn);
@@ -468,6 +499,7 @@ impl Game {
             drag: self.drag,
         };
         let mut destroyed = Vec::new();
+        let client = self.net.is_client();
         for (i, v) in self.flight.vessels.iter_mut().enumerate() {
             if Some(i) == self.flight.boarded {
                 continue;
@@ -476,10 +508,26 @@ impl Game {
                 v.sync_landed(&self.bodies, t1);
                 continue;
             }
+            // Someone else's to fly (or the host's, for a client): carry on until the next
+            // news of it.
+            if v.pilot.is_some() {
+                if t1 - t0 > 1.0 {
+                    v.rails(&self.bodies, (t0, t1));
+                } else if t1 >= t0 - 1.0 {
+                    v.position += v.velocity * (t1 - t0);
+                }
+                continue;
+            }
             v.throttle = 0.0;
             let mut from = t0;
             if v.can_rail_warp(&self.bodies) {
                 from = v.rails(&self.bodies, (t0, t1)).0;
+            }
+            if client {
+                if (t1 - from).abs() <= 1.0 {
+                    v.position += v.velocity * (t1 - from);
+                }
+                continue;
             }
             if from < t1 {
                 v.update(&env, &Controls::default(), (from, t1), None);
@@ -494,6 +542,13 @@ impl Game {
     }
 
     fn destroy_vessel(&mut self, i: usize, reason: &str) {
+        let id = self.flight.vessels[i].id;
+        self.net_vessel_gone(id, Some(reason));
+        self.explode_vessel(i, reason);
+    }
+
+    /// A rocket stops existing, with a bang.
+    pub(super) fn explode_vessel(&mut self, i: usize, reason: &str) {
         let v = self.flight.vessels.remove(i);
         let at = v.world_position(&self.bodies, self.active, self.time);
         let ground =
@@ -531,7 +586,26 @@ impl Game {
         }
     }
 
+    /// Takes a rocket away quietly (someone picked it up).
+    pub(super) fn remove_vessel(&mut self, i: usize) {
+        let v = self.flight.vessels.remove(i);
+        if let Some(mesh) = v.mesh {
+            self.renderer.destroy_mesh(mesh);
+        }
+        match self.flight.boarded {
+            Some(b) if b > i => self.flight.boarded = Some(b - 1),
+            _ => {}
+        }
+    }
+
+    /// Asks to get in (in a game with others, the host says who flies it).
     fn board(&mut self, i: usize) {
+        if self.player.mode != GameMode::Spectator && self.request_seat(i) {
+            self.enter_vessel(i);
+        }
+    }
+
+    pub(super) fn enter_vessel(&mut self, i: usize) {
         if self.player.mode == GameMode::Spectator {
             return;
         }
@@ -554,6 +628,7 @@ impl Game {
     /// Climbs out next to a landed rocket.
     fn exit_vessel(&mut self) {
         let Some(i) = self.flight.boarded else { return };
+        self.release_seat(i);
         let v = &self.flight.vessels[i];
         let landed_here = v.landed.is_some() && v.body == self.active;
         if !landed_here {
@@ -617,7 +692,7 @@ impl Game {
     }
 
     /// Back to first person at the player's eyes.
-    fn reset_camera(&mut self) {
+    pub(super) fn reset_camera(&mut self) {
         let (feet, up) = self.feet_and_up();
         let mut camera = Camera::new(self.planet.center + feet + up * EYE_HEIGHT, up.as_vec3());
         camera.fov_y = self.camera.fov_y;
@@ -708,11 +783,11 @@ impl Game {
             self.board(i);
         } else if self.input.button_pressed(MouseButton::Left)
             && self.flight.vessels[i].landed.is_some()
+            && self.flight.vessels[i].pilot.is_none()
         {
-            let v = self.flight.vessels.remove(i);
-            if let Some(mesh) = v.mesh {
-                self.renderer.destroy_mesh(mesh);
-            }
+            let id = self.flight.vessels[i].id;
+            self.net_vessel_gone(id, None);
+            self.remove_vessel(i);
             let pose = self.pose();
             if let Some(rest) = self.survival.inventory.add(ItemStack::new(Item::Rocket, 1)) {
                 self.survival
@@ -759,6 +834,7 @@ impl Game {
         self.flight
             .vessels
             .push(Vessel::on_pad(&self.bodies, self.active, base, self.time));
+        self.net_vessel_added();
         if self.player.mode != GameMode::Creative {
             self.survival.inventory.take_one(self.survival.selected);
         }
@@ -802,12 +878,24 @@ impl Game {
         Ok(())
     }
 
-    /// The boarded rocket's flame, smoke and plasma, its engine sound, and explosions.
+    /// Flames, smoke, plasma and engine sound of the rockets being flown, and explosions.
     pub(super) fn flight_effects(&mut self, dt: f32) -> Vec<ParticleEmitter> {
         let mut out = std::mem::take(&mut self.flight.pending);
-        let Some(i) = self.flight.boarded else {
-            return out;
-        };
+        if let Some(i) = self.flight.boarded {
+            self.vessel_effects(i, dt, &mut out);
+        }
+        let eye = self.camera.position - self.planet.center;
+        for i in 0..self.flight.vessels.len() {
+            let v = &self.flight.vessels[i];
+            let near = v.world_position(&self.bodies, self.active, self.time) - eye;
+            if Some(i) != self.flight.boarded && v.pilot.is_some() && near.length() < 6_000.0 {
+                self.vessel_effects(i, dt, &mut out);
+            }
+        }
+        out
+    }
+
+    fn vessel_effects(&mut self, i: usize, dt: f32, out: &mut Vec<ParticleEmitter>) {
         let t = self.time;
         let frame = self.active_frame(t);
         let v = &self.flight.vessels[i];
@@ -852,7 +940,6 @@ impl Game {
             let n = count(2, 150.0 + 600.0 * heat);
             out.push(effects::plasma(lead, flow, ground, n, heat));
         }
-        out
     }
 
     /// The flight HUD (in a rocket) and the map overlay, with their clicks.
@@ -882,13 +969,18 @@ impl Game {
                 segments: &self.flight.prediction,
                 craft: self.planet.center + self.craft_world(),
                 editable: self.flight.boarded.is_some(),
-                accel: THRUST / MASS,
+                accel: self
+                    .flight
+                    .boarded
+                    .map_or(vessel::THRUST / (vessel::DRY_MASS + FUEL_CAPACITY), |i| {
+                        self.flight.vessels[i].acceleration()
+                    }),
             };
             map_view::draw(ui, &ctx, &mut self.flight.planner, &mut pointer, dt);
         }
         if let Some(i) = self.flight.boarded {
             let info = self.flight_info(i);
-            for action in flight_hud::draw(ui, &info, &mut pointer, self.flight.time) {
+            for action in hud::draw(ui, &info, &mut pointer, self.flight.time) {
                 let v = &mut self.flight.vessels[i];
                 match action {
                     FlightAction::ToggleSas => v.sas = !v.sas,
@@ -926,7 +1018,7 @@ impl Game {
         let (prograde, normal, radial) = orbit_axes(r, vel);
         let node = self.flight.planner.nodes.first().map(|n| {
             let dv = n.dv.length();
-            let burn = dv / (THRUST / MASS);
+            let burn = dv / v.acceleration();
             (n.time - burn / 2.0 - t, dv, burn)
         });
         let feet = self.player.body_position(&self.active_frame(t));
@@ -942,6 +1034,8 @@ impl Game {
                 .map(|ap| (ap - radius, conic.time_to_anomaly(r, PI))),
             periapsis: (conic.periapsis() - radius, conic.time_to_anomaly(r, 0.0)),
             throttle: v.throttle,
+            fuel: v.fuel / FUEL_CAPACITY,
+            delta_v: v.delta_v(),
             temperature: v.temperature,
             pressure: v.pressure,
             sas: v.sas,
@@ -1035,6 +1129,7 @@ impl Game {
                     base,
                     self.time,
                 ));
+                self.net_vessel_added();
                 self.console.print("Placed a rocket");
             }
             "board" => {
@@ -1094,6 +1189,14 @@ impl Game {
                         self.bodies
                             .view(self.active, Body::Planet, DVec3::ZERO, self.time)
                     }
+                    Some("player") => match self.nearest_player() {
+                        Some(p) => p,
+                        None => return true,
+                    },
+                    Some(what @ ("tornado" | "volcano")) => match self.weather_target(what) {
+                        Some(p) => p,
+                        None => return true,
+                    },
                     Some("rocket") => {
                         let eye = self.camera.position - self.planet.center;
                         let nearest = self
@@ -1126,7 +1229,7 @@ impl Game {
             }
             "transfer" => self.plan_transfer(),
             "map" => self.toggle_map(),
-            "throttle" | "sas" | "node" | "chase" | "dive" => {
+            "throttle" | "sas" | "node" | "chase" | "dive" | "fuel" => {
                 let Some(i) = self.flight.boarded else {
                     self.console.print("Not in a rocket");
                     return true;
@@ -1134,6 +1237,19 @@ impl Game {
                 match command {
                     "throttle" => {
                         self.flight.vessels[i].throttle = number(0).unwrap_or(1.0).clamp(0.0, 1.0)
+                    }
+                    "fuel" => {
+                        let v = &mut self.flight.vessels[i];
+                        if let Some(percent) = number(0) {
+                            v.fuel = FUEL_CAPACITY * (percent / 100.0).clamp(0.0, 1.0);
+                        }
+                        let text = format!(
+                            "Fuel {:.0} kg, {:.0} m/s, {:.1} m/s^2",
+                            v.fuel,
+                            v.delta_v(),
+                            v.acceleration()
+                        );
+                        self.console.print(text);
                     }
                     "sas" => {
                         let v = &mut self.flight.vessels[i];

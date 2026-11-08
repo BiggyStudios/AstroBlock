@@ -324,6 +324,9 @@ fn describe_cell(
     }
 
     let (top_tex, side_tex, tint) = match s.biome {
+        Biome::Caldera => (Tex::Lava, Tex::Basalt, white),
+        Biome::Volcanic if steep => (Tex::Basalt, Tex::Basalt, white),
+        Biome::Volcanic => (Tex::Ash, Tex::Basalt, white),
         Biome::Highlands if steep => (Tex::MoonRock, Tex::MoonRock, white),
         Biome::Mare if steep => (Tex::Basalt, Tex::Basalt, white),
         Biome::Highlands => (Tex::Regolith, Tex::MoonRock, white),
@@ -593,7 +596,11 @@ impl TileMesher<'_> {
             &mut self.mesh.opaque
         };
         for c in 0..4 {
-            let data = BlockVertex::pack(tex as u32, uv[c], 3, 15, size);
+            let mut data = BlockVertex::pack(tex as u32, uv[c], 3, 15, size);
+            if tex == Tex::Lava {
+                // It glows at any distance.
+                data |= 15 << 28;
+            }
             target.push(BlockVertex::new(corners[c], tint, data));
         }
     }

@@ -49,6 +49,14 @@ void main() {
         size *= clamp(left / 0.25, 0.0, 1.0);
     }
     v_alpha = blended ? clamp(left / (0.3 * p.vel_life.w), 0.0, 1.0) * clamp(p.pos_age.w / 0.1, 0.0, 1.0) : 1.0;
+    // Big soft puffs fade out as they reach the eye, instead of a disc across the view.
+    if (blended && size > 1.0) {
+        v_alpha *= clamp((length(center) - size * 0.5) / (size * 1.5), 0.0, 1.0);
+    }
+    // Streaks right next to the eye would be huge blades across the view.
+    if ((flags & P_STRETCH) != 0u) {
+        v_alpha *= clamp((length(center) - 1.5) / 4.0, 0.0, 1.0);
+    }
 
     vec3 right = pc.right.xyz * (size * 0.5);
     vec3 up = pc.up.xyz * (size * 0.5);

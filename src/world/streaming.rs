@@ -112,6 +112,8 @@ pub struct StreamStats {
 }
 
 pub struct WorldStreamer {
+    /// Cells emptied by edits since the app last looked (lava may run into them).
+    pub changes: Vec<BlockCell>,
     planet: Arc<Planet>,
     terrain: Arc<TerrainGenerator>,
     load_radius: f64,
@@ -218,6 +220,7 @@ impl WorldStreamer {
             .collect();
 
         Self {
+            changes: Vec::new(),
             planet,
             terrain,
             load_radius,
@@ -731,6 +734,21 @@ impl WorldStreamer {
         }
     }
 
+    /// The player's edits to this world, as a file.
+    pub fn edits_bytes(&self) -> Vec<u8> {
+        self.edits.to_bytes()
+    }
+
+    /// Replaces the edits with a saved set (before any chunk of this world is loaded).
+    pub fn load_edits(&self, data: &[u8]) -> Result<()> {
+        self.edits.read_bytes(data)
+    }
+
+    /// No far terrain is still being generated.
+    pub fn lod_settled(&self) -> bool {
+        self.lod_queue.is_empty() && self.lod_in_flight.is_empty() && self.lod_ready.is_empty()
+    }
+
     /// The block in a cell, if its chunk is loaded.
     pub fn block(&self, cell: BlockCell) -> Option<Block> {
         let (key, [u, v, k]) = self.planet.cell_chunk(cell);
@@ -743,6 +761,9 @@ impl WorldStreamer {
     pub fn set_block(&mut self, cell: BlockCell, block: Block) {
         let planet = self.planet.clone();
         self.edits.set(&planet, cell, block);
+        if !block.is_solid() {
+            self.changes.push(cell);
+        }
         let (key, [u, v, k]) = planet.cell_chunk(cell);
         if let Some(chunk) = self.chunks.get_mut(&key) {
             chunk.blocks.set(u, v, k, block);

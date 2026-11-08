@@ -1,7 +1,19 @@
 use super::textures::Tex;
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum Block {
     #[default]
     Air,
@@ -61,12 +73,16 @@ pub enum Block {
     Regolith,
     /// The moon's pale highland rock (anorthosite).
     MoonRock,
-    /// The dark rock of the moon's maria.
+    /// The dark rock of the moon's maria and of volcanoes.
     Basalt,
+    /// Volcanic ash, the loose grey soil on a volcano's slopes.
+    Ash,
+    /// Molten rock in a volcano's crater: glows, and burns whoever stands on it.
+    Lava,
 }
 
 /// What a block sounds like (footsteps, breaking, placing).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Material {
     Grass,
     Dirt,
@@ -92,7 +108,7 @@ pub enum Tint {
 
 impl Block {
     /// Every block, in declaration order.
-    pub const ALL: [Block; 47] = {
+    pub const ALL: [Block; 49] = {
         use Block::*;
         [
             Air,
@@ -142,6 +158,8 @@ impl Block {
             Regolith,
             MoonRock,
             Basalt,
+            Ash,
+            Lava,
         ]
     };
 
@@ -164,7 +182,7 @@ impl Block {
     /// for light that spreads).
     pub fn glow(self) -> u32 {
         match self {
-            Block::OuterCore => 15,
+            Block::OuterCore | Block::Lava => 15,
             Block::InnerCore => 12,
             _ => 0,
         }
@@ -234,6 +252,8 @@ impl Block {
             Regolith => all(Tex::Regolith),
             MoonRock => all(Tex::MoonRock),
             Basalt => all(Tex::Basalt),
+            Ash => all(Tex::Ash),
+            Lava => all(Tex::Lava),
         }
     }
 
@@ -245,7 +265,7 @@ impl Block {
             OakLog | SpruceLog | OakPlanks | SprucePlanks | CraftingTable | Chest | Torch => {
                 Material::Wood
             }
-            Sand | RedSand | IlmeniteSand | Regolith => Material::Sand,
+            Sand | RedSand | IlmeniteSand | Regolith | Ash => Material::Sand,
             Gravel => Material::Gravel,
             Snow => Material::Snow,
             Glass | Ice => Material::Glass,
@@ -300,6 +320,6 @@ mod tests {
         for (i, b) in Block::ALL.iter().enumerate() {
             assert_eq!(*b as usize, i);
         }
-        assert_eq!(*Block::ALL.last().unwrap(), Block::Basalt);
+        assert_eq!(*Block::ALL.last().unwrap(), Block::Lava);
     }
 }

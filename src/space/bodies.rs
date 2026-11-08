@@ -13,7 +13,7 @@ use glam::{DQuat, DVec3};
 
 use super::{RotatingFrame, SolarSystem, gravity::PlanetGravity, orbit::Orbit};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Body {
     Star,
     Planet,

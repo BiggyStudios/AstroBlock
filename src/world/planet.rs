@@ -81,7 +81,7 @@ const MAP_MEDIAN_SCALE: f64 = 0.745_944_293_749_470_1;
 pub const BLOCK_WIDTH: f64 = 1.0;
 
 /// One of the 6 cube faces: 0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Face(pub u8);
 
 impl Face {

@@ -16,7 +16,7 @@ pub struct ChunkKey {
 /// type, which costs 1 byte instead of 32 KiB.
 /// One block cell on a planet: face, column (u, v) in the grid of the cell's own shell
 /// (`Planet::res_at(k)` columns per face edge) and layer k.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BlockCell {
     pub face: Face,
     pub u: i32,

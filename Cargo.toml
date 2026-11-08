@@ -11,9 +11,14 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 cpal = "0.18.2"
 crossbeam-channel = "0.5.17"
 env_logger = "0.11.11"
-glam = { version = "0.34.2", features = ["bytemuck"] }
+glam = { version = "0.34.2", features = ["bytemuck", "serde"] }
 gpu-allocator = { version = "0.28", default-features = false, features = ["std", "vulkan"] }
 log = "0.4.35"
+miniz_oxide = "0.8"
+postcard = { version = "1", features = ["use-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+steamworks = "0.13"
 winit = "0.30"
 
 [build-dependencies]

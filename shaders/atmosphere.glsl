@@ -21,6 +21,15 @@ layout(set = 0, binding = 6) uniform Frame {
     vec4 cave;          // rgb: underground fog colour, w: underground fog distance (m)
     mat4 target;        // camera-relative position -> targeted block box, [-1, 1]^3 inside
     vec4 target_info;   // x: 1 if a block is targeted, y: mining progress (0..1)
+    mat4 weather_rotation; // active frame axes -> home's body frame (the weather maps)
+    mat4 prev_view_proj;   // last frame's camera-relative world -> clip
+    vec4 prev_offset;      // xyz: camera now - camera last frame, w: 1 = last frame's clouds are usable
+    vec4 clouds;           // x: cloud base above sea level (m), y: shell thickness (m), z: frame number, w: lightning light on the ground
+    vec4 cloud_offset;     // xyz: noise offset carrying the clouds along (m), w: northern lights strength
+    vec4 flashes[2];       // xyz: lightning, camera-relative (m), w: intensity
+    vec4 tornadoes[3];     // xyz: foot of the funnel, camera-relative (m), w: core radius (0 = none)
+    vec4 plumes[2];        // xyz: an erupting volcano's vent, camera-relative (m), w: how hard (0 = none)
+    vec4 plume_wind[2];    // xyz: wind at that volcano (m/s), w: seconds since it began
 } frame;
 
 const float PI = 3.14159265358979;

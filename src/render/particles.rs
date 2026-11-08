@@ -55,6 +55,8 @@ pub mod flags {
     pub const TINT_MASK: u32 = 32;
     /// Glows by itself (flames, plasma) instead of being lit.
     pub const GLOW: u32 = 64;
+    /// Weather: stops at the highest block above it, so it never falls indoors.
+    pub const ROOFED: u32 = 256;
 }
 
 /// A request to spawn `count` particles this frame.
@@ -134,7 +136,27 @@ struct BatchHeader {
     shift: Vec4,
     info: [u32; 4],
     sim: [u32; 4],
+    vortex: [Vec4; 3],
+    roof_center: Vec4,
+    roof_u: Vec4,
+    roof_v: Vec4,
 }
+
+/// The heights of the highest block around the camera, for weather (see `flags::ROOFED`).
+/// Heights are along "up" from `center`, one per cell of a `ROOF_CELLS` square grid.
+#[derive(Clone)]
+pub struct RoofMap {
+    pub center: DVec3,
+    pub u: Vec3,
+    pub v: Vec3,
+    /// Cell size (m).
+    pub cell: f32,
+    /// Row by row; below -1e5 where no block was found.
+    pub heights: Vec<f32>,
+}
+
+pub const ROOF_CELLS: usize = 48;
+const ROOF_BYTES: usize = ROOF_CELLS * ROOF_CELLS * 4;
 
 /// Mirrors `Emitter` in particle_batch.glsl.
 #[repr(C)]
@@ -149,7 +171,8 @@ struct GpuEmitter {
     count: [u32; 4],
 }
 
-const BATCH_BYTES: usize = size_of::<BatchHeader>() + MAX_EMITTERS * size_of::<GpuEmitter>();
+const BATCH_BYTES: usize =
+    size_of::<BatchHeader>() + ROOF_BYTES + MAX_EMITTERS * size_of::<GpuEmitter>();
 
 /// This frame's particle work, decided before recording.
 #[derive(Clone, Copy, Debug, Default)]
@@ -175,6 +198,9 @@ pub struct ParticleEnvironment {
     pub dt: f32,
     pub view_proj: Mat4,
     pub near: f32,
+    /// Tornadoes: where (absolute) and their core radius (0 = none).
+    pub vortices: [(DVec3, f32); 3],
+    pub roof: Option<RoofMap>,
 }
 
 pub struct Particles {
@@ -225,6 +251,13 @@ impl Particles {
             cleared: false,
             seed: 0x9e37_79b9,
         })
+    }
+
+    /// Drops every particle (moving to another world).
+    pub fn forget(&mut self) {
+        self.live.clear();
+        self.pending.clear();
+        self.head = 0;
     }
 
     pub fn emit(&mut self, emitters: &[Emitter]) {
@@ -283,7 +316,8 @@ impl Particles {
             let look = (e.layer & 255)
                 | ((e.flags & 255) << 8)
                 | ((e.light.0.min(15)) << 16)
-                | ((e.light.1.min(15)) << 20);
+                | ((e.light.1.min(15)) << 20)
+                | (((e.flags >> 8) & 255) << 24);
             gpu.push(GpuEmitter {
                 origin: (e.origin - self.anchor).as_vec3().extend(e.burst),
                 extent: e.extent.extend(e.spread),
@@ -324,11 +358,28 @@ impl Particles {
             shift: shift.extend(0.0),
             info: [spawn, gpu.len() as u32, first_new, CAPACITY],
             sim: [sim_first, sim_count, self.seed, 0],
+            vortex: env
+                .vortices
+                .map(|(at, radius)| (at - self.anchor).as_vec3().extend(radius)),
+            roof_center: env.roof.as_ref().map_or(Vec4::ZERO, |r| {
+                (r.center - self.anchor).as_vec3().extend(1.0)
+            }),
+            roof_u: env.roof.as_ref().map_or(Vec4::ZERO, |r| r.u.extend(r.cell)),
+            roof_v: env.roof.as_ref().map_or(Vec4::ZERO, |r| r.v.extend(0.0)),
         };
         let batch = &mut self.batches[frame];
         batch.write(0, bytemuck::bytes_of(&header))?;
+        if let Some(roof) = &env.roof {
+            batch.write(
+                size_of::<BatchHeader>(),
+                bytemuck::cast_slice(&roof.heights),
+            )?;
+        }
         if !gpu.is_empty() {
-            batch.write(size_of::<BatchHeader>(), bytemuck::cast_slice(&gpu))?;
+            batch.write(
+                size_of::<BatchHeader>() + ROOF_BYTES,
+                bytemuck::cast_slice(&gpu),
+            )?;
         }
         Ok(out)
     }
@@ -359,7 +410,8 @@ mod tests {
     fn layouts_match_the_shaders() {
         assert_eq!(size_of::<GpuParticle>(), 64);
         assert_eq!(size_of::<GpuEmitter>(), 112);
-        assert_eq!(size_of::<BatchHeader>(), 224);
+        assert_eq!(size_of::<BatchHeader>(), 320);
+        assert_eq!((size_of::<BatchHeader>() + ROOF_BYTES) % 16, 0);
         assert!(size_of::<ParticlePush>() <= 128);
         assert_eq!(CAPACITY % GROUP, 0);
     }

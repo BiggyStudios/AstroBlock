@@ -14,6 +14,7 @@
 layout(set = 0, binding = 7) uniform texture2D u_scene; // HDR scene colour
 layout(set = 0, binding = 8) uniform texture2D u_depth; // reverse-Z depth (0 = sky)
 layout(set = 0, binding = 9) uniform texture2D u_galaxy; // Milky Way, equirectangular
+layout(set = 0, binding = 19) uniform texture2D u_clouds; // half resolution: light added, transmittance
 
 layout(location = 0) in vec2 v_ndc;
 layout(location = 0) out vec4 out_color;
@@ -138,6 +139,29 @@ vec3 glare(vec3 dir) {
     return frame.sun_color.rgb * sun_t * (core + wide);
 }
 
+// The half-resolution clouds at this pixel, taking the texels whose depth matches (so they
+// don't bleed over the edges of terrain in front of them).
+vec4 clouds_at(float depth) {
+    ivec2 size = textureSize(sampler2D(u_clouds, u_linear), 0);
+    vec2 uv = gl_FragCoord.xy * 0.5 - 0.5;
+    ivec2 base = ivec2(floor(uv));
+    vec2 f = uv - vec2(base);
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int y = 0; y <= 1; y++) {
+        for (int x = 0; x <= 1; x++) {
+            ivec2 texel = clamp(base + ivec2(x, y), ivec2(0), size - 1);
+            float d = texelFetch(sampler2D(u_depth, u_linear), texel * 2, 0).r;
+            float difference = abs(d - depth) / max(max(d, depth), 1e-9);
+            float weight = (x == 0 ? 1.0 - f.x : f.x) * (y == 0 ? 1.0 - f.y : f.y);
+            weight *= exp(-difference * difference * 60.0) + 1e-4;
+            sum += texelFetch(sampler2D(u_clouds, u_linear), texel, 0) * weight;
+            total += weight;
+        }
+    }
+    return sum / total;
+}
+
 // ACES filmic curve (Narkowicz fit).
 vec3 tonemap(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
@@ -153,7 +177,8 @@ vec3 to_linear(vec3 c) {
 
 void main() {
     ivec2 px = ivec2(gl_FragCoord.xy);
-    vec3 scene = texelFetch(sampler2D(u_scene, u_linear), px, 0).rgb;
+    vec4 scene4 = texelFetch(sampler2D(u_scene, u_linear), px, 0);
+    vec3 scene = scene4.rgb;
     float depth = texelFetch(sampler2D(u_depth, u_linear), px, 0).r;
 
     vec4 near_h = frame.inv_view_proj * vec4(v_ndc, 1.0, 1.0);
@@ -235,6 +260,15 @@ void main() {
             background = space(dir, night) + glare(dir);
         }
         color = background * transmittance + inscatter * frame.sun_color.rgb;
+
+        // The weather in the air: clouds, rain curtains, fog, dust, funnels, aurora.
+        vec4 clouds = clouds_at(depth);
+        color = color * clouds.a + clouds.rgb * frame.sun_color.rgb;
+
+        // Particles seen against the sky (they write no depth): over all of the above.
+        if (!geometry) {
+            color = color * (1.0 - clamp(scene4.a, 0.0, 1.0)) + scene;
+        }
     }
 
     // Exposure, tone mapping, and dithering (in sRGB space, against banding in the dark

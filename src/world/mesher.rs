@@ -436,7 +436,7 @@ fn emit_quad(
     let (target, cutout) = if cell.key & WATER != 0 {
         (&mut mesh.water, 0)
     } else if cell.key & CUTOUT != 0 {
-        (&mut mesh.cutout, crate::models::CUTOUT_FLAG)
+        (&mut mesh.cutout, crate::render::models::CUTOUT_FLAG)
     } else {
         (&mut mesh.opaque, 0)
     };

@@ -50,6 +50,10 @@ pub enum Biome {
     Savanna,
     Jungle,
     Mountains,
+    /// A volcano's slopes: ash over basalt.
+    Volcanic,
+    /// The lava lake in a volcano's crater.
+    Caldera,
     /// The moon's pale, cratered uplands.
     Highlands,
     /// The moon's dark basalt plains.
@@ -73,10 +77,26 @@ impl Biome {
             Biome::Savanna => "Savanna",
             Biome::Jungle => "Jungle",
             Biome::Mountains => "Mountains",
+            Biome::Volcanic => "Volcano",
+            Biome::Caldera => "Caldera",
             Biome::Highlands => "Highlands",
             Biome::Mare => "Mare",
         }
     }
+}
+
+/// A volcano (see `TerrainGenerator::find_volcanoes`). Generation is still a pure function of
+/// the seed: the list is the same every time.
+#[derive(Clone, Copy, Debug)]
+pub struct Volcano {
+    /// Direction of its summit (unit, planet body frame).
+    pub dir: DVec3,
+    /// Radius of the cone's foot and of the crater's rim (m).
+    pub radius: f64,
+    pub crater: f64,
+    /// Height of the rim above the ground around it, and of that ground (m).
+    pub height: f64,
+    pub base: f64,
 }
 
 /// Everything the generator knows about one column, from noise alone.
@@ -206,11 +226,14 @@ pub struct TerrainGenerator {
     provinces: [Noise; ORE_COUNT],
     /// The moon: craters and maria instead of continents and climate; no water or trees.
     pub lunar: bool,
+    /// Home's volcanoes (none on the moon).
+    pub volcanoes: Vec<Volcano>,
     cache: Mutex<FastMap<(Face, i32, i32), Arc<CacheEntry>>>,
     epoch: AtomicU32,
 }
 
 const CACHE_SOFT_LIMIT: usize = 6000;
+const MAX_VOLCANOES: usize = 14;
 /// Depth (m below sea level) of the surface zone: terrain, ores and trees live above it.
 /// Caves exist at every depth.
 const SURFACE_DEPTH: i32 = 1000;
@@ -221,7 +244,7 @@ impl TerrainGenerator {
     pub fn new(planet: Arc<Planet>) -> Self {
         let seed = planet.seed;
         let n = |i: u64| Noise::new(seed ^ mix64(i));
-        Self {
+        let mut generator = Self {
             continent: n(1),
             mountain_mask: n(2),
             ridges: n(3),
@@ -240,16 +263,89 @@ impl TerrainGenerator {
             cavern: n(16),
             provinces: std::array::from_fn(|i| n(100 + i as u64)),
             lunar: false,
+            volcanoes: Vec::new(),
             cache: Mutex::new(FastMap::default()),
             epoch: AtomicU32::new(0),
             planet,
+        };
+        generator.volcanoes = generator.find_volcanoes();
+        generator
+    }
+
+    /// Picks the volcanoes: on land or shallow shelves, well away from each other, the poles
+    /// and the distorted cube corners. Runs before any exist, so it sees the bare terrain.
+    fn find_volcanoes(&self) -> Vec<Volcano> {
+        let seed = self.planet.seed ^ 0x0701_ca40;
+        let radius = self.planet.sea_radius;
+        let mut found: Vec<Volcano> = Vec::new();
+        for (i, dir) in fibonacci_sphere(1_200).enumerate() {
+            let hash = hash3(seed, i as i64, 0, 0);
+            if unit(hash) > 0.25 || dir.y.abs() > 0.8 || self.corner_sea(dir) > 0.0 {
+                continue;
+            }
+            if found
+                .iter()
+                .any(|v| (v.dir - dir).length() * radius < 11_000.0)
+            {
+                continue;
+            }
+            let ground = self.sample_column(dir);
+            if !(-30.0..60.0).contains(&ground.height) {
+                continue;
+            }
+            let t = unit(mix64(hash ^ 1));
+            found.push(Volcano {
+                dir,
+                radius: 900.0 + 700.0 * t,
+                crater: 105.0 + 70.0 * t,
+                height: 340.0 + 220.0 * unit(mix64(hash ^ 2)),
+                base: ground.height,
+            });
+            if found.len() == MAX_VOLCANOES {
+                break;
+            }
         }
+        found
+    }
+
+    /// The volcano at `dir`, if any: the height it makes there (replacing `h`) and its biome
+    /// (`None` on the outer slopes, where the land keeps its own).
+    fn volcano_at(&self, dir: DVec3, p: DVec3, h: f64) -> Option<(f64, Option<Biome>)> {
+        for v in &self.volcanoes {
+            let d = (dir - v.dir).length() * self.planet.sea_radius;
+            if d >= v.radius {
+                continue;
+            }
+            if d < v.crater {
+                // A bowl around a flat lake of lava.
+                let floor = v.base + v.height * 0.62;
+                let rim = h + v.height;
+                let t = d / v.crater;
+                return Some(if t < 0.72 {
+                    (floor, Some(Biome::Caldera))
+                } else {
+                    (
+                        lerp(floor, rim, smoothstep(0.72, 1.0, t)),
+                        Some(Biome::Volcanic),
+                    )
+                });
+            }
+            // A concave cone, cut by gullies running down its sides.
+            let x = (d - v.crater) / (v.radius - v.crater);
+            let gullies = 1.0 - 0.16 * self.ridges.ridged(p / 170.0, 3) * smoothstep(0.0, 0.2, x);
+            let cone = v.height * (1.0 - x).powf(1.8) * gullies;
+            // The ash thins out raggedly into the land around it.
+            let ash_edge = 0.62 + 0.3 * self.hills.fbm(p / 240.0, 2);
+            return Some((h + cone, (x < ash_edge).then_some(Biome::Volcanic)));
+        }
+        None
     }
 
     /// A generator for a moon: grey, cratered, airless (see `lunar_column`).
     pub fn moon(planet: Arc<Planet>) -> Self {
         Self {
             lunar: true,
+            volcanoes: Vec::new(),
             ..Self::new(planet)
         }
     }
@@ -329,10 +425,19 @@ impl TerrainGenerator {
             h = lerp(h, terrace(h, 10.0, 0.85), cliff);
         }
 
+        // Volcanoes rise out of whatever is around them.
+        let volcano = self.volcano_at(dir, p, h);
+        let volcano_biome = volcano.and_then(|(_, b)| b);
+        if let Some((height, _)) = volcano {
+            h = height;
+        }
+
         // It gets colder the higher you go: snow-capped peaks even near the equator.
         let temperature = base_temp - h.max(0.0) / 300.0;
 
-        let biome = if h < 0.0 {
+        let biome = if let Some(b) = volcano_biome {
+            b
+        } else if h < 0.0 {
             if temperature < 0.0 {
                 Biome::FrozenOcean
             } else if h < -38.0 {
@@ -889,6 +994,22 @@ impl TerrainGenerator {
                 } else if d < 2 && !col.steep {
                     Block::Regolith
                 } else if d < 40 {
+                    Block::Basalt
+                } else {
+                    rock
+                }
+            }
+            Biome::Caldera => {
+                if d < 4 {
+                    Block::Lava
+                } else {
+                    Block::Basalt
+                }
+            }
+            Biome::Volcanic => {
+                if d < 2 && !col.steep {
+                    Block::Ash
+                } else if d < 60 {
                     Block::Basalt
                 } else {
                     rock
@@ -1721,6 +1842,52 @@ mod tests {
             sea / count as f64 * 100.0
         );
         assert_eq!(uncovered, 0, "{uncovered} distorted blocks on land");
+    }
+
+    /// Volcanoes: a handful, each a real cone with a lava lake in its crater, deterministic.
+    #[test]
+    fn volcanoes_have_cones_and_lava() {
+        let make = || {
+            let planet = Arc::new(Planet::new(DVec3::ZERO, 2048, 1024, 0x5eed_a57b));
+            TerrainGenerator::new(planet)
+        };
+        let (generator, again) = (make(), make());
+        let n = generator.volcanoes.len();
+        assert!((4..=MAX_VOLCANOES).contains(&n), "{n} volcanoes");
+        assert_eq!(n, again.volcanoes.len());
+        for (v, w) in generator.volcanoes.iter().zip(&again.volcanoes) {
+            assert_eq!(v.dir, w.dir);
+            let summit = generator.sample_column(v.dir);
+            assert_eq!(summit.biome, Biome::Caldera, "{v:?}");
+            // Beside the summit: the crater's rim, well above the land around the foot.
+            let side = v.dir.cross(DVec3::Y).normalize();
+            let at =
+                |metres: f64| (v.dir + side * (metres / generator.planet.sea_radius)).normalize();
+            let rim = generator.sample_column(at(v.crater + 5.0));
+            let foot = generator.sample_column(at(v.radius + 50.0));
+            assert!(
+                rim.height > foot.height + 150.0,
+                "{} vs {}",
+                rim.height,
+                foot.height
+            );
+            assert!(rim.height > summit.height, "the lake lies below the rim");
+        }
+        let lava = generator.terrain_block(
+            &Column {
+                height: 100,
+                biome: Biome::Caldera,
+                steep: false,
+                temperature: 0.5,
+                ilmenite: false,
+                strata: 0,
+                grass_tint: 0,
+                foliage_tint: 0,
+                water_tint: 0,
+            },
+            100,
+        );
+        assert_eq!(lava, Block::Lava);
     }
 
     /// The moon: only lunar biomes, real craters (a spread of heights), no water and no

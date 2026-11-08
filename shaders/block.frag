@@ -13,6 +13,7 @@ layout(set = 0, binding = 0) uniform texture2DArray u_textures;
 layout(set = 0, binding = 1) uniform sampler u_sampler;
 
 #include "atmosphere.glsl"
+#include "weather.glsl"
 
 layout(push_constant) uniform Push {
     mat4 mvp;
@@ -28,9 +29,19 @@ layout(location = 3) in vec3 v_light; // ambient occlusion, sky light, block lig
 
 layout(location = 0) out vec4 out_color;
 
+// The texture layer of `Tex::Lava` (checked by the test `lava_layer_matches_the_shader`).
+const uint LAVA_LAYER = 117u;
+
 void main() {
     float dist = length(v_rel);
     vec3 uvl = vec3(v_uv, float(v_layer & 255u));
+    bool lava = (v_layer & 255u) == LAVA_LAYER;
+    if (lava) {
+        // Molten rock creeps and churns.
+        float time = frame.radii.z;
+        uvl.xy += vec2(sin(v_uv.y * 0.9 + time * 0.31), cos(v_uv.x * 1.1 - time * 0.23)) * 0.22
+            + vec2(time * 0.07, time * 0.11);
+    }
 
 #if defined(FAR) || defined(WATER)
     // Clip pipelines (LOD terrain, fading chunks, all water):
@@ -85,6 +96,11 @@ void main() {
     float mu_s = dot(up, sun_dir);
     vec3 sun_light = frame.sun_color.rgb * sun_transmittance(r, mu_s);
     vec3 sky_light = frame.sun_color.rgb * sky_irradiance(r, mu_s);
+    // Cloud shadows moving over the land; an overcast sky is dimmer.
+    vec2 through_clouds = cloud_light(p, sun_dir);
+    // (What the clouds take from the sun comes back as soft light from everywhere.)
+    sky_light = sky_light * through_clouds.y + sun_light * max(mu_s, 0.0) * (1.0 - through_clouds.x) * 0.42;
+    sun_light *= through_clouds.x;
 
     float ao = v_light.x;
     // Fake sky visibility (1 in the open, 0 deep in caves) until there is real light
@@ -95,7 +111,8 @@ void main() {
     vec3 bounce = (sun_light * max(mu_s, 0.0) + sky_light) * frame.misc.y;
     vec3 ambient = sky_light * (0.5 + 0.5 * up_n) + bounce * (0.5 - 0.5 * up_n);
     // Starlight / airglow, so nights are dark but not black.
-    vec3 night = vec3(0.45, 0.6, 1.0) * frame.misc.z;
+    vec3 night = vec3(0.45, 0.6, 1.0) * frame.misc.z
+        + vec3(0.8, 0.86, 1.0) * frame.clouds.w * sky;
     // Block light (torches, flood-filled on the CPU, see world::light): warm, with
     // Minecraft's brightness curve (level 15 = 1, each step down noticeably dimmer).
     float level = v_light.z;
@@ -109,6 +126,12 @@ void main() {
         + vec3(1.0, 0.85, 0.7) * lamp
         + vec3(1.0, 0.78, 0.55) * torch * TORCH_IRRADIANCE * mix(1.0, ao, 0.6);
     vec3 color = albedo / PI * irradiance;
+    if (lava) {
+        // It shines by itself, day and night.
+        float hot = dot(t.rgb, vec3(0.3, 0.6, 0.1));
+        float pulse = 0.82 + 0.18 * sin(frame.radii.z * 1.3 + v_uv.x * 2.1 + v_uv.y * 1.7);
+        color += t.rgb * vec3(1.0, 0.72, 0.5) * (0.3 + 1.6 * hot * hot) * pulse * frame.sun_color.rgb * 0.2;
+    }
 
 #ifndef WATER
     // Outline of the block the player is looking at (and how far mining has got).

@@ -21,7 +21,7 @@ use super::{
 
 /// A planned burn: when, and how much along prograde, normal and radial-out (m/s), in the
 /// orbit's frame at that moment.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ManeuverNode {
     pub time: f64,
     pub dv: DVec3,

@@ -21,6 +21,8 @@ const SHADERS: &[(&str, &str, &[&str])] = &[
     ("block.frag", "block_far.frag", &["FAR"]),
     ("fullscreen.vert", "fullscreen.vert", &[]),
     ("sky.frag", "sky.frag", &[]),
+    ("clouds.frag", "clouds.frag", &[]),
+    ("clouds_resolve.frag", "clouds_resolve.frag", &[]),
     ("ui.vert", "ui.vert", &[]),
     ("ui.frag", "ui.frag", &[]),
     ("particles.vert", "particles.vert", &[]),
@@ -33,6 +35,7 @@ const SHADERS: &[(&str, &str, &[&str])] = &[
 fn main() {
     let out_dir = env::var("OUT_DIR").unwrap();
     println!("cargo:rerun-if-changed=shaders");
+    copy_steam_library(Path::new(&out_dir));
 
     for &(source, output, defines) in SHADERS {
         let path = Path::new("shaders").join(source);
@@ -44,6 +47,58 @@ fn main() {
             _ => panic!("unknown shader stage for {source}"),
         };
         compile(&path, output, stage, defines, Path::new(&out_dir));
+    }
+}
+
+/// The game links against Steam's library at load time, so it has to sit next to the
+/// executable even when Steam isn't used. Cargo only puts it on the path for `cargo run`.
+fn copy_steam_library(out_dir: &Path) {
+    let name = match env::var("CARGO_CFG_TARGET_OS").as_deref() {
+        Ok("windows") => "win64/steam_api64.dll",
+        Ok("linux") => "linux64/libsteam_api.so",
+        Ok("macos") => "osx/libsteam_api.dylib",
+        _ => return,
+    };
+    let home = env::var_os("CARGO_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            env::var_os("USERPROFILE")
+                .or_else(|| env::var_os("HOME"))
+                .map(|h| Path::new(&h).join(".cargo"))
+        });
+    let Some(registry) = home.map(|h| h.join("registry/src")) else {
+        return;
+    };
+    // <target>/<profile>/build/<crate>/out
+    let Some(profile) = out_dir.ancestors().nth(3) else {
+        return;
+    };
+    let Ok(indexes) = fs::read_dir(registry) else {
+        return;
+    };
+    for index in indexes.flatten() {
+        let Ok(crates) = fs::read_dir(index.path()) else {
+            continue;
+        };
+        for entry in crates.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("steamworks-sys-")
+            {
+                continue;
+            }
+            let from = entry
+                .path()
+                .join("lib/steam/redistributable_bin")
+                .join(name);
+            if let Some(file) = from.file_name()
+                && from.exists()
+            {
+                let _ = fs::copy(&from, profile.join(file));
+                let _ = fs::copy(&from, profile.join("deps").join(file));
+            }
+        }
     }
 }
 

@@ -16,7 +16,7 @@ use glam::DVec3;
 
 use crate::{mobs::MobKind, util::FastMap, world::block::Material};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Sound {
     Step(Material),
     /// A hit on a block being mined.
@@ -37,7 +37,20 @@ pub enum Sound {
     /// A rocket engine (one overlapping piece of its rumble, replayed while it burns).
     Engine,
     Explosion,
+    /// Lightning's thunder, a long rolling rumble.
+    Thunder,
 }
+
+/// Sounds that play continuously, at a changing volume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ambience {
+    Rain,
+    Wind,
+    /// A tornado.
+    Roar,
+}
+
+const AMBIENCES: usize = 3;
 
 /// Takes of each sound.
 const VARIANTS: u32 = 4;
@@ -50,10 +63,36 @@ struct Voice {
     gain: [f32; 2],
 }
 
+/// A loop playing at a volume that follows its target smoothly.
+struct Loop {
+    samples: Arc<Vec<f32>>,
+    position: usize,
+    gain: f32,
+    target: f32,
+}
+
+/// What the audio callback plays.
+struct Mixer {
+    voices: Vec<Voice>,
+    loops: Vec<Loop>,
+    /// Everything is multiplied by this.
+    master: f32,
+}
+
+impl Default for Mixer {
+    fn default() -> Self {
+        Self {
+            voices: Vec::new(),
+            loops: Vec::new(),
+            master: 1.0,
+        }
+    }
+}
+
 pub struct Audio {
     /// None when there's no audio device (the game still runs, silently).
     stream: Option<cpal::Stream>,
-    voices: Arc<Mutex<Vec<Voice>>>,
+    mixer: Arc<Mutex<Mixer>>,
     sample_rate: f32,
     cache: FastMap<(Sound, u32), Arc<Vec<f32>>>,
     rng: u64,
@@ -62,9 +101,9 @@ pub struct Audio {
 impl Audio {
     /// `enabled: false` stays silent (unattended captures shouldn't make noise).
     pub fn new(enabled: bool) -> Self {
-        let voices = Arc::new(Mutex::new(Vec::<Voice>::new()));
+        let mixer = Arc::new(Mutex::new(Mixer::default()));
         let opened = if enabled {
-            open_stream(voices.clone())
+            open_stream(mixer.clone())
         } else {
             Err(anyhow::anyhow!("disabled"))
         };
@@ -75,12 +114,51 @@ impl Audio {
                 (None, 48_000.0)
             }
         };
+        if stream.is_some() {
+            let loops = [Ambience::Rain, Ambience::Wind, Ambience::Roar].map(|kind| Loop {
+                samples: Arc::new(ambience_loop(kind, sample_rate)),
+                position: 0,
+                gain: 0.0,
+                target: 0.0,
+            });
+            mixer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .loops
+                .extend(loops);
+        }
         Self {
             stream,
-            voices,
+            mixer,
             sample_rate,
             cache: FastMap::default(),
             rng: 0x9e37_79b9_7f4a_7c15,
+        }
+    }
+
+    /// The volume setting, 0..1 (on a curve: halfway sounds about half as loud).
+    pub fn set_volume(&mut self, volume: f32) {
+        let volume = volume.clamp(0.0, 1.0);
+        self.mixer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .master = volume * volume;
+    }
+
+    /// Sets how loud a continuous sound should be (0 = silent); it fades there by itself.
+    pub fn set_ambience(&mut self, kind: Ambience, gain: f32) {
+        if self.stream.is_none() {
+            return;
+        }
+        let index = match kind {
+            Ambience::Rain => 0,
+            Ambience::Wind => 1,
+            Ambience::Roar => 2,
+        };
+        debug_assert!(index < AMBIENCES);
+        let mut mixer = self.mixer.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(l) = mixer.loops.get_mut(index) {
+            l.target = gain.clamp(0.0, 1.0);
         }
     }
 
@@ -122,9 +200,9 @@ impl Audio {
             volume * ((1.0 - pan) * 0.5).sqrt(),
             volume * ((1.0 + pan) * 0.5).sqrt(),
         ];
-        let mut voices = self.voices.lock().unwrap_or_else(PoisonError::into_inner);
-        if voices.len() < 48 {
-            voices.push(Voice {
+        let mut mixer = self.mixer.lock().unwrap_or_else(PoisonError::into_inner);
+        if mixer.voices.len() < 48 {
+            mixer.voices.push(Voice {
                 samples,
                 position: 0,
                 gain,
@@ -149,6 +227,18 @@ fn volume(sound: Sound) -> f32 {
         Sound::MobHurt(_) => 0.5,
         Sound::Engine => 0.5,
         Sound::Explosion => 0.9,
+        Sound::Thunder => 1.0,
+    }
+}
+
+/// Loudness of each loop at full strength (RMS). Noise that never stops needs far less level
+/// than a short sound to fill the mix, so these are measured as loudness, not by peak: wind
+/// and rain together stay under a footstep (see `weather_stays_under_the_game`).
+fn ambience_level(kind: Ambience) -> f32 {
+    match kind {
+        Ambience::Rain => 0.02,
+        Ambience::Wind => 0.018,
+        Ambience::Roar => 0.05,
     }
 }
 
@@ -157,11 +247,12 @@ fn range(sound: Sound) -> f64 {
     match sound {
         Sound::Engine => 600.0,
         Sound::Explosion => 1_500.0,
+        Sound::Thunder => 14_000.0,
         _ => RANGE,
     }
 }
 
-fn open_stream(voices: Arc<Mutex<Vec<Voice>>>) -> anyhow::Result<(cpal::Stream, f32)> {
+fn open_stream(voices: Arc<Mutex<Mixer>>) -> anyhow::Result<(cpal::Stream, f32)> {
     let host = cpal::default_host();
     let device = host
         .default_output_device()
@@ -193,15 +284,26 @@ fn open_stream(voices: Arc<Mutex<Vec<Voice>>>) -> anyhow::Result<(cpal::Stream, 
 
 /// Mixes the playing voices into an interleaved buffer. Loud moments are rounded off
 /// (tanh) instead of clipping harshly.
-fn mix<T: Copy>(
-    voices: &Mutex<Vec<Voice>>,
-    data: &mut [T],
-    channels: usize,
-    convert: impl Fn(f32) -> T,
-) {
-    let mut voices = voices.lock().unwrap_or_else(PoisonError::into_inner);
+fn mix<T: Copy>(mixer: &Mutex<Mixer>, data: &mut [T], channels: usize, convert: impl Fn(f32) -> T) {
+    let mut mixer = mixer.lock().unwrap_or_else(PoisonError::into_inner);
+    let Mixer {
+        voices,
+        loops,
+        master,
+    } = &mut *mixer;
+    let master = *master;
     for frame in data.chunks_mut(channels) {
         let mut out = [0.0f32; 2];
+        for l in loops.iter_mut() {
+            // About a third of a second to reach a new level.
+            l.gain += (l.target - l.gain) * 0.00012;
+            if l.gain > 1e-4 {
+                let s = l.samples[l.position] * l.gain;
+                out[0] += s;
+                out[1] += s;
+            }
+            l.position = (l.position + 1) % l.samples.len();
+        }
         for v in voices.iter_mut() {
             if let Some(&s) = v.samples.get(v.position) {
                 out[0] += s * v.gain[0];
@@ -215,10 +317,67 @@ fn mix<T: Copy>(
             } else {
                 out[c.min(1)]
             };
-            *sample = convert(x.tanh());
+            *sample = convert((x * master).tanh());
         }
     }
     voices.retain(|v| v.position < v.samples.len());
+}
+
+/// A long, seamless loop of weather noise (mono, at its `ambience_level`).
+fn ambience_loop(kind: Ambience, rate: f32) -> Vec<f32> {
+    let seconds = 7.0;
+    let total = (seconds * rate) as usize;
+    let fade = (0.6 * rate) as usize;
+    let mut rng = 0x7a31_c2d5u32 ^ kind as u32;
+    let mut noise = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 17;
+        rng ^= rng << 5;
+        (rng as f32 / u32::MAX as f32) * 2.0 - 1.0
+    };
+    // One-pole low-pass coefficient for a cutoff in Hz.
+    let k = |hz: f32| 1.0 - (-TAU * hz / rate).exp();
+    let mut raw = vec![0.0f32; total + fade];
+    let (mut a, mut b) = (0.0f32, 0.0f32);
+    let mut swell = 0.0f32;
+    for (i, out) in raw.iter_mut().enumerate() {
+        let n = noise();
+        let t = i as f32 / rate;
+        *out = match kind {
+            Ambience::Rain => {
+                // A steady hiss with its top rolled off.
+                a += (n - a) * k(3_400.0);
+                b += (a - b) * k(420.0);
+                a - b
+            }
+            Ambience::Wind => {
+                // Low, breathing noise.
+                a += (n - a) * k(620.0);
+                b += (a - b) * k(120.0);
+                swell += (noise().abs() - swell) * k(0.7);
+                (a - b) * (0.45 + 1.3 * swell + 0.2 * (t * 1.3).sin())
+            }
+            Ambience::Roar => {
+                // Deep and heavy.
+                a += (n - a) * k(240.0);
+                b += (a - b) * k(46.0);
+                (a - b) * (0.8 + 0.2 * (t * 7.0).sin())
+            }
+        };
+    }
+    let rms = (raw.iter().map(|x| x * x).sum::<f32>() / raw.len() as f32).sqrt();
+    let level = ambience_level(kind) / rms.max(1e-6);
+    // The tail fades into the head, so the loop has no click.
+    let mut out = Vec::with_capacity(total);
+    for i in 0..total {
+        let mut s = raw[i];
+        if i < fade {
+            let f = i as f32 / fade as f32;
+            s = raw[i] * f + raw[total + i] * (1.0 - f);
+        }
+        out.push(s * level);
+    }
+    out
 }
 
 // ---- Synthesis ------------------------------------------------------------------------
@@ -596,6 +755,42 @@ fn synthesize(sound: Sound, variant: u32, rate: f32) -> Vec<f32> {
     };
     let s = &mut synth;
     let mut out = match sound {
+        Sound::Thunder => {
+            // A sharp first crack and then rolling booms, each dying away: low-passed noise
+            // shaped by a handful of random bursts.
+            let len = s.len(6.0);
+            let mut bursts = vec![(0.0f32, 1.0f32, 0.35f32)];
+            for _ in 0..7 {
+                let onset = 0.1 + s.random() * 3.6;
+                let strength = 0.3 + s.random() * 0.6;
+                let decay = 0.35 + s.random() * 1.1;
+                bursts.push((onset, strength, decay));
+            }
+            let (mut a, mut b) = (0.0f32, 0.0f32);
+            let ka = 1.0 - (-TAU * 240.0 / rate).exp();
+            let kb = 1.0 - (-TAU * 90.0 / rate).exp();
+            let mut out = Vec::with_capacity(len);
+            for i in 0..len {
+                let t = i as f32 / rate;
+                let n = s.noise();
+                a += (n - a) * ka;
+                b += (a - b) * kb;
+                let mut env = 0.0;
+                for &(onset, strength, decay) in &bursts {
+                    if t >= onset {
+                        env += strength * (-(t - onset) / decay).exp();
+                    }
+                }
+                let crack = if t < 0.12 {
+                    n * (1.0 - t / 0.12) * 0.25
+                } else {
+                    0.0
+                };
+                let tail = (1.0 - t / 6.0).max(0.0);
+                out.push((b * env * 4.0 + crack) * tail.sqrt());
+            }
+            out
+        }
         Sound::Step(m) => {
             // Footsteps are light and dull.
             let mut out = impact(s, m, 0.35);
@@ -830,6 +1025,7 @@ mod tests {
             Sound::Equip,
             Sound::Hurt,
             Sound::Engine,
+            Sound::Thunder,
             Sound::Explosion,
         ];
         for m in MATERIALS {
@@ -853,13 +1049,48 @@ mod tests {
         rate / TAU * (slope / energy).sqrt()
     }
 
+    /// The loudest 50 ms of a sound (RMS): how loud it is while it is actually sounding.
+    fn loudness(samples: &[f32], rate: f32) -> f32 {
+        let window = (0.05 * rate) as usize;
+        samples
+            .chunks(window / 2)
+            .zip(samples.chunks(window / 2).skip(1))
+            .map(|(a, b)| {
+                let energy: f32 = a.iter().chain(b).map(|x| x * x).sum();
+                (energy / (a.len() + b.len()) as f32).sqrt()
+            })
+            .fold(0.0, f32::max)
+    }
+
+    /// A full storm must not drown out the player's own footsteps, nor a tornado being hurt.
+    #[test]
+    fn weather_stays_under_the_game() {
+        let rate = 48_000.0;
+        let heard = |sound| {
+            (0..VARIANTS)
+                .map(|v| loudness(&synthesize(sound, v, rate), rate) * volume(sound))
+                .fold(f32::MAX, f32::min)
+        };
+        let storm = [Ambience::Rain, Ambience::Wind]
+            .map(|kind| loudness(&ambience_loop(kind, rate), rate).powi(2))
+            .iter()
+            .sum::<f32>()
+            .sqrt();
+        let step = heard(Sound::Step(Material::Stone));
+        assert!(storm < step, "storm {storm} against a step {step}");
+        let roar = loudness(&ambience_loop(Ambience::Roar, rate), rate);
+        let hurt = heard(Sound::Hurt);
+        assert!(roar < hurt * 0.5, "roar {roar} against being hurt {hurt}");
+    }
+
     #[test]
     fn sounds_are_short_soft_and_in_range() {
         for sound in all() {
             for variant in 0..VARIANTS {
                 let samples = synthesize(sound, variant, 48_000.0);
+                let longest = if sound == Sound::Thunder { 7 } else { 2 };
                 assert!(
-                    !samples.is_empty() && samples.len() < 48_000 * 2,
+                    !samples.is_empty() && samples.len() < 48_000 * longest,
                     "{sound:?}"
                 );
                 let peak = samples.iter().fold(0.0f32, |m, x| m.max(x.abs()));

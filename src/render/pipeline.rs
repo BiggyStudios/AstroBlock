@@ -17,6 +17,9 @@ const WATER_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block_water.
 const FAR_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block_far.frag.spv"));
 const FULLSCREEN_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fullscreen.vert.spv"));
 const SKY_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sky.frag.spv"));
+const CLOUDS_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/clouds.frag.spv"));
+const CLOUDS_RESOLVE_FRAG: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/clouds_resolve.frag.spv"));
 const UI_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.vert.spv"));
 const UI_FRAG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.frag.spv"));
 const PARTICLES_VERT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/particles.vert.spv"));
@@ -36,8 +39,10 @@ const _: () = assert!(size_of::<PushConstants>() as u32 <= PUSH_BYTES);
 /// Descriptor set 0 (must match the shaders): 0 block textures, 1 block sampler,
 /// 2 LUT sampler, 3 transmittance LUT, 4 multiple scattering LUT, 5 sky irradiance LUT,
 /// 6 frame uniforms, 7 HDR scene, 8 depth, 9 galaxy map, 10 font atlas, 11 particles,
-/// 12 particle batch (this frame's simulation parameters and emitters).
-pub const BINDINGS: [(vk::DescriptorType, vk::ShaderStageFlags); 13] = {
+/// 12 particle batch (this frame's simulation parameters and emitters), 13 and 14 weather
+/// maps, 15 and 16 cloud noise, 17 raw clouds, 18 last frame's clouds, 19 this frame's clouds,
+/// 20 repeating sampler.
+pub const BINDINGS: [(vk::DescriptorType, vk::ShaderStageFlags); 21] = {
     use vk::{DescriptorType as T, ShaderStageFlags as S};
     const FRAGMENT_COMPUTE: S = S::from_raw(S::FRAGMENT.as_raw() | S::COMPUTE.as_raw());
     const VERTEX_COMPUTE: S = S::from_raw(S::VERTEX.as_raw() | S::COMPUTE.as_raw());
@@ -55,6 +60,14 @@ pub const BINDINGS: [(vk::DescriptorType, vk::ShaderStageFlags); 13] = {
         (T::SAMPLED_IMAGE, S::FRAGMENT),      // 10 font atlas
         (T::STORAGE_BUFFER, VERTEX_COMPUTE),  // 11 particles
         (T::STORAGE_BUFFER, S::COMPUTE),      // 12 particle batch
+        (T::SAMPLED_IMAGE, S::FRAGMENT),      // 13 weather map A
+        (T::SAMPLED_IMAGE, S::FRAGMENT),      // 14 weather map B
+        (T::SAMPLED_IMAGE, S::FRAGMENT),      // 15 cloud shape noise
+        (T::SAMPLED_IMAGE, S::FRAGMENT),      // 16 cloud detail noise
+        (T::SAMPLED_IMAGE, S::FRAGMENT),      // 17 raw clouds
+        (T::SAMPLED_IMAGE, S::FRAGMENT),      // 18 last frame's clouds
+        (T::SAMPLED_IMAGE, S::FRAGMENT),      // 19 this frame's clouds
+        (T::SAMPLER, S::FRAGMENT),            // 20 repeating sampler
     ]
 };
 
@@ -67,6 +80,9 @@ pub struct Pipelines {
     pub far: vk::Pipeline,
     /// Full-screen atmosphere + tone mapping pass into the swapchain.
     pub sky: vk::Pipeline,
+    /// Half-resolution weather in the air, and its temporal resolve.
+    pub clouds: vk::Pipeline,
+    pub clouds_resolve: vk::Pipeline,
     /// 2D overlay (console, HUD), alpha blended over the swapchain image.
     pub ui: vk::Pipeline,
     /// Particles: cut-out (with the opaque scene, writes depth) and blended (after water).
@@ -83,6 +99,7 @@ enum Kind {
     Water,
     Far,
     Sky,
+    Clouds,
     Ui,
     Particles,
     ParticlesBlend,
@@ -146,6 +163,8 @@ impl Pipelines {
         let water = make(BLOCK_VERT, WATER_FRAG, Kind::Water);
         let far = make(BLOCK_VERT, FAR_FRAG, Kind::Far);
         let sky = make(FULLSCREEN_VERT, SKY_FRAG, Kind::Sky);
+        let clouds = make(FULLSCREEN_VERT, CLOUDS_FRAG, Kind::Clouds);
+        let clouds_resolve = make(FULLSCREEN_VERT, CLOUDS_RESOLVE_FRAG, Kind::Clouds);
         let ui = make(UI_VERT, UI_FRAG, Kind::Ui);
         let particles = make(PARTICLES_VERT, PARTICLES_FRAG, Kind::Particles);
         let particles_blend = make(PARTICLES_VERT, PARTICLES_BLEND_FRAG, Kind::ParticlesBlend);
@@ -159,6 +178,8 @@ impl Pipelines {
             water: water?,
             far: far?,
             sky: sky?,
+            clouds: clouds?,
+            clouds_resolve: clouds_resolve?,
             ui: ui?,
             particles: particles?,
             particles_blend: particles_blend?,
@@ -174,6 +195,8 @@ impl Pipelines {
                 self.water,
                 self.far,
                 self.sky,
+                self.clouds,
+                self.clouds_resolve,
                 self.ui,
                 self.particles,
                 self.particles_blend,
@@ -236,7 +259,7 @@ fn create(
     let ui_attributes = UiVertex::attribute_descriptions();
     // The full-screen pass generates its triangle from the vertex index.
     let vertex_input = match kind {
-        Kind::Sky | Kind::Particles | Kind::ParticlesBlend => {
+        Kind::Sky | Kind::Clouds | Kind::Particles | Kind::ParticlesBlend => {
             vk::PipelineVertexInputStateCreateInfo::default()
         }
         Kind::Ui => vk::PipelineVertexInputStateCreateInfo::default()
@@ -260,7 +283,7 @@ fn create(
     // visible from below.
     let cull = if matches!(
         kind,
-        Kind::Water | Kind::Sky | Kind::Ui | Kind::Particles | Kind::ParticlesBlend
+        Kind::Water | Kind::Sky | Kind::Clouds | Kind::Ui | Kind::Particles | Kind::ParticlesBlend
     ) {
         vk::CullModeFlags::NONE
     } else {
@@ -277,7 +300,7 @@ fn create(
 
     // Reverse-Z: closer = larger depth. Translucent water tests depth but doesn't write it.
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo::default()
-        .depth_test_enable(!matches!(kind, Kind::Sky | Kind::Ui))
+        .depth_test_enable(!matches!(kind, Kind::Sky | Kind::Clouds | Kind::Ui))
         .depth_write_enable(matches!(kind, Kind::Opaque | Kind::Far | Kind::Particles))
         .depth_compare_op(vk::CompareOp::GREATER_OR_EQUAL);
 
@@ -300,7 +323,7 @@ fn create(
         vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
 
     let color_formats = [color_format];
-    let depth_format = if matches!(kind, Kind::Sky | Kind::Ui) {
+    let depth_format = if matches!(kind, Kind::Sky | Kind::Clouds | Kind::Ui) {
         vk::Format::UNDEFINED
     } else {
         DepthBuffer::FORMAT

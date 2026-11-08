@@ -74,6 +74,46 @@ vec3 normal_at(ivec2 px, vec3 rel) {
     return dot(n, rel) > 0.0 ? -n : n;
 }
 
+// True when the point is below the highest block of its column (weather: under a roof).
+bool under_roof(vec3 pos) {
+    if (b_roof_center.w < 0.5) {
+        return false;
+    }
+    vec3 rel = pos - b_roof_center.xyz;
+    vec2 c = vec2(dot(rel, b_roof_u.xyz), dot(rel, b_roof_v.xyz)) / b_roof_u.w + 24.0;
+    if (c.x < 0.0 || c.y < 0.0 || c.x >= 48.0 || c.y >= 48.0) {
+        return false;
+    }
+    float top = b_roof[int(c.y) * 48 + int(c.x)];
+    return top > -1e5 && dot(rel, normalize(pos - b_planet.xyz)) < top;
+}
+
+// The air's motion at a point: the local wind, plus the tornadoes: a whirl around each, air
+// drawn in near the ground and thrown up the middle.
+vec3 wind_at(vec3 pos) {
+    vec3 wind = b_wind.xyz;
+    for (int i = 0; i < 3; i++) {
+        float core = b_vortex[i].w;
+        if (core <= 0.0) {
+            continue;
+        }
+        vec3 rel = pos - b_vortex[i].xyz;
+        vec3 axis = normalize(b_vortex[i].xyz - b_planet.xyz);
+        float h = dot(rel, axis);
+        vec3 radial = rel - axis * h;
+        float d = length(radial);
+        if (d < 1e-3 || d > core * 14.0) {
+            continue;
+        }
+        float swirl = d < core ? d / core : core / d;
+        vec3 inward = -radial / d;
+        wind += cross(axis, inward) * -58.0 * swirl;
+        wind += inward * 22.0 * swirl * exp(-max(h, 0.0) / 60.0);
+        wind += axis * 34.0 * exp(-d * d / (core * core * 2.2));
+    }
+    return wind;
+}
+
 void main() {
     if (gl_GlobalInvocationID.x >= b_sim.y) {
         return;
@@ -87,6 +127,7 @@ void main() {
     vec3 pos = p.pos_age.xyz - b_shift.xyz;
     vec3 vel = p.vel_life.xyz;
     float life = p.vel_life.w;
+    float age = p.pos_age.w + dt;
     uint flags = (p.look.x >> 8u) & 255u;
     float size = p.phys.z;
     vec3 down = normalize(b_planet.xyz - pos);
@@ -106,13 +147,22 @@ void main() {
         bool visible = was == SKY || (was == SURFACE && behind <= 0.02);
 
         vel += down * (b_planet.w * p.phys.x * dt);
-        vel += (b_wind.xyz - vel) * (1.0 - exp(-p.phys.y * dt));
+        vel += (wind_at(pos) - vel) * (1.0 - exp(-p.phys.y * dt));
         vec3 next = pos + vel * dt;
         if (visible && (flags & (P_BOUNCE | P_DIE_ON_HIT)) != 0u) {
             vec3 rel = next + b_anchor.xyz;
             float reach = 0.1 + length(vel) * dt * 2.0;
             if (probe(rel, behind, px) == SURFACE && behind > 0.0 && behind < reach) {
-                if ((flags & P_DIE_ON_HIT) != 0u) {
+                if ((flags & P_DIE_ON_HIT) != 0u && (flags & P_STRETCH) != 0u) {
+                    // A raindrop landing: a tiny splash where it hit.
+                    vec4 clip = b_view_proj * vec4(rel, 1.0);
+                    next = rel * ((clip.w - behind) / clip.w) - b_anchor.xyz + down * -0.06;
+                    vel = down * -0.5;
+                    flags = (flags & ~(P_STRETCH | P_DIE_ON_HIT)) | P_ROUND;
+                    size *= 2.6;
+                    age = 0.0;
+                    life = 0.14;
+                } else if ((flags & P_DIE_ON_HIT) != 0u) {
                     life = 0.0;
                 } else {
                     vec3 normal = normal_at(px, rel);
@@ -133,9 +183,13 @@ void main() {
             }
         }
         pos = next;
+        if (((p.look.x >> 24u) & P2_ROOFED) != 0u && (flags & (P_DIE_ON_HIT | P_STRETCH)) != 0u && under_roof(pos)) {
+            life = 0.0;
+        }
     }
 
-    particles[i].pos_age = vec4(pos, p.pos_age.w + dt);
+    particles[i].pos_age = vec4(pos, age);
     particles[i].vel_life = vec4(vel, life);
+    particles[i].phys.z = size;
     particles[i].look.x = (p.look.x & ~(255u << 8u)) | (flags << 8u);
 }

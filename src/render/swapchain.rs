@@ -27,6 +27,7 @@ impl Swapchain {
         ctx: &VulkanContext,
         window_size: PhysicalSize<u32>,
         old: vk::SwapchainKHR,
+        vsync: bool,
     ) -> Result<Self> {
         let (pd, surface) = (ctx.physical_device, ctx.surface);
         let caps = unsafe {
@@ -51,16 +52,15 @@ impl Swapchain {
             })
             .unwrap_or(formats[0]);
 
-        // FIFO = vsync, guaranteed to be supported everywhere. ASTRO_VSYNC=0 uncaps the
-        // framerate (IMMEDIATE, else MAILBOX) for profiling.
+        // FIFO = vsync, guaranteed to be supported everywhere. Without vsync: IMMEDIATE, else
+        // MAILBOX.
         let modes = unsafe {
             ctx.surface_loader
                 .get_physical_device_surface_present_modes(pd, surface)?
         };
-        let uncapped = std::env::var("ASTRO_VSYNC").is_ok_and(|v| v == "0");
         let present_mode = [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX]
             .into_iter()
-            .find(|m| uncapped && modes.contains(m))
+            .find(|m| !vsync && modes.contains(m))
             .unwrap_or(vk::PresentModeKHR::FIFO);
 
         let extent = if caps.current_extent.width != u32::MAX {

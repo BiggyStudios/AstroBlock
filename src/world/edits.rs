@@ -4,16 +4,47 @@
 //! whenever a chunk is (re)generated - to the chunk itself *and* to the 1-block padding it
 //! borrows from its neighbours, so meshes stay seamless next to edited blocks.
 //!
-//! Edits live in memory for the session (saving to disk is future work).
+//! On disk (`to_bytes`) blocks are stored through a table of their names, so inserting a new
+//! block type later never scrambles an old save.
 
 use std::sync::RwLock;
+
+use anyhow::{Result, bail};
 
 use super::{
     block::Block,
     chunk::{BlockCell, ChunkKey, PaddedBlocks},
-    planet::{CHUNK_SIZE, Planet},
+    planet::{CHUNK_SIZE, Face, Planet},
 };
 use crate::util::FastMap;
+
+/// Little-endian fields out of a byte slice, failing cleanly on a cut-off file.
+struct Reader<'a> {
+    data: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let Some(slice) = self.data.get(self.at..self.at + n) else {
+            bail!("the file ends too soon");
+        };
+        self.at += n;
+        Ok(slice)
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into()?))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into()?))
+    }
+
+    fn i32(&mut self) -> Result<i32> {
+        Ok(i32::from_le_bytes(self.take(4)?.try_into()?))
+    }
+}
 
 #[derive(Default)]
 pub struct WorldEdits {
@@ -25,7 +56,84 @@ fn local_index([u, v, k]: [i32; 3]) -> u16 {
     (u + v * CHUNK_SIZE + k * CHUNK_SIZE * CHUNK_SIZE) as u16
 }
 
+const MAGIC: &[u8; 4] = b"ABE1";
+
 impl WorldEdits {
+    /// All edits as a compact binary file.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let chunks = self.chunks.read().unwrap();
+        let palette: Vec<Block> = chunks
+            .values()
+            .flat_map(|c| c.values().copied())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let edits: usize = chunks.values().map(|c| c.len()).sum();
+        let mut out = Vec::with_capacity(16 + palette.len() * 16 + chunks.len() * 15 + edits * 4);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&(palette.len() as u16).to_le_bytes());
+        for block in &palette {
+            let name = format!("{block:?}");
+            out.push(name.len() as u8);
+            out.extend_from_slice(name.as_bytes());
+        }
+        out.extend_from_slice(&(chunks.len() as u32).to_le_bytes());
+        for (key, cells) in chunks.iter() {
+            out.push(key.face.0);
+            for x in [key.cu, key.cv, key.ck] {
+                out.extend_from_slice(&x.to_le_bytes());
+            }
+            out.extend_from_slice(&(cells.len() as u16).to_le_bytes());
+            for (&index, block) in cells {
+                let id = palette.binary_search(block).expect("in the table") as u16;
+                out.extend_from_slice(&index.to_le_bytes());
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// Replaces all edits with those of a file written by `to_bytes` (on a bad file, keeps
+    /// what it has). Blocks this version of the game doesn't know are left as generated.
+    pub fn read_bytes(&self, data: &[u8]) -> Result<()> {
+        let mut r = Reader { data, at: 0 };
+        if r.take(4)? != MAGIC {
+            bail!("not a block edits file");
+        }
+        let names = r.u16()? as usize;
+        let mut palette = Vec::with_capacity(names);
+        for _ in 0..names {
+            let len = r.take(1)?[0] as usize;
+            let name = std::str::from_utf8(r.take(len)?)?;
+            palette.push(
+                Block::ALL
+                    .iter()
+                    .copied()
+                    .find(|b| format!("{b:?}") == name),
+            );
+        }
+        let count = r.u32()? as usize;
+        let mut chunks: FastMap<ChunkKey, FastMap<u16, Block>> = FastMap::default();
+        for _ in 0..count {
+            let face = Face(r.take(1)?[0]);
+            let (cu, cv, ck) = (r.i32()?, r.i32()?, r.i32()?);
+            let cells = r.u16()? as usize;
+            let entry = chunks.entry(ChunkKey { face, cu, cv, ck }).or_default();
+            for _ in 0..cells {
+                let index = r.u16()?;
+                let id = r.u16()? as usize;
+                let Some(block) = palette.get(id) else {
+                    bail!("block edit out of range");
+                };
+                if let Some(block) = block {
+                    entry.insert(index, *block);
+                }
+            }
+        }
+        *self.chunks.write().unwrap() = chunks;
+        Ok(())
+    }
+
     pub fn set(&self, planet: &Planet, cell: BlockCell, block: Block) {
         let (key, local) = planet.cell_chunk(cell);
         self.chunks
@@ -123,7 +231,57 @@ mod tests {
     use glam::DVec3;
 
     use super::*;
-    use crate::world::planet::Face;
+
+    #[test]
+    fn edits_survive_being_written_and_read() {
+        let planet = Planet::new(DVec3::ZERO, 2048, 1024, 1);
+        let edits = WorldEdits::default();
+        let k = planet.sea_layer + 5;
+        let cells = [
+            (100, 200, Block::Stone),
+            (101, 200, Block::Air),
+            (9000, 5, Block::Lava),
+        ];
+        for (u, v, block) in cells {
+            let face = Face(4);
+            edits.set(&planet, BlockCell { face, u, v, k }, block);
+        }
+        let bytes = edits.to_bytes();
+        let loaded = WorldEdits::default();
+        loaded.read_bytes(&bytes).unwrap();
+        assert_eq!(
+            *loaded.chunks.read().unwrap(),
+            *edits.chunks.read().unwrap()
+        );
+        // A file cut short is an error, not a crash or half a world.
+        assert!(loaded.read_bytes(&bytes[..bytes.len() - 3]).is_err());
+        assert!(loaded.read_bytes(b"nonsense").is_err());
+        assert_eq!(
+            *loaded.chunks.read().unwrap(),
+            *edits.chunks.read().unwrap()
+        );
+    }
+
+    /// A block name this version doesn't know keeps the generated block.
+    #[test]
+    fn unknown_blocks_are_skipped() {
+        let planet = Planet::new(DVec3::ZERO, 2048, 1024, 1);
+        let edits = WorldEdits::default();
+        let k = planet.sea_layer + 5;
+        let cell = BlockCell {
+            face: Face(4),
+            u: 7,
+            v: 7,
+            k,
+        };
+        edits.set(&planet, cell, Block::Lava);
+        let mut bytes = edits.to_bytes();
+        let at = bytes.windows(4).position(|w| w == b"Lava").unwrap();
+        bytes[at..at + 4].copy_from_slice(b"Goop");
+        let loaded = WorldEdits::default();
+        loaded.read_bytes(&bytes).unwrap();
+        assert!(loaded.chunks.read().unwrap().values().all(|c| c.is_empty()));
+    }
 
     #[test]
     fn edits_reach_neighbour_padding() {

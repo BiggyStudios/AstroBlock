@@ -151,6 +151,8 @@ textures! {
     Regolith,
     MoonRock,
     Basalt,
+    Ash,
+    Lava,
 }
 
 impl Tex {
@@ -833,6 +835,30 @@ fn make(t: Tex) -> Img {
             for _ in 0..12 {
                 let (x, y) = (r.below(16), r.below(16));
                 img.shade(x, y, 0.62);
+            }
+            img
+        }
+        Tex::Ash => {
+            // Soft dark grey ash, with a few pale cinders.
+            let mut img = noisy(r, [84, 82, 80], 0.1, 0);
+            for _ in 0..10 {
+                let (x, y) = (r.below(16), r.below(16));
+                img.shade(x, y, 1.35);
+            }
+            img
+        }
+        Tex::Lava => {
+            // Bright molten rock broken by a few darker, cooling plates.
+            let mut img = noisy(r, [255, 128, 28], 0.14, 0);
+            for _ in 0..7 {
+                let (x, y) = (r.below(14), r.below(14));
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    img.shade(x + dx, y + dy, 0.45);
+                }
+            }
+            for _ in 0..12 {
+                let (x, y) = (r.below(16), r.below(16));
+                img.shade(x, y, 1.25);
             }
             img
         }

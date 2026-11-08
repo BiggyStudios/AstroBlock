@@ -22,5 +22,10 @@ layout(std430, set = 0, binding = 12) readonly buffer Batch {
     vec4 b_shift;         // xyz: new anchor - old anchor (re-base), w: unused
     uvec4 b_info;         // x: new particles, y: emitters, z: ring index of the first new one, w: capacity
     uvec4 b_sim;          // x: first ring index to simulate, y: how many, z: random seed, w: unused
+    vec4 b_vortex[3];     // tornadoes: xyz relative to the anchor, w: core radius (0 = none)
+    vec4 b_roof_center;   // xyz: the roof map's centre relative to the anchor, w: 1 = roof map in use
+    vec4 b_roof_u;        // xyz: its first axis (unit), w: cell size (m)
+    vec4 b_roof_v;        // xyz: its second axis (unit)
+    float b_roof[2304];   // 48 x 48 heights of the highest block, along "up" from the centre
     Emitter b_emitters[];
 };

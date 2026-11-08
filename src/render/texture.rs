@@ -156,6 +156,243 @@ impl Texture {
         })
     }
 
+    /// A tiling 3D volume (R8, with its mip chain), sampled linearly and repeating.
+    pub fn new_3d(
+        ctx: &VulkanContext,
+        allocator: &mut Allocator,
+        upload_pool: vk::CommandPool,
+        size: u32,
+        levels: &[Vec<u8>],
+        name: &str,
+    ) -> Result<Self> {
+        let device = &ctx.device;
+        let format = vk::Format::R8_UNORM;
+        let info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_3D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: size,
+                height: size,
+                depth: size,
+            })
+            .mip_levels(levels.len() as u32)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None)? };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = allocator.allocate(&AllocationCreateDesc {
+            name,
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
+
+        let bytes: Vec<u8> = levels.concat();
+        let mut staging = Buffer::new(
+            device,
+            allocator,
+            "volume staging",
+            bytes.len() as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+        )?;
+        staging.write(0, &bytes)?;
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(levels.len() as u32)
+            .layer_count(1);
+        let mut offset = 0u64;
+        let regions: Vec<_> = levels
+            .iter()
+            .enumerate()
+            .map(|(level, data)| {
+                let edge = (size >> level).max(1);
+                let region = vk::BufferImageCopy {
+                    buffer_offset: offset,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: level as u32,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_extent: vk::Extent3D {
+                        width: edge,
+                        height: edge,
+                        depth: edge,
+                    },
+                    ..Default::default()
+                };
+                offset += data.len() as u64;
+                region
+            })
+            .collect();
+        ctx.submit_and_wait(upload_pool, |cmd| unsafe {
+            transition(
+                device,
+                cmd,
+                image,
+                range,
+                (
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                ),
+            );
+            device.cmd_copy_buffer_to_image(
+                cmd,
+                staging.handle,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &regions,
+            );
+            transition(
+                device,
+                cmd,
+                image,
+                range,
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ),
+            );
+        })?;
+        staging.destroy(device, allocator);
+
+        let view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_3D)
+                    .format(format)
+                    .subresource_range(range),
+                None,
+            )?
+        };
+        let sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_w(vk::SamplerAddressMode::REPEAT)
+                    .max_lod(levels.len() as f32),
+                None,
+            )?
+        };
+        Ok(Self {
+            image,
+            view,
+            sampler,
+            allocation: Some(allocation),
+        })
+    }
+
+    /// An RGBA8 cube map, cleared to zero, to be updated by copies every so often.
+    pub fn new_cube(
+        ctx: &VulkanContext,
+        allocator: &mut Allocator,
+        upload_pool: vk::CommandPool,
+        size: u32,
+        name: &str,
+    ) -> Result<Self> {
+        let device = &ctx.device;
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let info = vk::ImageCreateInfo::default()
+            .flags(vk::ImageCreateFlags::CUBE_COMPATIBLE)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: size,
+                height: size,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(6)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&info, None)? };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let allocation = allocator.allocate(&AllocationCreateDesc {
+            name,
+            requirements,
+            location: MemoryLocation::GpuOnly,
+            linear: false,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        })?;
+        unsafe { device.bind_image_memory(image, allocation.memory(), allocation.offset())? };
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(6);
+        ctx.submit_and_wait(upload_pool, |cmd| unsafe {
+            transition(
+                device,
+                cmd,
+                image,
+                range,
+                (
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                ),
+            );
+            device.cmd_clear_color_image(
+                cmd,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &vk::ClearColorValue { float32: [0.0; 4] },
+                &[range],
+            );
+            transition(
+                device,
+                cmd,
+                image,
+                range,
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ),
+            );
+        })?;
+        let view = unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::CUBE)
+                    .format(format)
+                    .subresource_range(range),
+                None,
+            )?
+        };
+        let sampler = unsafe {
+            device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )?
+        };
+        Ok(Self {
+            image,
+            view,
+            sampler,
+            allocation: Some(allocation),
+        })
+    }
+
     /// A 2D RGBA16F lookup table with a linear, clamp-to-edge sampler.
     pub fn new_lut(
         ctx: &VulkanContext,
@@ -314,6 +551,31 @@ impl Texture {
         if let Some(a) = self.allocation.take() {
             let _ = allocator.free(a);
         }
+    }
+}
+
+/// A layout transition with a full barrier (for one-shot setup commands).
+unsafe fn transition(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    image: vk::Image,
+    range: vk::ImageSubresourceRange,
+    (old, new): (vk::ImageLayout, vk::ImageLayout),
+) {
+    let barrier = [vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .src_access_mask(vk::AccessFlags2::MEMORY_WRITE)
+        .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+        .dst_access_mask(vk::AccessFlags2::MEMORY_READ | vk::AccessFlags2::MEMORY_WRITE)
+        .old_layout(old)
+        .new_layout(new)
+        .image(image)
+        .subresource_range(range)];
+    unsafe {
+        device.cmd_pipeline_barrier2(
+            cmd,
+            &vk::DependencyInfo::default().image_memory_barriers(&barrier),
+        );
     }
 }
 

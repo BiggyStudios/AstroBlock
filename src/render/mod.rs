@@ -15,10 +15,13 @@
 mod arena;
 pub mod atmosphere;
 mod buffer;
+pub mod camera;
+mod cloud_noise;
 mod context;
 pub mod font;
 mod frustum;
 mod mesh;
+pub mod models;
 mod particles;
 mod pipeline;
 mod starfield;
@@ -43,7 +46,7 @@ use gpu_allocator::{
 };
 use winit::window::Window;
 
-use crate::camera::Camera;
+use crate::render::camera::Camera;
 use arena::{ArenaAlloc, StagingRing, VertexArena};
 use atmosphere::{Atmosphere, AtmosphereLuts};
 use buffer::Buffer;
@@ -61,7 +64,7 @@ use swapchain::{
 use texture::Texture;
 
 pub use mesh::{BlockVertex, ChunkMesh, DrawItem, Fade, MeshHandle, UiVertex};
-pub use particles::{Emitter as ParticleEmitter, flags as particle_flags};
+pub use particles::{Emitter as ParticleEmitter, ROOF_CELLS, RoofMap, flags as particle_flags};
 pub use texture::TextureArrayData;
 
 /// How many frames the CPU may record ahead of the GPU.
@@ -69,6 +72,8 @@ const FRAMES_IN_FLIGHT: usize = 2;
 /// Every mesh is a list of quads, so a single shared index buffer
 /// (0,1,2, 0,2,3, 4,5,6, 4,6,7, ...) serves all of them.
 const MAX_QUADS_PER_DRAW: u32 = 1 << 17;
+/// Clouds are rendered at 1 / this of the screen's resolution in each direction.
+const CLOUD_DIVISOR: u32 = 2;
 /// Overlay vertices per frame (4 per quad).
 const MAX_UI_VERTICES: usize = 1 << 16;
 
@@ -106,6 +111,33 @@ pub struct FrameParams {
     pub gravity: f32,
     pub wind: Vec3,
     pub particle_dt: f32,
+    /// Clouds, tornadoes and the roof over weather particles.
+    pub clouds: CloudParams,
+    /// Tornadoes for the particles: where (absolute) and their core radius (0 = none).
+    pub vortices: [(DVec3, f32); 3],
+    pub roof: Option<RoofMap>,
+}
+
+/// What the cloud pass needs each frame (see `shaders/atmosphere.glsl`).
+pub struct CloudParams {
+    /// Active frame axes -> home's body frame.
+    pub rotation: Mat3,
+    /// Cloud base above sea level, and the thickness of the shell (m).
+    pub base: f32,
+    pub thickness: f32,
+    /// How far the cloud noise has been carried by the wind (m).
+    pub offset: Vec3,
+    /// Lightning: camera-relative position (m) and intensity.
+    pub flashes: [Vec4; 2],
+    /// Funnels: foot, camera-relative (m), and core radius (0 = none).
+    pub tornadoes: [Vec4; 3],
+    /// Erupting volcanoes: vent, camera-relative (m), and how hard (0 = none); the wind
+    /// there (m/s) and how long ago it began (s).
+    pub plumes: [Vec4; 2],
+    pub plume_wind: [Vec4; 2],
+    /// Lightning's light on the ground, and the northern lights' strength.
+    pub flash_light: f32,
+    pub aurora: f32,
 }
 
 /// The targeted block, for the outline drawn by `block.frag`.
@@ -133,6 +165,15 @@ struct FrameUniforms {
     cave: Vec4,
     target: Mat4,
     target_info: Vec4,
+    weather_rotation: Mat4,
+    prev_view_proj: Mat4,
+    prev_offset: Vec4,
+    clouds: Vec4,
+    cloud_offset: Vec4,
+    flashes: [Vec4; 2],
+    tornadoes: [Vec4; 3],
+    plumes: [Vec4; 2],
+    plume_wind: [Vec4; 2],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -182,6 +223,20 @@ pub struct Renderer {
     ui_buffers: Vec<Buffer>,
     /// GPU particles (see `particles`).
     particles: Particles,
+    /// The two weather maps (cube maps, see `shaders/weather.glsl`) and the cloud noise.
+    weather_maps: [Texture; 2],
+    cloud_noise: [Texture; 2],
+    /// Half-resolution cloud targets: this frame's raw march, and its accumulated result.
+    /// The accumulated ones alternate: frame slot `i` writes `clouds_history[i]`.
+    clouds_raw: ColorTarget,
+    clouds_history: [ColorTarget; FRAMES_IN_FLIGHT],
+    /// The accumulated targets don't hold anything yet (first frame, after a resize).
+    clouds_fresh: bool,
+    frame_number: u32,
+    prev_view_proj: Mat4,
+    prev_camera: DVec3,
+    /// Staging offset of a weather map update waiting to be copied.
+    pending_weather: Option<vk::DeviceSize>,
 
     frames: Vec<Frame>,
     /// Vertex blocks to free once the matching frame slot's fence has signalled.
@@ -197,6 +252,7 @@ pub struct Renderer {
     free_mesh_slots: Vec<usize>,
     pending_uploads: Vec<PendingUpload>,
     needs_resize: bool,
+    vsync: bool,
     capture_request: Option<PathBuf>,
 
     // Declared last so it's dropped after the Vulkan surface is destroyed.
@@ -209,6 +265,7 @@ impl Renderer {
         textures: &TextureArrayData,
         atmosphere: &Atmosphere,
         atmosphere_luts: &AtmosphereLuts,
+        vsync: bool,
     ) -> Result<Self> {
         let ctx = VulkanContext::new(&window)?;
         let device = &ctx.device;
@@ -222,7 +279,7 @@ impl Renderer {
             allocation_sizes: Default::default(),
         })?;
 
-        let swapchain = Swapchain::new(&ctx, window.inner_size(), vk::SwapchainKHR::null())?;
+        let swapchain = Swapchain::new(&ctx, window.inner_size(), vk::SwapchainKHR::null(), vsync)?;
         let depth = DepthBuffer::new(device, &mut allocator, swapchain.extent)?;
         let hdr = ColorTarget::new(device, &mut allocator, swapchain.extent)?;
         let pipelines = Pipelines::new(device, ColorTarget::FORMAT, swapchain.format)?;
@@ -293,6 +350,26 @@ impl Renderer {
             })
             .collect::<Result<Vec<_>>>()?;
         let particles = Particles::new(device, &mut allocator, FRAMES_IN_FLIGHT)?;
+        let cube = |allocator: &mut Allocator, name| {
+            Texture::new_cube(&ctx, allocator, upload_pool, crate::weather::MAP_SIZE, name)
+        };
+        let weather_maps = [
+            cube(&mut allocator, "weather map a")?,
+            cube(&mut allocator, "weather map b")?,
+        ];
+        let volume = |allocator: &mut Allocator, v: cloud_noise::Volume, name| {
+            Texture::new_3d(&ctx, allocator, upload_pool, v.size, &v.levels, name)
+        };
+        let cloud_noise = [
+            volume(&mut allocator, cloud_noise::shape(), "cloud shape")?,
+            volume(&mut allocator, cloud_noise::detail(), "cloud detail")?,
+        ];
+        let clouds_size = cloud_extent(swapchain.extent);
+        let clouds_raw = ColorTarget::new(device, &mut allocator, clouds_size)?;
+        let clouds_history = [
+            ColorTarget::new(device, &mut allocator, clouds_size)?,
+            ColorTarget::new(device, &mut allocator, clouds_size)?,
+        ];
         let (descriptor_pool, descriptor_sets) = create_descriptors(device, &pipelines)?;
         let quad_indices = create_quad_index_buffer(&ctx, &mut allocator, upload_pool)?;
 
@@ -344,6 +421,15 @@ impl Renderer {
             font,
             ui_buffers,
             particles,
+            weather_maps,
+            cloud_noise,
+            clouds_raw,
+            clouds_history,
+            clouds_fresh: true,
+            frame_number: 0,
+            prev_view_proj: Mat4::IDENTITY,
+            prev_camera: DVec3::ZERO,
+            pending_weather: None,
             frames,
             garbage: (0..FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect(),
             frame_index: 0,
@@ -355,6 +441,7 @@ impl Renderer {
             free_mesh_slots: Vec::new(),
             pending_uploads: Vec::new(),
             needs_resize: false,
+            vsync,
             capture_request: None,
             window,
         };
@@ -390,6 +477,12 @@ impl Renderer {
             (7, image(self.hdr.view, read_only)),
             (9, image(self.luts[3].view, read_only)),
             (10, image(self.font.view, read_only)),
+            (13, image(self.weather_maps[0].view, read_only)),
+            (14, image(self.weather_maps[1].view, read_only)),
+            (15, image(self.cloud_noise[0].view, read_only)),
+            (16, image(self.cloud_noise[1].view, read_only)),
+            (17, image(self.clouds_raw.view, read_only)),
+            (20, sampler(self.cloud_noise[0].sampler)),
             (
                 8,
                 image(self.depth.view, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
@@ -400,12 +493,19 @@ impl Renderer {
             offset: 0,
             range: vk::WHOLE_SIZE,
         }];
-        for ((set, uniforms), batch) in self
+        for (slot, ((set, uniforms), batch)) in self
             .descriptor_sets
             .iter()
             .zip(&self.frame_uniforms)
             .zip(&self.particles.batches)
+            .enumerate()
         {
+            // Frame slot `i` writes `clouds_history[i]` and reads the other one.
+            let clouds_prev = image(
+                self.clouds_history[(slot + 1) % FRAMES_IN_FLIGHT].view,
+                read_only,
+            );
+            let clouds_now = image(self.clouds_history[slot].view, read_only);
             let buffer = [vk::DescriptorBufferInfo {
                 buffer: uniforms.handle,
                 offset: 0,
@@ -426,6 +526,20 @@ impl Renderer {
                         .image_info(info)
                 })
                 .collect();
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(18)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&clouds_prev),
+            );
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(*set)
+                    .dst_binding(19)
+                    .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                    .image_info(&clouds_now),
+            );
             writes.push(
                 vk::WriteDescriptorSet::default()
                     .dst_set(*set)
@@ -454,6 +568,24 @@ impl Renderer {
     /// Call when the window was resized; the swapchain is rebuilt before the next frame.
     pub fn resize(&mut self) {
         self.needs_resize = true;
+    }
+
+    /// Turns vsync on or off (the swapchain is rebuilt before the next frame).
+    pub fn set_vsync(&mut self, vsync: bool) {
+        if vsync != self.vsync {
+            self.vsync = vsync;
+            self.needs_resize = true;
+        }
+    }
+
+    /// Another world is about to be loaded: every mesh goes, particles vanish and the clouds
+    /// start over. Mesh handles anyone still holds become invalid.
+    pub fn forget_world(&mut self) {
+        for i in 0..self.meshes.len() {
+            self.destroy_mesh(MeshHandle(i));
+        }
+        self.particles.forget();
+        self.clouds_fresh = true;
     }
 
     /// Swapchain size in pixels.
@@ -592,10 +724,15 @@ impl Renderer {
                 dt: params.particle_dt,
                 view_proj: camera.view_projection(self.aspect_ratio()),
                 near: camera.near,
+                vortices: params.vortices,
+                roof: params.roof.clone(),
             },
         )?;
         let uniforms = self.frame_uniforms(camera, params);
         self.frame_uniforms[self.frame_index].write(0, bytemuck::bytes_of(&uniforms))?;
+        self.prev_view_proj = camera.view_projection(self.aspect_ratio());
+        self.prev_camera = camera.position;
+        self.frame_number = self.frame_number.wrapping_add(1);
         let ui_len = ui.len().min(MAX_UI_VERTICES) / 4 * 4;
         self.ui_buffers[self.frame_index].write(0, bytemuck::cast_slice(&ui[..ui_len]))?;
 
@@ -631,6 +768,7 @@ impl Renderer {
             )?;
         }
         self.record_uploads(cmd);
+        self.record_weather_upload(cmd);
         let capture = match self.capture_request.take() {
             Some(path) => {
                 let extent = self.swapchain.extent;
@@ -660,6 +798,7 @@ impl Renderer {
             capture.as_ref().map(|c| c.1.handle),
         );
         stats.gpu_wait_ms = gpu_wait_ms;
+        self.clouds_fresh = false;
         unsafe { self.ctx.device.end_command_buffer(cmd)? };
 
         let render_finished = self.swapchain.render_finished[image_index];
@@ -722,6 +861,82 @@ impl Renderer {
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
         self.staging_ready = false;
         Ok(stats)
+    }
+
+    /// Queues new weather maps (`a` and `b`, 6 faces each) for the next frame.
+    pub fn upload_weather(&mut self, a: &[u8], b: &[u8]) -> Result<()> {
+        self.prepare_staging()?;
+        if let Some(offset) = self.staging[self.frame_index].push(&[a, b])? {
+            self.pending_weather = Some(offset);
+        }
+        Ok(())
+    }
+
+    /// Copies a queued weather map update into the cube maps.
+    fn record_weather_upload(&mut self, cmd: vk::CommandBuffer) {
+        use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as P};
+        let Some(offset) = self.pending_weather.take() else {
+            return;
+        };
+        let device = &self.ctx.device;
+        let size = crate::weather::MAP_SIZE;
+        let range = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .level_count(1)
+            .layer_count(6);
+        let staging = self.staging[self.frame_index].handle();
+        for (i, map) in self.weather_maps.iter().enumerate() {
+            let to_copy = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(P::FRAGMENT_SHADER)
+                .src_access_mask(A::NONE)
+                .dst_stage_mask(P::COPY)
+                .dst_access_mask(A::TRANSFER_WRITE)
+                .old_layout(L::SHADER_READ_ONLY_OPTIMAL)
+                .new_layout(L::TRANSFER_DST_OPTIMAL)
+                .image(map.image)
+                .subresource_range(range)];
+            let region = vk::BufferImageCopy {
+                buffer_offset: offset + (i * crate::weather::MAP_BYTES) as u64,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 6,
+                },
+                image_extent: vk::Extent3D {
+                    width: size,
+                    height: size,
+                    depth: 1,
+                },
+                ..Default::default()
+            };
+            let to_read = [vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(P::COPY)
+                .src_access_mask(A::TRANSFER_WRITE)
+                .dst_stage_mask(P::FRAGMENT_SHADER)
+                .dst_access_mask(A::SHADER_SAMPLED_READ)
+                .old_layout(L::TRANSFER_DST_OPTIMAL)
+                .new_layout(L::SHADER_READ_ONLY_OPTIMAL)
+                .image(map.image)
+                .subresource_range(range)];
+            unsafe {
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_copy),
+                );
+                device.cmd_copy_buffer_to_image(
+                    cmd,
+                    staging,
+                    map.image,
+                    L::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+                device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&to_read),
+                );
+            }
+        }
     }
 
     /// Copies pending mesh data into VRAM; the barrier makes it visible to vertex input.
@@ -790,6 +1005,149 @@ impl Renderer {
                 .target
                 .as_ref()
                 .map_or(Vec4::ZERO, |t| Vec4::new(1.0, t.progress, 0.0, 0.0)),
+            weather_rotation: Mat4::from_mat3(params.clouds.rotation),
+            prev_view_proj: self.prev_view_proj,
+            prev_offset: (camera.position - self.prev_camera)
+                .as_vec3()
+                .extend(if self.clouds_fresh { 0.0 } else { 1.0 }),
+            clouds: Vec4::new(
+                params.clouds.base,
+                params.clouds.thickness,
+                (self.frame_number % 4096) as f32,
+                params.clouds.flash_light,
+            ),
+            cloud_offset: params.clouds.offset.extend(params.clouds.aurora),
+            flashes: params.clouds.flashes,
+            tornadoes: params.clouds.tornadoes,
+            plumes: params.clouds.plumes,
+            plume_wind: params.clouds.plume_wind,
+        }
+    }
+
+    /// The weather in the air: the raw half-resolution march, then the accumulated result
+    /// (which the sky pass reads). The caller has made depth readable.
+    fn record_clouds(&self, cmd: vk::CommandBuffer, extent: vk::Extent2D) {
+        use vk::{AccessFlags2 as A, ImageLayout as L, PipelineStageFlags2 as P};
+        let device = &self.ctx.device;
+        let size = cloud_extent(extent);
+        let current = &self.clouds_history[self.frame_index];
+        let previous = &self.clouds_history[(self.frame_index + 1) % FRAMES_IN_FLIGHT];
+        let to_attachment = |image| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(P::FRAGMENT_SHADER)
+                .src_access_mask(A::NONE)
+                .dst_stage_mask(P::COLOR_ATTACHMENT_OUTPUT)
+                .dst_access_mask(A::COLOR_ATTACHMENT_WRITE)
+                .old_layout(L::UNDEFINED)
+                .new_layout(L::COLOR_ATTACHMENT_OPTIMAL)
+                .image(image)
+                .subresource_range(color_subresource_range())
+        };
+        let to_read = |image| {
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(P::COLOR_ATTACHMENT_OUTPUT)
+                .src_access_mask(A::COLOR_ATTACHMENT_WRITE)
+                .dst_stage_mask(P::FRAGMENT_SHADER)
+                .dst_access_mask(A::SHADER_SAMPLED_READ)
+                .old_layout(L::COLOR_ATTACHMENT_OPTIMAL)
+                .new_layout(L::SHADER_READ_ONLY_OPTIMAL)
+                .image(image)
+                .subresource_range(color_subresource_range())
+        };
+        let mut before = vec![
+            to_attachment(self.clouds_raw.image),
+            to_attachment(current.image),
+        ];
+        if self.clouds_fresh {
+            // Nothing has been written to it yet; the resolve won't use it (`prev_offset.w`).
+            before.push(
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(P::TOP_OF_PIPE)
+                    .src_access_mask(A::NONE)
+                    .dst_stage_mask(P::FRAGMENT_SHADER)
+                    .dst_access_mask(A::SHADER_SAMPLED_READ)
+                    .old_layout(L::UNDEFINED)
+                    .new_layout(L::SHADER_READ_ONLY_OPTIMAL)
+                    .image(previous.image)
+                    .subresource_range(color_subresource_range()),
+            );
+        }
+        let area = vk::Rect2D {
+            offset: vk::Offset2D::default(),
+            extent: size,
+        };
+        let pass = |view, pipeline| unsafe {
+            let target = vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(L::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE);
+            device.cmd_begin_rendering(
+                cmd,
+                &vk::RenderingInfo::default()
+                    .render_area(area)
+                    .layer_count(1)
+                    .color_attachments(slice::from_ref(&target)),
+            );
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+            device.cmd_draw(cmd, 3, 1, 0, 0);
+            device.cmd_end_rendering(cmd);
+        };
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&before),
+            );
+            device.cmd_set_viewport(
+                cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: size.width as f32,
+                    height: size.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            device.cmd_set_scissor(cmd, 0, &[area]);
+        }
+        pass(self.clouds_raw.view, self.pipelines.clouds);
+        let raw_ready = [to_read(self.clouds_raw.image)];
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&raw_ready),
+            );
+        }
+        pass(current.view, self.pipelines.clouds_resolve);
+        let done = [to_read(current.image)];
+        unsafe {
+            device.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(&done),
+            );
+            // Back to the full screen for the sky and the overlay.
+            device.cmd_set_viewport(
+                cmd,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: extent.width as f32,
+                    height: extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            device.cmd_set_scissor(
+                cmd,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent,
+                }],
+            );
         }
     }
 
@@ -936,8 +1294,9 @@ impl Renderer {
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
                 .clear_value(vk::ClearValue {
+                    // Alpha 0: the sky pass reads how much particles cover the empty sky.
                     color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 1.0],
+                        float32: [0.0, 0.0, 0.0, 0.0],
                     },
                 });
             // Depth is kept: the atmosphere pass needs the distance to every pixel.
@@ -1191,6 +1550,7 @@ impl Renderer {
                 cmd,
                 &vk::DependencyInfo::default().image_memory_barriers(&to_composite),
             );
+            self.record_clouds(cmd, extent);
             let target = vk::RenderingAttachmentInfo::default()
                 .image_view(self.swapchain.views[image_index])
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1431,7 +1791,7 @@ impl Renderer {
         let device = &self.ctx.device;
         unsafe { device.device_wait_idle()? };
 
-        let new = Swapchain::new(&self.ctx, size, self.swapchain.handle)?;
+        let new = Swapchain::new(&self.ctx, size, self.swapchain.handle, self.vsync)?;
         let mut old = std::mem::replace(&mut self.swapchain, new);
         old.destroy(&self.ctx);
 
@@ -1439,6 +1799,14 @@ impl Renderer {
         self.depth = DepthBuffer::new(device, &mut self.allocator, self.swapchain.extent)?;
         self.hdr.destroy(device, &mut self.allocator);
         self.hdr = ColorTarget::new(device, &mut self.allocator, self.swapchain.extent)?;
+        let size = cloud_extent(self.swapchain.extent);
+        self.clouds_raw.destroy(device, &mut self.allocator);
+        self.clouds_raw = ColorTarget::new(device, &mut self.allocator, size)?;
+        for target in &mut self.clouds_history {
+            target.destroy(device, &mut self.allocator);
+            *target = ColorTarget::new(device, &mut self.allocator, size)?;
+        }
+        self.clouds_fresh = true;
         self.write_descriptors();
 
         self.needs_resize = false;
@@ -1463,6 +1831,13 @@ impl Drop for Renderer {
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             self.depth.destroy(device, allocator);
             self.hdr.destroy(device, allocator);
+            self.clouds_raw.destroy(device, allocator);
+            for target in &mut self.clouds_history {
+                target.destroy(device, allocator);
+            }
+            for texture in self.weather_maps.iter_mut().chain(&mut self.cloud_noise) {
+                texture.destroy(device, allocator);
+            }
             for lut in &mut self.luts {
                 lut.destroy(device, allocator);
             }
@@ -1486,6 +1861,14 @@ impl Drop for Renderer {
             // The allocator must be gone before the device is destroyed (in ctx's Drop).
             ManuallyDrop::drop(&mut self.allocator);
         }
+    }
+}
+
+/// The size of the cloud targets for a screen of `extent`.
+fn cloud_extent(extent: vk::Extent2D) -> vk::Extent2D {
+    vk::Extent2D {
+        width: (extent.width / CLOUD_DIVISOR).max(1),
+        height: (extent.height / CLOUD_DIVISOR).max(1),
     }
 }
 
