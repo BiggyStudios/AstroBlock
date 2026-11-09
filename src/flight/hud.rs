@@ -120,6 +120,8 @@ pub struct FlightInfo {
     pub sas: bool,
     pub sas_mode: SasMode,
     pub landed: bool,
+    /// Whether the wheel brake is on (None: no wheels to brake).
+    pub brake: Option<bool>,
     pub attitude: Attitude,
     /// The next maneuver: seconds until its burn should start, remaining dv, burn time.
     pub node: Option<(f64, f64, f64)>,
@@ -132,6 +134,7 @@ pub enum FlightAction {
     ToggleSas,
     Sas(SasMode),
     ToggleMap,
+    ToggleBrake,
 }
 
 pub fn draw(ui: &mut Ui, info: &FlightInfo, pointer: &mut Pointer, time: f32) -> Vec<FlightAction> {
@@ -288,6 +291,15 @@ pub fn draw(ui: &mut Ui, info: &FlightInfo, pointer: &mut Pointer, time: f32) ->
         &text,
         if hot { DANGER } else { DIM },
     );
+
+    // The wheel brake, at the foot of the temperature line.
+    if let Some(on) = info.brake {
+        let y = gy + gauge_h - ch - 3.0 * s;
+        let (clicked, _) = button(ui, pointer, hx + 5.0 * s, y, "brake", on, true);
+        if clicked {
+            actions.push(FlightAction::ToggleBrake);
+        }
+    }
 
     // Map toggle, and the keys, bottom left.
     let (clicked, _) = button(
@@ -556,4 +568,71 @@ pub fn clock(t: f64) -> String {
 
 fn until(t: Option<f64>) -> String {
     t.map_or(String::new(), |t| format!(" in {}", clock(t)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(brake: Option<bool>) -> FlightInfo {
+        FlightInfo {
+            body: Body::Planet,
+            altitude: 40.0,
+            vertical_speed: 0.0,
+            speed: 12.0,
+            surface: true,
+            apoapsis: None,
+            periapsis: (0.0, None),
+            throttle: 0.0,
+            fuel: 1.0,
+            delta_v: 0.0,
+            temperature: 290.0,
+            pressure: 0.0,
+            sas: false,
+            sas_mode: SasMode::Stability,
+            landed: false,
+            brake,
+            attitude: Attitude {
+                right: DVec3::X,
+                nose: DVec3::Y,
+                dorsal: DVec3::Z,
+                up: DVec3::Z,
+                north: DVec3::Y,
+                east: DVec3::X,
+                prograde: None,
+                normal: None,
+                radial: None,
+                maneuver: None,
+            },
+            node: None,
+            warp: 1.0,
+            time_of_day: 12.0,
+            map: false,
+        }
+    }
+
+    /// What a click does at (x, y).
+    fn click(info: &FlightInfo, (x, y): (f32, f32)) -> Vec<FlightAction> {
+        let mut ui = Ui::new(1920.0, 1080.0);
+        let mut pointer = Pointer {
+            pos: (x, y),
+            pressed: true,
+            held: true,
+            ..Default::default()
+        };
+        draw(&mut ui, info, &mut pointer, 0.0)
+    }
+
+    // At 1920x1080 a GUI pixel is 3 pixels: this follows from the layout.
+    const BRAKE: (f32, f32) = (1180.0, 990.0);
+
+    #[test]
+    fn the_brake_button_is_there_for_what_has_wheels() {
+        for on in [false, true] {
+            let actions = click(&info(Some(on)), BRAKE);
+            assert!(matches!(actions.as_slice(), [FlightAction::ToggleBrake]));
+        }
+        assert!(click(&info(None), BRAKE).is_empty(), "a rocket has none");
+        assert!(click(&info(Some(false)), (1500.0, 500.0)).is_empty());
+    }
 }

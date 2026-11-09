@@ -104,6 +104,8 @@ pub(super) struct Flight {
     controls: Controls,
     /// Controls held from the console (`steer`), for tests without a keyboard.
     held_controls: Controls,
+    /// The HUD's brake button is on (Space brakes as well, while held).
+    brake_on: bool,
     last_cursor: (f32, f32),
     /// The mouse was over flight UI last frame (the wheel then doesn't zoom).
     over_ui: bool,
@@ -149,6 +151,7 @@ impl Default for Flight {
             prediction: Vec::new(),
             controls: Controls::default(),
             held_controls: Controls::default(),
+            brake_on: false,
             last_cursor: (0.0, 0.0),
             over_ui: false,
             engine_timer: 0.0,
@@ -378,6 +381,8 @@ impl Game {
         }
 
         let Some(i) = self.flight.boarded else {
+            // (It belongs to the seat, not to the next vehicle sat in.)
+            self.flight.brake_on = false;
             return;
         };
         let held = |k: KeyCode| self.input.held(k) as i32 as f64;
@@ -386,7 +391,7 @@ impl Game {
             yaw: held(KeyCode::KeyD) - held(KeyCode::KeyA),
             roll: held(KeyCode::KeyE) - held(KeyCode::KeyQ),
             drive: held(KeyCode::KeyW) - held(KeyCode::KeyS),
-            brake: self.input.held(KeyCode::Space),
+            brake: self.input.held(KeyCode::Space) || self.flight.brake_on,
         };
         let console = self.flight.held_controls;
         let controls = &mut self.flight.controls;
@@ -1191,6 +1196,7 @@ impl Game {
                         v.sas_mode = mode;
                     }
                     FlightAction::ToggleMap => self.toggle_map(),
+                    FlightAction::ToggleBrake => self.flight.brake_on = !self.flight.brake_on,
                 }
             }
         }
@@ -1243,6 +1249,11 @@ impl Game {
             sas: v.sas,
             sas_mode: v.sas_mode,
             landed: v.landed.is_some(),
+            brake: v
+                .craft
+                .as_ref()
+                .filter(|c| !c.stats.wheels.is_empty())
+                .map(|_| self.flight.controls.brake),
             attitude: Attitude {
                 right: v.right(),
                 nose: v.nose(),
@@ -1439,12 +1450,19 @@ impl Game {
             }
             "transfer" => self.plan_transfer(),
             "map" => self.toggle_map(),
-            "throttle" | "sas" | "node" | "chase" | "dive" | "fuel" | "steer" => {
+            "throttle" | "sas" | "node" | "chase" | "dive" | "fuel" | "steer" | "brake" => {
                 let Some(i) = self.flight.boarded else {
                     self.console.print("Not in a rocket");
                     return true;
                 };
                 match command {
+                    "brake" => {
+                        self.flight.brake_on = match args.first().copied() {
+                            Some("on") => true,
+                            Some("off") => false,
+                            _ => !self.flight.brake_on,
+                        };
+                    }
                     "steer" => {
                         // steer <pitch> <yaw> <roll> <drive>: holds those controls.
                         self.flight.held_controls = Controls {
