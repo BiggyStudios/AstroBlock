@@ -289,6 +289,8 @@ pub struct Survival {
     pub attack: (f32, f32),
     /// What the crosshair is on (a block or an animal), for the HUD.
     pub target_name: Option<String>,
+    /// Waiting to respawn: can't be hurt and picks nothing up (not even what just fell here).
+    pub dead: bool,
     /// Gestures so far, for the first-person view: swings (hits, swings at nothing,
     /// creative breaks) and uses (placing, opening, putting on). Mining shows as `mining`.
     pub swings: u32,
@@ -345,6 +347,7 @@ impl Default for Survival {
             action_cooldown: 0.0,
             attack: (0.0, 0.25),
             target_name: None,
+            dead: false,
             swings: 0,
             uses: 0,
             catalog: Item::all(),
@@ -928,6 +931,9 @@ impl Survival {
         support: BlockCell,
         pose: &Pose,
     ) -> bool {
+        if block.is_vehicle_part() {
+            return false; // they go on vehicles: `Game::craft_clicks`
+        }
         let planet = world.planet;
         let center = interact::cell_center(planet, cell);
         let mut state = ModelState {
@@ -1312,7 +1318,7 @@ impl Survival {
             let gone = drop.age > drops::LIFETIME && self.net != NetSide::Client;
             let near = (drop.position - center).length() < drops::PICKUP_RADIUS;
             drop.asked -= dt as f32;
-            if near && drop.pickup_delay <= 0.0 && mode != GameMode::Spectator {
+            if near && drop.pickup_delay <= 0.0 && mode != GameMode::Spectator && !self.dead {
                 if self.net == NetSide::Client {
                     // The host decides who gets it.
                     if drop.asked <= 0.0 {
@@ -1438,6 +1444,9 @@ impl Survival {
     /// Takes damage; returns true if the player died. Armor softens attacks (Minecraft's
     /// formula) but not falls or starvation (`bypass_armor`).
     pub fn hurt(&mut self, amount: f32, bypass_armor: bool, at: DVec3) -> bool {
+        if self.dead {
+            return false;
+        }
         let mut amount = amount;
         if !bypass_armor {
             let points = self.armor_points() as f32;

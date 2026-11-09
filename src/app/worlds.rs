@@ -99,9 +99,10 @@ impl Game {
 
     /// Loads the world of the body the player's craft is at.
     pub(super) fn follow_craft_world(&mut self) {
-        let body = match (self.flight.boarded, &self.flight.eva) {
-            (Some(i), _) => Some(self.flight.vessels[i].body),
-            (None, Some(eva)) => Some(eva.body),
+        let body = match (self.flight.boarded, &self.flight.eva, &self.flight.aboard) {
+            (Some(i), _, _) => Some(self.flight.vessels[i].body),
+            (None, Some(eva), _) => Some(eva.body),
+            (None, None, Some(a)) => Some(self.flight.vessels[a.vessel].body),
             _ => None,
         };
         if let Some(body @ (Body::Planet | Body::Moon)) = body {

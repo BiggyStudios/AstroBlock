@@ -470,6 +470,9 @@ pub fn mining(block: Block) -> Mining {
         GoldOre | DiamondOre | UraniumOre => m(3.0, Some(Pickaxe), Some(2)),
         Mantle => m(4.5, Some(Pickaxe), Some(2)),
         OuterCore | InnerCore => m(10.0, Some(Pickaxe), Some(3)),
+        Wing | Flap | Seat => m(0.5, None, None),
+        Hull | FuelTank | Wheel | LandingGear | Propeller => m(0.8, None, None),
+        VehicleCore | JetEngine | RocketEngine | OrbitalEngine | Gyro => m(1.2, None, None),
     }
 }
 

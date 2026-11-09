@@ -209,7 +209,7 @@ fn torch() -> ModelBox {
 type BoxFace<'a> = ([[f32; 3]; 4], Tex, &'a dyn Fn([f32; 3]) -> [f32; 2]);
 
 /// A face as 4 corners (model units, counter-clockwise seen from outside) with texel uvs.
-pub(crate) struct Quad {
+pub struct Quad {
     pub corners: [[f32; 3]; 4],
     pub uv: [[f32; 2]; 4],
     pub tex: Tex,
@@ -290,7 +290,7 @@ pub(crate) fn pitch(p: [f32; 3], pivot: [f32; 2], angle: f32) -> [f32; 3] {
 
 /// Turns quads into mesh vertices. `place` maps model units to planet-relative meters;
 /// positions are stored relative to `origin`.
-pub(crate) fn build(
+pub fn build(
     quads: &[Quad],
     place: impl Fn([f32; 3]) -> DVec3,
     origin: DVec3,

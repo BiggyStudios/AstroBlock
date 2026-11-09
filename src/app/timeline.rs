@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use glam::{DQuat, DVec3};
 
-use super::{Game, WARP_LEVELS, multiplayer::Remote};
+use super::{Game, MAX_PHYSICS_WARP, WARP_LEVELS, multiplayer::Remote};
 use crate::{
     flight::vessel::{self, Vessel},
     net::protocol::{Msg, PlayerId, VesselState},
@@ -43,6 +43,10 @@ pub(super) struct Follow {
     pub player: PlayerId,
     /// Only until they stop warping (a sync, or just having joined).
     pub once: bool,
+    /// Because of being aboard their vehicle: it ends when you get off.
+    pub ride: bool,
+    /// Because they are on your team and last changed the warp.
+    pub team: bool,
 }
 
 /// Fits the time step to reach another clock over a few seconds, by running a little fast or
@@ -128,7 +132,7 @@ impl Game {
         let Some(follow) = self.net.follow.take() else {
             return;
         };
-        if !follow.once {
+        if !follow.once && !follow.ride && !follow.team {
             let name = self.player_called(follow.player);
             self.message = Some((format!("no longer following {name}"), Instant::now()));
         }
@@ -168,6 +172,8 @@ impl Game {
         self.net.follow = (stay || rate > 1.0).then_some(Follow {
             player: id,
             once: !stay,
+            ride: false,
+            team: false,
         });
         self.warp = if self.net.follow.is_some() {
             level_for(rate)
@@ -278,6 +284,8 @@ impl Game {
     /// Each frame: stays with the clock this player is attached to.
     pub(super) fn keep_time(&mut self) {
         self.net.clock_error = 0.0;
+        self.keep_ride();
+        self.keep_team();
         let following = self.net.follow;
         if let Some(f) = following
             && !self.net.players.contains_key(&f.player)
@@ -317,6 +325,193 @@ impl Game {
             && (time - self.time).abs() < 1.0
         {
             self.net.follow = None;
+        }
+    }
+
+    /// Aboard someone else's vehicle, their warp is yours; off it, that ends.
+    fn keep_ride(&mut self) {
+        let pilot = self
+            .flight
+            .aboard
+            .as_ref()
+            .and_then(|a| self.flight.vessels[a.vessel].pilot)
+            .filter(|p| *p != self.net.me);
+        match (pilot, self.net.follow) {
+            (Some(player), follow) if follow.is_none_or(|f| f.player != player || !f.ride) => {
+                self.net.follow = Some(Follow {
+                    player,
+                    once: false,
+                    ride: true,
+                    team: false,
+                });
+            }
+            (None, Some(f)) if f.ride => {
+                self.net.follow = None;
+                self.warp = 0;
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the warp keys are someone else's to use right now.
+    pub(super) fn warp_is_someone_elses(&mut self) -> bool {
+        let Some(f) = self.net.follow.filter(|f| f.ride) else {
+            return false;
+        };
+        let name = self.player_called(f.player);
+        self.message = Some((format!("{name} is flying: warp is theirs"), Instant::now()));
+        true
+    }
+
+    // ---- Teams ----------------------------------------------------------------------------
+
+    /// Whether `id` is on this player's team.
+    pub(super) fn on_my_team(&self, id: PlayerId) -> bool {
+        self.net.team.is_some()
+            && self
+                .net
+                .players
+                .get(&id)
+                .is_some_and(|r| r.team == self.net.team)
+    }
+
+    /// Joins someone's team (it starts with them, if they have none), and goes to their time.
+    pub(super) fn join_team(&mut self, id: PlayerId) {
+        let Some(remote) = self.net.players.get(&id) else {
+            return;
+        };
+        let team = remote.team.unwrap_or(id);
+        let name = remote.name.clone();
+        self.net.team = Some(team);
+        let me = self.net.me;
+        self.send_everyone(
+            &Msg::Team {
+                who: me,
+                team: Some(team),
+            },
+            true,
+        );
+        // If this starts their team, they are on it too.
+        if let Some(remote) = self.net.players.get_mut(&id) {
+            remote.team = Some(team);
+        }
+        self.time_sync(id, true);
+        if let Some(f) = &mut self.net.follow {
+            f.team = true;
+        }
+        let text = format!("on {name}'s team: you warp together");
+        self.console.print(text.clone());
+        self.message = Some((text, Instant::now()));
+    }
+
+    pub(super) fn leave_team(&mut self) {
+        if self.net.team.take().is_none() {
+            return;
+        }
+        if self.net.follow.is_some_and(|f| f.team) {
+            self.net.follow = None;
+            self.warp = 0;
+        }
+        let me = self.net.me;
+        self.send_everyone(
+            &Msg::Team {
+                who: me,
+                team: None,
+            },
+            true,
+        );
+        self.console.print("left the team");
+        self.message = Some(("left the team".to_string(), Instant::now()));
+    }
+
+    /// News: `who` has joined a team or left one.
+    pub(super) fn got_team(&mut self, who: PlayerId, team: Option<PlayerId>) {
+        let me = self.net.me;
+        if who == me {
+            return;
+        }
+        if let Some(remote) = self.net.players.get_mut(&who) {
+            remote.team = team;
+        }
+        // Someone has joined me, and I had no team yet: it is mine now.
+        if team == Some(me) && self.net.team.is_none() {
+            self.net.team = Some(me);
+            self.send_everyone(
+                &Msg::Team {
+                    who: me,
+                    team: Some(me),
+                },
+                true,
+            );
+            let name = self.player_called(who);
+            let text = format!("{name} joined your team: you warp together");
+            self.console.print(text.clone());
+            self.message = Some((text, Instant::now()));
+        }
+        if self.net.follow.is_some_and(|f| f.team && f.player == who) && team != self.net.team {
+            self.net.follow = None;
+            self.warp = 0;
+        }
+    }
+
+    /// This player changed the warp: the team goes with them.
+    pub(super) fn tell_team_warp(&mut self) {
+        if !self.net.in_session() || self.net.team.is_none() {
+            return;
+        }
+        self.net.team_warped_at = Instant::now();
+        let msg = Msg::TeamWarp {
+            from: self.net.me,
+            level: self.warp as u8,
+        };
+        self.send_everyone(&msg, true);
+    }
+
+    /// News: a team mate changed the warp.
+    pub(super) fn got_team_warp(&mut self, from: PlayerId, level: u8) {
+        if !self.on_my_team(from) || self.net.follow.is_some_and(|f| f.ride) {
+            return;
+        }
+        // Both pressed a key at once: the lower number wins, so nobody ends up following
+        // someone who is following them.
+        let fresh = self.net.team_warped_at.elapsed().as_secs_f64() < 0.5;
+        if fresh && self.net.me < from {
+            return;
+        }
+        self.net.follow = Some(Follow {
+            player: from,
+            once: false,
+            ride: false,
+            team: true,
+        });
+        self.warp = (level as usize).min(WARP_LEVELS.len() - 1);
+        self.flight.planner.warp_to = None;
+    }
+
+    /// Whoever is setting the pace can't warp past physics speed while a team mate is flying
+    /// through air: that would tear the team's clocks apart.
+    fn keep_team(&mut self) {
+        if self.net.team.is_none() || self.net.follow.is_some() {
+            return;
+        }
+        let cap = WARP_LEVELS
+            .iter()
+            .rposition(|&l| l <= MAX_PHYSICS_WARP)
+            .unwrap_or(0);
+        if self.warp <= cap {
+            return;
+        }
+        let held_back = self
+            .net
+            .players
+            .iter()
+            .find(|(id, r)| self.on_my_team(**id) && !r.can_rail())
+            .map(|(_, r)| r.name.clone());
+        if let Some(name) = held_back {
+            self.warp = cap;
+            self.tell_team_warp();
+            let text = format!("warp held at x{MAX_PHYSICS_WARP}: {name} is in flight");
+            self.message = Some((text, Instant::now()));
         }
     }
 
@@ -442,6 +637,19 @@ impl Game {
         if !self.net.in_session() {
             return None;
         }
+        if self.net.team.is_some() {
+            let mut names: Vec<&str> = self
+                .net
+                .players
+                .iter()
+                .filter(|(id, _)| self.on_my_team(**id))
+                .map(|(_, r)| r.name.as_str())
+                .collect();
+            names.sort_unstable();
+            if !names.is_empty() {
+                return Some(format!("team: {}", names.join(", ")));
+            }
+        }
         if let Some(follow) = self.net.follow
             && !follow.once
         {
@@ -479,7 +687,11 @@ impl Game {
                         "same time".to_string()
                     },
                     rate: format!("x{}", clock.map_or(1.0, |(_, rate)| rate).round()),
-                    following: self.net.follow.is_some_and(|f| f.player == *id && !f.once),
+                    following: self
+                        .net
+                        .follow
+                        .is_some_and(|f| f.player == *id && !f.once && !f.team),
+                    team: self.on_my_team(*id),
                     apart: gap.abs() > SAME_TIME,
                 }
             })

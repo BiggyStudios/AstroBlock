@@ -13,6 +13,7 @@ use winit::{
     window::{CursorGrabMode, Fullscreen, Window, WindowId},
 };
 
+mod death;
 mod flight;
 pub mod input;
 mod lava;
@@ -20,6 +21,7 @@ mod multiplayer;
 pub mod save;
 mod session;
 mod timeline;
+mod vehicles;
 mod weather;
 mod worlds;
 
@@ -179,6 +181,8 @@ struct Game {
     was_on_ground: bool,
     /// Where the player respawns (body-frame feet position).
     spawn_feet: DVec3,
+    /// Dead, and waiting for the player to respawn.
+    death: Option<death::Death>,
     /// The block being looked at.
     target: Option<Hit>,
     last_jump_tap: Option<Instant>,
@@ -310,6 +314,7 @@ impl ApplicationHandler for App {
                         if !game.mouse_grabbed
                             && game.menu.is_none()
                             && game.survival.screen.is_none()
+                            && game.death.is_none()
                             && game.first_person() =>
                     {
                         game.set_mouse_grab(true)
@@ -708,6 +713,7 @@ impl Game {
             last_feet: feet,
             was_on_ground: false,
             spawn_feet: feet,
+            death: None,
             target: None,
             last_jump_tap: None,
             message: None,
@@ -879,13 +885,49 @@ impl Game {
         Ok(exit)
     }
 
-    fn update(&mut self, dt: f64) {
-        // Keep the camera upright relative to the planet surface below it (first person;
-        // the chase and map cameras place themselves).
-        if self.first_person() {
-            let (_, up) = self.feet_and_up();
+    /// Keeps the camera upright relative to the surface below it, or the deck under it (first
+    /// person; the chase and map cameras place themselves).
+    fn keep_view_upright(&mut self, dt: f32) {
+        if !self.first_person() {
+            return;
+        }
+        let (_, up) = self.feet_and_up();
+        if self.flight.settling_view {
+            self.flight.settling_view = !self.camera.ease_up(up.as_vec3(), dt);
+        } else {
             self.camera.set_up(up.as_vec3());
         }
+    }
+
+    /// Where the camera goes, once everything has moved.
+    fn place_camera(&mut self) {
+        // Stepping on or off a vehicle, "up" changes at once if it isn't level: the view
+        // eases over instead.
+        let aboard = self.flight.aboard.is_some();
+        if aboard != self.flight.view_aboard {
+            self.flight.view_aboard = aboard;
+            self.flight.settling_view = true;
+        }
+        if self.first_person() {
+            // The camera rides at the player's eyes.
+            let (feet, up) = self.feet_and_up();
+            let up = if self.flight.settling_view {
+                self.camera.up().as_dvec3()
+            } else {
+                up
+            };
+            self.camera.position = self.planet.center + feet + up * self.eye_height();
+        } else {
+            self.place_flight_camera();
+        }
+    }
+
+    fn update(&mut self, dt: f64) {
+        if self.death.is_some() {
+            self.update_dead(dt);
+            return;
+        }
+        self.keep_view_upright(dt as f32);
         let flying = self.flight.boarded.is_some();
 
         // Inventory screens: E opens one; while open they get the mouse and keys.
@@ -930,14 +972,21 @@ impl Game {
             self.input.pressed(KeyCode::Period),
             self.input.pressed(KeyCode::Comma),
         );
-        if faster || slower {
-            self.stop_following();
-        }
-        if faster {
-            self.warp = (self.warp + 1).min(WARP_LEVELS.len() - 1);
-        }
-        if slower {
-            self.warp = self.warp.saturating_sub(1);
+        if (faster || slower) && self.warp_is_someone_elses() {
+            // Riding with a pilot: their warp is yours.
+        } else {
+            if faster || slower {
+                self.stop_following();
+            }
+            if faster {
+                self.warp = (self.warp + 1).min(WARP_LEVELS.len() - 1);
+            }
+            if slower {
+                self.warp = self.warp.saturating_sub(1);
+            }
+            if faster || slower {
+                self.tell_team_warp();
+            }
         }
 
         // Hotbar: number keys and the scroll wheel (which sets the fly speed in spectator).
@@ -979,13 +1028,18 @@ impl Game {
         }
 
         // Double-tapping jump toggles creative flight.
-        if self.input.pressed(KeyCode::Space) && !flying {
+        let seated = self
+            .flight
+            .aboard
+            .as_ref()
+            .is_some_and(|a| a.seat.is_some());
+        if self.input.pressed(KeyCode::Space) && !flying && !seated {
             let now = Instant::now();
             if self
                 .last_jump_tap
                 .is_some_and(|t| now.duration_since(t).as_secs_f64() < DOUBLE_TAP)
             {
-                self.player.toggle_flight();
+                self.toggle_flight();
                 self.last_jump_tap = None;
             } else {
                 self.last_jump_tap = Some(now);
@@ -1002,42 +1056,58 @@ impl Game {
             self.player_input()
         };
         let start = self.time;
+        let mut on_foot = None;
         if self.flight.boarded.is_some() {
             self.fly(dt);
+        } else if self.flight.aboard.is_some() {
+            self.aboard_physics(&input, dt);
+        } else if self.flight.eva.is_some() {
+            self.float(dt);
         } else {
-            if self.flight.eva.is_some() {
-                self.float(dt);
-            } else {
-                self.walk_physics(&input, dt);
-                self.start_floating();
-            }
+            on_foot = Some(self.feet_in_grids());
+            self.walk_physics(&input, dt);
         }
         self.update_vessels(start);
         self.follow_craft_world();
+        if let Some(before) = on_foot {
+            self.meet_vehicles(&before);
+            if self.flight.aboard.is_none() {
+                self.start_floating();
+            }
+        }
+        self.place_aboard();
         let warped = self.time - start;
 
         let feet = self.player.body_position(&self.active_frame(self.time));
-        if self.first_person() {
-            // The camera rides at the player's eyes.
-            let (feet, up) = self.feet_and_up();
-            self.camera.position = self.planet.center + feet + up * EYE_HEIGHT;
-        } else {
-            self.place_flight_camera();
-        }
+        self.place_camera();
         self.update_prediction();
 
-        // Fall damage, death and respawn.
+        // Fall damage, and death.
         let fallen = std::mem::take(&mut self.player.fallen);
         if self.player.mode == GameMode::Survival {
             let g = self.gravity.acceleration(self.player.position).length() / 9.81;
             let damage = Player::fall_damage(fallen * g);
             let at = self.camera.position - self.planet.center;
             if damage > 0.0 && self.survival.hurt(damage, true, at) {
-                self.respawn();
+                self.die("you fell too far", None);
             }
         }
 
-        // Drops, furnaces, regeneration.
+        self.world_goes_on(warped);
+        if self.survival.screen.is_none() && in_screen {
+            self.close_screen();
+        }
+
+        self.interact(dt as f32);
+        if !flying {
+            self.walking(&input, feet);
+        }
+        self.survival.apply_lights(&mut self.streamer);
+        self.play_sounds();
+    }
+
+    /// Drops, furnaces, regeneration and animals, over `warped` seconds of game time.
+    fn world_goes_on(&mut self, warped: f64) {
         let pose = self.pose();
         let world = WorldVoxels {
             planet: &self.planet,
@@ -1058,16 +1128,6 @@ impl Game {
         if let Some(message) = messages.into_iter().last() {
             self.message = Some((message, Instant::now()));
         }
-        if self.survival.screen.is_none() && in_screen {
-            self.close_screen();
-        }
-
-        self.interact(dt as f32);
-        if !flying {
-            self.walking(&input, feet);
-        }
-        self.survival.apply_lights(&mut self.streamer);
-        self.play_sounds();
     }
 
     /// The player's own physics (on foot), with time warp.
@@ -1162,17 +1222,6 @@ impl Game {
         }
     }
 
-    /// Died: items drop where it happened, and the player is back at the spawn point.
-    fn respawn(&mut self) {
-        let pose = self.pose();
-        self.survival.die(&pose);
-        self.flight.eva = None;
-        self.switch_world(Body::Planet);
-        let frame = self.active_frame(self.time);
-        self.player.teleport(self.spawn_feet, &frame);
-        self.message = Some(("You died!".to_string(), Instant::now()));
-    }
-
     /// Turns the keys and the camera's heading into player controls.
     fn player_input(&self) -> PlayerInput {
         if self.survival.screen.is_some() {
@@ -1225,10 +1274,11 @@ impl Game {
 
     /// Looking at, breaking and placing blocks.
     fn interact(&mut self, dt: f32) {
-        if self.player.mode == GameMode::Spectator || !self.first_person() {
+        if self.player.mode == GameMode::Spectator || !self.first_person() || self.death.is_some() {
             self.target = None;
             self.survival.mining = None;
             self.survival.target_name = None;
+            self.flight.pointed = None;
             return;
         }
         let creative = self.player.mode == GameMode::Creative;
@@ -1240,8 +1290,10 @@ impl Game {
         let origin = self.camera.position - self.planet.center;
         let dir = self.camera.forward().as_dvec3();
         self.target = interact::raycast(&self.planet, &self.streamer, origin, dir, reach);
-        // A rocket in front of the block beats it.
+        // A rocket in front of the block beats it, and so does a vehicle.
         let rocket = self.rocket_target(reach);
+        let vehicle = self.craft_target(reach);
+        self.flight.pointed = vehicle;
         if self.survival.screen.is_some() || !self.mouse_grabbed {
             let pose = self.pose();
             self.survival.aim(&pose, reach, self.target.as_ref());
@@ -1251,15 +1303,36 @@ impl Game {
             self.survival.mining = None;
             return;
         }
-        if rocket.is_none() && self.place_rocket(self.input.button_pressed(MouseButton::Right)) {
-            return;
+        let right_click = self.input.button_pressed(MouseButton::Right);
+        if self.input.pressed(KeyCode::KeyR) {
+            self.turn_part();
+        }
+        if rocket.is_none() && vehicle.is_none() {
+            if self.place_rocket(right_click) || self.place_core(right_click) {
+                return;
+            }
+            let holding_part = self
+                .survival
+                .held()
+                .and_then(|s| s.item.block())
+                .is_some_and(|b| b.is_vehicle_part());
+            if holding_part
+                && right_click
+                && self.target.as_ref().is_some_and(|h| !h.block.is_model())
+            {
+                self.message = Some((
+                    "This goes on a vehicle: place a vehicle core first".to_string(),
+                    Instant::now(),
+                ));
+                return;
+            }
         }
         let pose = self.pose();
         let mut world = survival::World {
             planet: &self.planet,
             streamer: &mut self.streamer,
         };
-        let target = if rocket.is_some() {
+        let target = if rocket.is_some() || vehicle.is_some() {
             None
         } else {
             self.target.as_ref()
@@ -1279,6 +1352,10 @@ impl Game {
         if let Some(i) = rocket {
             self.survival.target_name = Some("rocket".to_string());
             self.rocket_clicks(i);
+        } else if let Some(hit) = vehicle {
+            self.craft_clicks(hit, dt);
+        } else {
+            self.flight.digging = None;
         }
     }
 
@@ -1389,12 +1466,14 @@ impl Game {
                 None => self.console.print("Usage: time <hours>"),
             },
             "warp" => match number(0) {
+                Some(_) if self.warp_is_someone_elses() => {}
                 Some(w) => {
                     self.stop_following();
                     self.warp = WARP_LEVELS
                         .iter()
                         .rposition(|&l| l <= w.max(1.0))
                         .unwrap_or(0);
+                    self.tell_team_warp();
                     self.console
                         .print(format!("Time warp x{}", WARP_LEVELS[self.warp]));
                 }
@@ -1418,6 +1497,8 @@ impl Game {
                 }
                 None => self.console.print("Not looking at a block"),
             },
+            "break" if self.console_vehicle_click(false) => {}
+            "place" if self.console_vehicle_click(true) => {}
             "break" => match self.target.as_ref().map(|h| (h.cell, h.block)) {
                 Some((cell, block)) => {
                     let creative = self.player.mode == GameMode::Creative;
@@ -1529,8 +1610,17 @@ impl Game {
                 _ => self.console.print("Usage: select <1-9>"),
             },
             "kill" => {
-                self.respawn();
+                self.die("struck down from the console", None);
                 self.console.print("Killed the player");
+            }
+            "respawn" => {
+                self.respawn();
+                self.console.print("Back at the spawn point");
+            }
+            "fly" => {
+                self.toggle_flight();
+                self.console
+                    .print(format!("Flying: {}", self.player.flying));
             }
             "rain" => {
                 self.rain = match (number(0), self.rain) {
@@ -1560,7 +1650,7 @@ impl Game {
                 Some(n) => {
                     let at = self.camera.position - self.planet.center;
                     if self.survival.hurt(n as f32, true, at) {
-                        self.respawn();
+                        self.die("struck down from the console", None);
                     }
                 }
                 None => self.console.print("Usage: hurt <amount>"),
@@ -1647,7 +1737,8 @@ impl Game {
             sky,
             block: cell.map_or(0, |c| self.streamer.light(c)) as u32,
         };
-        let visible = self.player.mode != GameMode::Spectator && self.first_person();
+        let visible =
+            self.player.mode != GameMode::Spectator && self.first_person() && self.death.is_none();
         self.view_model.draw(
             &mut self.renderer,
             self.camera.position,
@@ -1740,7 +1831,7 @@ impl Game {
                 .map(|(m, t)| (m.as_str(), t.elapsed().as_secs_f32())),
             console: &self.console,
             screen_open: self.survival.screen.is_some(),
-            flight: !self.first_person(),
+            flight: !self.first_person() || self.death.is_some(),
             weather: self.weather_line(),
             together: self.together_line(),
         };
@@ -1748,6 +1839,7 @@ impl Game {
         hud::draw(&mut ui, &info, &mut self.hud_anim, dt);
         self.survival
             .draw_screen(&mut ui, self.input.cursor, &mut self.screen_anim, dt);
+        self.draw_death(&mut ui);
         self.draw_menu(&mut ui, dt);
         ui
     }
@@ -1903,6 +1995,8 @@ impl Game {
     }
 
     fn set_mouse_grab(&mut self, grab: bool) {
+        // (The death screen needs the cursor, whatever else is going on.)
+        let grab = grab && self.death.is_none();
         if grab == self.mouse_grabbed {
             return;
         }

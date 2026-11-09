@@ -31,6 +31,7 @@
 
 use glam::{DMat3, DQuat, DVec3};
 
+use super::craft::{At, Craft, Part};
 use crate::{
     player::{self, Voxels},
     render::MeshHandle,
@@ -54,13 +55,15 @@ pub const THRUST: f64 = 37_000.0;
 /// to the moon and back about 600, so it leaves little to spare.
 pub const EXHAUST_SPEED: f64 = 6_100.0;
 /// Seconds to fill an empty tank, landed on the home planet.
-const REFUEL_TIME: f64 = 20.0;
+pub(super) const REFUEL_TIME: f64 = 20.0;
 /// From the engine bell to the nose tip (m), and the centre of mass above the bell.
 pub const HEIGHT: f64 = 8.0;
 pub const COM_HEIGHT: f64 = 3.0;
 /// Collision box: half width, and height from the bell up (the fins and tank bottom).
 const BOX: (f64, f64) = (1.0, 4.0);
 const STEP: f64 = 1.0 / 120.0;
+/// Vehicles built from blocks have stiffer contacts (wheels on springs).
+const CRAFT_STEP: f64 = 1.0 / 240.0;
 /// Reaction wheels: angular acceleration (rad/s^2) and the fastest SAS turn (rad/s).
 const WHEEL_ACCEL: f64 = 1.5;
 const MAX_TURN_RATE: f64 = 1.0;
@@ -79,7 +82,10 @@ const AERO_TORQUE: f64 = 2.5e-5;
 const AERO_DAMPING: f64 = 1.5e-5;
 /// Hull heating. The flux constant is gameplay-tuned: speeds here are a tenth of Earth's,
 /// so the real constant would give no heating at all.
-const HEAT_FLUX: f64 = 0.05;
+pub(super) const HEAT_FLUX: f64 = 0.05;
+/// The mass (kg) the heating numbers were tuned for: a vehicle of another mass heats up that
+/// much slower or faster.
+pub(super) const HEAT_REFERENCE_MASS: f64 = 3_000.0;
 const HEATED_AREA: f64 = 3.0;
 const RADIATING_AREA: f64 = 40.0;
 const EMISSIVITY: f64 = 0.8;
@@ -137,10 +143,13 @@ pub struct Controls {
     pub pitch: f64,
     pub yaw: f64,
     pub roll: f64,
+    /// Driven wheels: forwards (1) or backwards (-1).
+    pub drive: f64,
+    pub brake: bool,
 }
 
 impl Controls {
-    fn any(&self) -> bool {
+    pub(super) fn any(&self) -> bool {
         self.pitch != 0.0 || self.yaw != 0.0 || self.roll != 0.0
     }
 }
@@ -209,7 +218,7 @@ pub struct Vessel {
     pub sas: bool,
     pub sas_mode: SasMode,
     /// The attitude stability mode holds (captured when steering stops).
-    hold: Option<DQuat>,
+    pub(super) hold: Option<DQuat>,
     pub landed: Option<Landed>,
     /// Hull temperature (K), and the heat flux on it now (W/m^2).
     pub temperature: f64,
@@ -224,6 +233,24 @@ pub struct Vessel {
     pub burned: DVec3,
     #[serde(skip)]
     pub mesh: Option<MeshHandle>,
+    /// What it is built from; none for the plain test rocket.
+    #[serde(default)]
+    pub craft: Option<Box<Craft>>,
+    /// The `Craft::version` the mesh was built from.
+    #[serde(skip)]
+    pub mesh_version: u32,
+    /// How long it has sat still on the ground (s).
+    #[serde(skip)]
+    pub(super) still: f64,
+    /// Something touched the ground in the last step.
+    #[serde(skip)]
+    pub touching: bool,
+    /// Parts being broken off in this step.
+    #[serde(skip)]
+    pub(super) breaking: Vec<At>,
+    /// What has come off since the game last looked.
+    #[serde(skip)]
+    pub broke_off: Vec<Part>,
 }
 
 impl Vessel {
@@ -259,28 +286,137 @@ impl Vessel {
             destroyed: None,
             burned: DVec3::ZERO,
             mesh: None,
+            craft: None,
+            mesh_version: 0,
+            still: 0.0,
+            touching: false,
+            breaking: Vec::new(),
+            broke_off: Vec::new(),
         };
         vessel.sync_landed(bodies, t);
         vessel
     }
 
+    /// A vehicle resting with its core at `core` (the body's frame), grid axes turned by
+    /// `rotation` (grid to body frame). It starts with full tanks.
+    pub fn built(
+        bodies: &Bodies,
+        body: Body,
+        core: DVec3,
+        rotation: DQuat,
+        t: f64,
+        craft: Craft,
+    ) -> Self {
+        let mut vessel = Self::on_pad(bodies, body, core, t);
+        let com = craft.massing(craft.stats.capacity).com;
+        vessel.fuel = craft.stats.capacity;
+        vessel.landed = Some(Landed {
+            position: core + rotation * com,
+            attitude: rotation.normalize(),
+        });
+        vessel.craft = Some(Box::new(craft));
+        vessel.sync_landed(bodies, t);
+        vessel
+    }
+
+    /// Fuel when full (kg).
+    pub fn fuel_capacity(&self) -> f64 {
+        self.craft
+            .as_ref()
+            .map_or(FUEL_CAPACITY, |c| c.stats.capacity)
+    }
+
+    /// Grid coordinates of the centre of mass (zero for the plain rocket).
+    pub fn com(&self) -> DVec3 {
+        self.craft
+            .as_ref()
+            .map_or(DVec3::ZERO, |c| c.massing(self.fuel).com)
+    }
+
+    /// A point of the vehicle's grid, relative to `body`, inertial axes.
+    pub fn grid_to_inertial(&self, p: DVec3) -> DVec3 {
+        self.position + self.attitude * (p - self.com())
+    }
+
+    /// The velocity of a point of its grid (inertial).
+    pub fn point_velocity(&self, p: DVec3) -> DVec3 {
+        self.velocity + self.spin.cross(self.attitude * (p - self.com()))
+    }
+
+    /// Changes its parts, keeping every part where it is in the world (the centre of mass
+    /// moves, and the state follows it).
+    pub fn rebuild_craft(&mut self, change: impl FnOnce(&mut Craft)) {
+        let Some(mut craft) = self.craft.take() else {
+            return;
+        };
+        let before = craft.massing(self.fuel).com;
+        change(&mut craft);
+        self.fuel = self.fuel.min(craft.stats.capacity);
+        let shift = craft.massing(self.fuel).com - before;
+        self.position += self.attitude * shift;
+        if let Some(l) = &mut self.landed {
+            l.position += l.attitude * shift;
+        }
+        self.craft = Some(craft);
+    }
+
+    /// Knocks a part off in a collision (with whatever only it held on).
+    pub(super) fn break_part(&mut self, at: At) {
+        let mut removed = crate::flight::craft::Removed::default();
+        self.rebuild_craft(|c| removed = c.remove(at));
+        if removed.core_gone {
+            self.destroyed = Some("crashed");
+        }
+        self.broke_off.extend(removed.parts);
+    }
+
     /// Mass right now (kg).
     pub fn mass(&self) -> f64 {
-        DRY_MASS + self.fuel
+        match &self.craft {
+            Some(c) => c.massing(self.fuel).mass,
+            None => DRY_MASS + self.fuel,
+        }
     }
 
     /// What the engine can do at full throttle right now (m/s^2).
     pub fn acceleration(&self) -> f64 {
-        THRUST / self.mass()
+        match &self.craft {
+            Some(c) => c.stats.engines.iter().map(|e| e.kind.thrust).sum::<f64>() / self.mass(),
+            None => THRUST / self.mass(),
+        }
     }
 
     /// How much velocity the fuel left can still add (m/s).
     pub fn delta_v(&self) -> f64 {
-        EXHAUST_SPEED * (self.mass() / DRY_MASS).ln()
+        let Some(c) = &self.craft else {
+            return EXHAUST_SPEED * (self.mass() / DRY_MASS).ln();
+        };
+        // All engines running: what they burn together sets the exhaust speed.
+        let thrust: f64 = c.stats.engines.iter().map(|e| e.kind.thrust).sum();
+        let burn: f64 = c
+            .stats
+            .engines
+            .iter()
+            .map(|e| e.kind.thrust / e.kind.exhaust)
+            .sum();
+        if burn <= 0.0 {
+            return 0.0;
+        }
+        (thrust / burn) * (self.mass() / c.stats.dry_mass).ln()
     }
 
     pub fn nose(&self) -> DVec3 {
-        self.attitude * DVec3::Y
+        self.attitude * self.craft.as_ref().map_or(DVec3::Y, |c| c.stats.forward)
+    }
+
+    /// To the pilot's right (unit, inertial).
+    pub fn right(&self) -> DVec3 {
+        self.attitude * self.craft.as_ref().map_or(DVec3::X, |c| c.stats.right)
+    }
+
+    /// Over the pilot's head (unit, inertial).
+    pub fn dorsal(&self) -> DVec3 {
+        self.attitude * self.craft.as_ref().map_or(DVec3::Z, |c| c.stats.up)
     }
 
     /// Updates the inertial state of a landed vessel from where it rests.
@@ -305,7 +441,7 @@ impl Vessel {
     }
 
     /// The air around it: density (kg/m^3) and the velocity relative to that air (inertial).
-    fn air(&self, bodies: &Bodies, t: f64) -> (f64, DVec3) {
+    pub(super) fn air(&self, bodies: &Bodies, t: f64) -> (f64, DVec3) {
         if self.body != Body::Planet {
             return (0.0, self.velocity);
         }
@@ -404,13 +540,22 @@ impl Vessel {
         (t0, t1): (f64, f64),
         target: Option<DVec3>,
     ) {
-        let steps = ((t1 - t0) / STEP).ceil().clamp(1.0, 1200.0) as usize;
+        let step = if self.craft.is_some() {
+            CRAFT_STEP
+        } else {
+            STEP
+        };
+        let steps = ((t1 - t0) / step).ceil().clamp(1.0, 2400.0) as usize;
         let dt = (t1 - t0) / steps as f64;
         for i in 0..steps {
             if self.destroyed.is_some() {
                 return;
             }
-            self.step(env, controls, t0 + dt * i as f64, dt, target);
+            if self.craft.is_some() {
+                self.step_craft(env, controls, t0 + dt * i as f64, dt, target);
+            } else {
+                self.step(env, controls, t0 + dt * i as f64, dt, target);
+            }
         }
     }
 
@@ -529,7 +674,7 @@ impl Vessel {
     }
 
     /// Heating by `flux` (W/m^2), cooling by radiation and the air.
-    fn cool(&mut self, rho: f64, flux: f64, dt: f64) {
+    pub(super) fn cool(&mut self, rho: f64, flux: f64, dt: f64) {
         let t = self.temperature;
         let radiated =
             EMISSIVITY * STEFAN_BOLTZMANN * RADIATING_AREA * (t.powi(4) - AIR_TEMPERATURE.powi(4));
@@ -627,7 +772,7 @@ impl Vessel {
     }
 
     /// Crossing into a child's sphere of influence, or out of the reference body's.
-    fn change_soi(&mut self, bodies: &Bodies, t: f64) {
+    pub(super) fn change_soi(&mut self, bodies: &Bodies, t: f64) {
         if self.position.length() > bodies.soi(self.body)
             && let Some(parent) = self.body.parent()
         {
@@ -659,6 +804,9 @@ impl Vessel {
         dir: DVec3,
         reach: f64,
     ) -> Option<f64> {
+        if self.craft.is_some() {
+            return None; // targeted part by part: see `Game::craft_target`
+        }
         let frame = bodies.frame(active, t);
         let center = self.world_position(bodies, active, t);
         let to_local = (frame.rotation.inverse() * self.attitude).inverse();

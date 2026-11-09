@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     audio::Sound,
-    flight::vessel::{Landed, Vessel},
+    flight::{
+        craft::{At, Part},
+        vessel::{Landed, Vessel},
+    },
     mobs::{Mob, MobKind},
     player::GameMode,
     render::models::ModelState,
@@ -25,7 +28,7 @@ use crate::{
 };
 
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 /// The host is always player 0.
 pub const HOST: PlayerId = 0;
 /// Most people in one game, the host included.
@@ -59,6 +62,24 @@ pub struct PlayerPose {
     /// Their own clock (everyone warps on their own), and how fast it is running right now.
     pub time: f64,
     pub rate: f32,
+    /// On a vehicle: where, in its own grid.
+    pub aboard: Option<AboardPose>,
+}
+
+/// Someone standing or sitting on a vehicle.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AboardPose {
+    pub vessel: u32,
+    /// Grid coordinates.
+    pub feet: Vec3,
+    pub seat: bool,
+}
+
+/// A part put on or taken off a vehicle.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub enum CraftChange {
+    Put(Part),
+    Take(At),
 }
 
 /// A change to one world, passed on to everyone.
@@ -227,6 +248,23 @@ pub enum Msg {
     Board(u32),
     /// Who is flying this rocket now.
     Pilot(u32, Option<PlayerId>),
+    /// Someone has changed a vehicle.
+    CraftEdit {
+        vessel: u32,
+        change: CraftChange,
+    },
+
+    // ---- Teams -------------------------------------------------------------------------------
+    /// `who` is now on the team of `team` (the id of whoever started it), or on none.
+    Team {
+        who: PlayerId,
+        team: Option<PlayerId>,
+    },
+    /// `from` has changed the warp, for the whole team.
+    TeamWarp {
+        from: PlayerId,
+        level: u8,
+    },
 
     // ---- Weather -----------------------------------------------------------------------------
     /// The cyclones behind that weather.
@@ -341,8 +379,13 @@ mod tests {
             can_rail: true,
             time: 1.0e9,
             rate: 1_000_000.0,
+            aboard: Some(AboardPose {
+                vessel: u32::MAX,
+                feet: Vec3::splat(40.0),
+                seat: true,
+            }),
         };
-        assert!(encode(&Msg::Pose(pose)).len() < 140);
+        assert!(encode(&Msg::Pose(pose)).len() < 160);
         assert!(decode(&[0xff, 0xff, 0xff, 0xff, 1, 2, 3]).is_none());
         assert!(decode(&[]).is_none());
     }

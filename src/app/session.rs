@@ -207,6 +207,8 @@ impl Game {
                 Action::SyncTime(id) => self.time_sync(id, false),
                 Action::FollowTime(id) => self.time_sync(id, true),
                 Action::StopFollowing => self.unfollow(),
+                Action::JoinTeam(id) => self.join_team(id),
+                Action::LeaveTeam => self.leave_team(),
                 Action::CancelJoin => self.cancel_join(),
                 Action::ShowWorlds => self.show_worlds(),
                 Action::Play(i) => self.play_world(i),
@@ -214,6 +216,7 @@ impl Game {
                 Action::Delete(i) => self.delete_world(i),
                 Action::SettingsChanged => self.apply_settings(),
                 Action::Resume => self.resume(),
+                Action::Respawn => self.respawn(),
                 Action::LeaveWorld => self.leave_world(),
                 Action::Quit => {
                     self.save_on_exit();
@@ -350,6 +353,7 @@ impl Game {
 
     /// Saves and goes back to the main menu.
     pub(super) fn leave_world(&mut self) {
+        self.respawn();
         if let Err(e) = self.save_world(true) {
             // Don't throw away a world that couldn't be saved: stay in it, say why.
             log::error!("{e:#}");
@@ -500,6 +504,7 @@ impl Game {
         self.camera = world.camera;
         self.last_feet = world.feet;
         self.spawn_feet = world.feet;
+        self.death = None;
         self.active = Body::Planet;
         self.exposure = None;
         self.flight = Default::default();
@@ -600,7 +605,8 @@ impl Game {
             return;
         };
         session.meta.played += dt;
-        if session.last_save.elapsed().as_secs_f64() < AUTOSAVE {
+        // (Not while dead: the save would come back alive in the wreck.)
+        if session.last_save.elapsed().as_secs_f64() < AUTOSAVE || self.death.is_some() {
             return;
         }
         if let Err(e) = self.save_world(false) {
@@ -611,6 +617,7 @@ impl Game {
 
     /// The window is closing.
     pub(super) fn save_on_exit(&mut self) {
+        self.respawn();
         self.store_settings();
         if let Err(e) = self.save_world(true) {
             log::error!("could not save: {e:#}");

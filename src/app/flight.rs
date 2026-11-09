@@ -14,18 +14,22 @@ use anyhow::Result;
 use glam::{DVec3, Quat};
 use winit::{event::MouseButton, keyboard::KeyCode};
 
-use super::{Game, MAX_PHYSICS_WARP, WARP_LEVELS, WorldVoxels};
+use super::{
+    Game, MAX_PHYSICS_WARP, MOUSE_SENSITIVITY, WARP_LEVELS, WorldVoxels,
+    vehicles::{Aboard, CraftHit, cockpit_turn, seat_feet},
+};
 use crate::{
     audio::Sound,
     effects,
     flight::{
+        craft::At,
         hud::{self, Attitude, FlightAction, FlightInfo, Pointer},
         map_view::{self, MapContext, Planner, View},
         rocket_model::rocket_model,
         vessel::{self, COM_HEIGHT, Controls, FUEL_CAPACITY, SasMode, Vessel},
     },
     player::{EYE_HEIGHT, GameMode},
-    render::{DrawItem, Fade, ParticleEmitter, camera::Camera, models::Light},
+    render::{DrawItem, Fade, MeshHandle, ParticleEmitter, camera::Camera, models::Light},
     space::{
         bodies::Body,
         conic::propagate,
@@ -70,6 +74,27 @@ pub(super) struct Flight {
     /// The vessel the player is in.
     pub boarded: Option<usize>,
     pub eva: Option<Eva>,
+    /// Standing or sitting on a vehicle (and not flying it).
+    pub aboard: Option<Aboard>,
+    /// The seat the pilot is in.
+    pub seat: Option<At>,
+    /// Seeing from the pilot's seat instead of from outside.
+    pub cockpit: bool,
+    /// Breaking a vehicle part: which, and for how long so far.
+    pub digging: Option<(usize, At, f32)>,
+    /// `R`: which way the next part faces (None: by where it is placed).
+    pub part_turn: Option<u8>,
+    /// The part the crosshair is on, and its outline.
+    pub pointed: Option<CraftHit>,
+    pub outline: Option<MeshHandle>,
+    pub outline_for: Option<At>,
+    /// How the vehicle under you was turned last frame.
+    pub turned_with: Option<Quat>,
+    /// Walked off the edge this frame (see `place_aboard`).
+    pub stepping_off: bool,
+    /// Whether the view is standing on a vehicle, and is still easing over to its new "up".
+    pub view_aboard: bool,
+    pub settling_view: bool,
     pub map: bool,
     chase: Orbiting,
     map_cam: Orbiting,
@@ -77,10 +102,12 @@ pub(super) struct Flight {
     pub planner: Planner,
     pub prediction: Vec<Segment>,
     controls: Controls,
+    /// Controls held from the console (`steer`), for tests without a keyboard.
+    held_controls: Controls,
     last_cursor: (f32, f32),
     /// The mouse was over flight UI last frame (the wheel then doesn't zoom).
     over_ui: bool,
-    engine_timer: f32,
+    pub engine_timer: f32,
     /// Fractions of particles carried to the next frame: flame, smoke, plasma.
     carry: [f32; 3],
     /// Explosions etc. to send with this frame's particles.
@@ -94,6 +121,18 @@ impl Default for Flight {
             vessels: Vec::new(),
             boarded: None,
             eva: None,
+            aboard: None,
+            seat: None,
+            cockpit: false,
+            digging: None,
+            part_turn: None,
+            pointed: None,
+            outline: None,
+            outline_for: None,
+            turned_with: None,
+            stepping_off: false,
+            view_aboard: false,
+            settling_view: false,
             map: false,
             chase: Orbiting {
                 yaw: PI,
@@ -109,6 +148,7 @@ impl Default for Flight {
             planner: Planner::default(),
             prediction: Vec::new(),
             controls: Controls::default(),
+            held_controls: Controls::default(),
             last_cursor: (0.0, 0.0),
             over_ui: false,
             engine_timer: 0.0,
@@ -126,6 +166,10 @@ pub(super) struct SavedFlight {
     boarded: Option<usize>,
     eva: Option<Eva>,
     nodes: Vec<ManeuverNode>,
+    #[serde(default)]
+    aboard: Option<Aboard>,
+    #[serde(default)]
+    seat: Option<At>,
 }
 
 impl Flight {
@@ -135,11 +179,15 @@ impl Flight {
             boarded: self.boarded,
             eva: self.eva.clone(),
             nodes: self.planner.nodes.clone(),
+            aboard: self.aboard.clone(),
+            seat: self.seat,
         }
     }
 
     pub(super) fn restore(&mut self, saved: SavedFlight) {
         self.boarded = saved.boarded.filter(|&i| i < saved.vessels.len());
+        self.aboard = saved.aboard.filter(|a| a.vessel < saved.vessels.len());
+        self.seat = saved.seat;
         self.vessels = saved.vessels;
         self.eva = saved.eva;
         self.planner.nodes = saved.nodes;
@@ -147,9 +195,9 @@ impl Flight {
 }
 
 impl Game {
-    /// The camera is the player's eyes (not in a rocket, not the map).
+    /// The camera is the player's eyes (not in a rocket, not the map, not watching a wreck).
     pub(super) fn first_person(&self) -> bool {
-        self.flight.boarded.is_none() && !self.flight.map
+        self.flight.boarded.is_none() && !self.flight.map && !self.watching_wreck()
     }
 
     /// The craft the map and predictions are about: the rocket, or the player.
@@ -159,9 +207,13 @@ impl Game {
                 let v = &self.flight.vessels[i];
                 (v.body, v.position, v.velocity)
             }
-            None => match &self.flight.eva {
-                Some(e) => (e.body, e.position, e.velocity),
-                None => (self.active, self.player.position, self.player.velocity),
+            None => match (&self.flight.eva, &self.flight.aboard) {
+                (Some(e), _) => (e.body, e.position, e.velocity),
+                (None, Some(a)) => {
+                    let v = &self.flight.vessels[a.vessel];
+                    (v.body, v.position, v.velocity)
+                }
+                _ => (self.active, self.player.position, self.player.velocity),
             },
         }
     }
@@ -182,6 +234,10 @@ impl Game {
     pub(super) fn feet_and_up(&self) -> (DVec3, DVec3) {
         let frame = self.active_frame(self.time);
         let feet = self.player.body_position(&frame);
+        if let Some(a) = &self.flight.aboard {
+            let v = &self.flight.vessels[a.vessel];
+            return (feet, frame.to_body(v.attitude * DVec3::Y));
+        }
         let center = match &self.flight.eva {
             Some(e) => self
                 .bodies
@@ -305,13 +361,19 @@ impl Game {
             if self.input.pressed(KeyCode::Escape) {
                 self.toggle_map();
             }
-        } else if self.flight.boarded.is_some() {
+        } else if self.flight.boarded.is_some() || self.watching_wreck() {
             let cam = &mut self.flight.chase;
             if dragging {
                 cam.yaw += dx * DRAG_SENSITIVITY;
                 cam.pitch = (cam.pitch + dy * DRAG_SENSITIVITY).clamp(-1.4, 1.4);
             }
             cam.distance = (cam.distance * 0.88f64.powf(scroll)).clamp(9.0, 600.0);
+        } else if self.death.is_some() && dragging {
+            // Dead on foot: the cursor is for the button, the right button still looks around.
+            self.camera.rotate(
+                dx as f32 * MOUSE_SENSITIVITY,
+                -dy as f32 * MOUSE_SENSITIVITY,
+            );
         }
 
         let Some(i) = self.flight.boarded else {
@@ -322,7 +384,15 @@ impl Game {
             pitch: held(KeyCode::KeyS) - held(KeyCode::KeyW),
             yaw: held(KeyCode::KeyD) - held(KeyCode::KeyA),
             roll: held(KeyCode::KeyE) - held(KeyCode::KeyQ),
+            drive: held(KeyCode::KeyW) - held(KeyCode::KeyS),
+            brake: self.input.held(KeyCode::Space),
         };
+        let console = self.flight.held_controls;
+        let controls = &mut self.flight.controls;
+        controls.pitch += console.pitch;
+        controls.yaw += console.yaw;
+        controls.roll += console.roll;
+        controls.drive += console.drive;
         let v = &mut self.flight.vessels[i];
         let mut throttle = v.throttle;
         throttle += (held(KeyCode::ShiftLeft) - held(KeyCode::ControlLeft)) * THROTTLE_RATE * dt;
@@ -338,6 +408,9 @@ impl Game {
         }
         if self.input.pressed(KeyCode::KeyF) {
             self.exit_vessel();
+        }
+        if self.input.pressed(KeyCode::KeyV) && self.flight.vessels[i].craft.is_some() {
+            self.flight.cockpit = !self.flight.cockpit;
         }
     }
 
@@ -375,6 +448,7 @@ impl Game {
         let Some(i) = self.flight.boarded else { return };
         // "Warp to": the fastest warp that won't overshoot the target.
         let mut warp = WARP_LEVELS[self.warp];
+        let warp_before = self.warp;
         if let Some(target) = self.flight.planner.warp_to {
             let left = target - self.time;
             if left <= 1.0 {
@@ -387,6 +461,9 @@ impl Game {
                     .unwrap_or(0);
             }
             warp = WARP_LEVELS[self.warp];
+            if self.warp != warp_before {
+                self.tell_team_warp();
+            }
         }
         let mut rails = warp > MAX_PHYSICS_WARP;
         if rails && !self.flight.vessels[i].can_rail_warp(&self.bodies) {
@@ -466,6 +543,7 @@ impl Game {
             }
         }
 
+        self.report_broken_parts(i);
         if let Some(reason) = self.flight.vessels[i].destroyed {
             self.destroy_vessel(i, reason);
             return;
@@ -515,6 +593,8 @@ impl Game {
                     v.rails(&self.bodies, (t0, t1));
                 } else if t1 >= t0 - 1.0 {
                     v.position += v.velocity * (t1 - t0);
+                    let turn = glam::DQuat::from_scaled_axis(v.spin * (t1 - t0));
+                    v.attitude = (turn * v.attitude).normalize();
                 }
                 continue;
             }
@@ -536,8 +616,34 @@ impl Game {
                 destroyed.push((i, reason));
             }
         }
+        for i in 0..self.flight.vessels.len() {
+            self.report_broken_parts(i);
+        }
         for (i, reason) in destroyed.into_iter().rev() {
             self.destroy_vessel(i, reason);
+        }
+    }
+
+    /// Parts knocked off in a collision: a puff of debris here, and everyone is told.
+    fn report_broken_parts(&mut self, i: usize) {
+        let broke = std::mem::take(&mut self.flight.vessels[i].broke_off);
+        let Some(first) = broke.first().copied() else {
+            return;
+        };
+        let v = &self.flight.vessels[i];
+        let id = v.id;
+        let (grid, to_world) = self.grid_pose(v);
+        let at = grid + to_world * crate::flight::craft::center(first.at);
+        let up = at.normalize_or(DVec3::Y);
+        self.flight
+            .pending
+            .extend(effects::explosion(at, DVec3::ZERO, up));
+        let listener = self.camera.position - self.planet.center;
+        let right = self.camera.right().as_dvec3();
+        self.audio
+            .play_gain(Sound::Explosion, at - listener, right, 0.5);
+        for part in broke {
+            self.send_craft_change(id, crate::net::protocol::CraftChange::Take(part.at));
         }
     }
 
@@ -564,26 +670,44 @@ impl Game {
         let listener = self.camera.position - self.planet.center;
         let right = self.camera.right().as_dvec3();
         self.audio.play(Sound::Explosion, at - listener, right);
-        self.message = Some((format!("The rocket {reason}!"), Instant::now()));
+        let noun = if v.craft.is_some() {
+            "vehicle"
+        } else {
+            "rocket"
+        };
+        let aboard_it = self.flight.aboard.as_ref().is_some_and(|a| a.vessel == i);
+        self.shift_aboard(i);
+        let cause = format!("your {noun} {reason}");
         match self.flight.boarded {
             Some(b) if b == i => {
+                // (Creative or not: there is nothing left to be in.)
                 self.flight.boarded = None;
-                self.flight.map = false;
-                self.flight.planner = Planner::default();
-                self.reset_camera();
-                if self.player.mode == GameMode::Survival {
-                    self.respawn();
-                } else {
-                    let frame = self.active_frame(self.time);
-                    self.player.teleport(self.spawn_feet, &frame);
-                }
-                if self.capture.is_none() {
-                    self.set_mouse_grab(true);
-                }
+                self.die(&cause, Some(at));
             }
             Some(b) if b > i => self.flight.boarded = Some(b - 1),
             _ => {}
         }
+        if aboard_it && self.player.mode == GameMode::Survival {
+            self.die(&cause, Some(at));
+        }
+        if self.death.is_none() {
+            self.message = Some((format!("The {noun} {reason}!"), Instant::now()));
+        }
+    }
+
+    /// Vessel `i` is going away: whoever is aboard it is off, and the others keep their place.
+    fn shift_aboard(&mut self, i: usize) {
+        if self.flight.aboard.as_ref().is_some_and(|a| a.vessel == i) {
+            self.flight.aboard = None;
+            self.player.on_ground = false;
+        }
+        if let Some(a) = &mut self.flight.aboard
+            && a.vessel > i
+        {
+            a.vessel -= 1;
+        }
+        self.flight.pointed = None;
+        self.flight.digging = None;
     }
 
     /// Takes a rocket away quietly (someone picked it up).
@@ -592,6 +716,7 @@ impl Game {
         if let Some(mesh) = v.mesh {
             self.renderer.destroy_mesh(mesh);
         }
+        self.shift_aboard(i);
         match self.flight.boarded {
             Some(b) if b > i => self.flight.boarded = Some(b - 1),
             _ => {}
@@ -600,6 +725,15 @@ impl Game {
 
     /// Asks to get in (in a game with others, the host says who flies it).
     fn board(&mut self, i: usize) {
+        if let Some(craft) = &self.flight.vessels[i].craft {
+            match craft.stats.seats.first().copied() {
+                Some(seat) => self.sit_down(i, seat),
+                None => {
+                    self.message = Some(("It has no seat".to_string(), Instant::now()));
+                }
+            }
+            return;
+        }
         if self.player.mode != GameMode::Spectator && self.request_seat(i) {
             self.enter_vessel(i);
         }
@@ -611,6 +745,8 @@ impl Game {
         }
         self.flight.boarded = Some(i);
         self.flight.eva = None;
+        self.flight.aboard = None;
+        self.flight.pointed = None;
         self.flight.planner = Planner::default();
         self.flight.chase = Orbiting {
             yaw: PI,
@@ -619,16 +755,30 @@ impl Game {
         };
         self.survival.mining = None;
         self.set_mouse_grab(false);
-        self.message = Some((
-            "In the rocket: shift / ctrl throttle, wasd qe steer, m map, f to get out".to_string(),
-            Instant::now(),
-        ));
+        let text = if self.flight.vessels[i].craft.is_some() {
+            "Flying: shift / ctrl throttle, wasd qe steer, w s drive wheels, space brake, v view, m map, f to stand up"
+        } else {
+            "In the rocket: shift / ctrl throttle, wasd qe steer, m map, f to get out"
+        };
+        self.message = Some((text.to_string(), Instant::now()));
     }
 
     /// Climbs out next to a landed rocket.
     fn exit_vessel(&mut self) {
         let Some(i) = self.flight.boarded else { return };
         self.release_seat(i);
+        if self.flight.vessels[i].craft.is_some() {
+            self.flight.boarded = None;
+            self.flight.map = false;
+            self.flight.cockpit = false;
+            self.flight.planner = Planner::default();
+            self.stand_from_controls(i);
+            self.reset_camera();
+            if self.capture.is_none() {
+                self.set_mouse_grab(true);
+            }
+            return;
+        }
         let v = &self.flight.vessels[i];
         let landed_here = v.landed.is_some() && v.body == self.active;
         if !landed_here {
@@ -694,7 +844,10 @@ impl Game {
     /// Back to first person at the player's eyes.
     pub(super) fn reset_camera(&mut self) {
         let (feet, up) = self.feet_and_up();
-        let mut camera = Camera::new(self.planet.center + feet + up * EYE_HEIGHT, up.as_vec3());
+        let mut camera = Camera::new(
+            self.planet.center + feet + up * self.eye_height(),
+            up.as_vec3(),
+        );
         camera.fov_y = self.camera.fov_y;
         self.camera = camera;
     }
@@ -724,19 +877,58 @@ impl Game {
             let center = self.bodies.view(self.active, v.body, DVec3::ZERO, t);
             let up = (com - center).normalize_or(DVec3::Y);
             let axis = self.bodies.view_rotation(self.active, v.body, t) * DVec3::Y;
-            let east = axis
-                .cross(up)
-                .try_normalize()
-                .unwrap_or_else(|| up.any_orthonormal_vector());
-            let north = up.cross(east);
             let c = self.flight.chase;
-            let dir =
-                (north * c.yaw.cos() + east * c.yaw.sin()) * c.pitch.cos() + up * c.pitch.sin();
+            if self.flight.cockpit
+                && let Some(craft) = &v.craft
+            {
+                let seat = self
+                    .flight
+                    .seat
+                    .or_else(|| craft.stats.seats.first().copied());
+                let (grid, to_world) = self.grid_pose(v);
+                let eye = seat_feet(seat.unwrap_or([0, 1, 0])) + DVec3::Y * 1.05;
+                let (forward, up) = (craft.stats.forward, craft.stats.up);
+                let turn = cockpit_turn(c.yaw - PI, c.pitch - 0.2, up, craft.stats.right);
+                let look = to_world * (turn * forward);
+                self.camera.position = self.planet.center + grid + to_world * eye;
+                self.camera
+                    .look_at(look.as_vec3(), (to_world * up).as_vec3());
+                return;
+            }
+            let dir = self.chase_direction(up, axis);
             // Aim a little below the centre of mass: the rocket sits high, its flame in view.
-            let target = com - up * 2.5;
+            let target = if v.craft.is_some() {
+                com
+            } else {
+                com - up * 2.5
+            };
             self.camera.position = self.planet.center + target + dir * c.distance;
             self.camera.look_at(-dir.as_vec3(), up.as_vec3());
+        } else if let Some(at) = self.death.as_ref().and_then(|d| d.wreck()) {
+            // Dead: the same view, on where the vehicle came apart. It is standing still now,
+            // so it can look in from behind a hill: keep it above the ground.
+            let up = at.normalize_or(DVec3::Y);
+            let axis = self.bodies.view_rotation(self.active, self.active, t) * DVec3::Y;
+            let mut eye = at + self.chase_direction(up, axis) * self.flight.chase.distance;
+            let along = eye.normalize_or(DVec3::Y);
+            let ground = Self::ground_position(&self.planet, &self.terrain, along).length() + 1.5;
+            if eye.length() < ground {
+                eye = along * ground;
+            }
+            self.camera.position = self.planet.center + eye;
+            self.camera.look_at((at - eye).as_vec3(), up.as_vec3());
         }
+    }
+
+    /// From the thing the chase camera circles towards the camera.
+    fn chase_direction(&self, up: DVec3, axis: DVec3) -> DVec3 {
+        let east = axis
+            .cross(up)
+            .try_normalize()
+            .unwrap_or_else(|| up.any_orthonormal_vector());
+        let north = up.cross(east);
+        let c = self.flight.chase;
+        (north * c.yaw.cos() + east * c.yaw.sin()) * c.pitch.cos() + up * c.pitch.sin()
     }
 
     /// Recomputes the predicted trajectory (for the map, and maneuver nodes).
@@ -849,7 +1041,13 @@ impl Game {
     pub(super) fn flight_draw_items(&mut self, objects: &mut Vec<DrawItem>) -> Result<()> {
         let t = self.time;
         let frame = self.active_frame(t);
-        for v in &mut self.flight.vessels {
+        self.vehicle_outline(objects)?;
+        for i in 0..self.flight.vessels.len() {
+            if self.flight.vessels[i].craft.is_some() {
+                self.vehicle_draw_item(i, objects)?;
+            }
+        }
+        for v in self.flight.vessels.iter_mut().filter(|v| v.craft.is_none()) {
             let com = v.world_position(&self.bodies, self.active, t);
             let to_body = frame.rotation.inverse() * v.attitude;
             let axes = (to_body * DVec3::X, to_body * DVec3::Y, to_body * DVec3::Z);
@@ -896,6 +1094,7 @@ impl Game {
     }
 
     fn vessel_effects(&mut self, i: usize, dt: f32, out: &mut Vec<ParticleEmitter>) {
+        self.vehicle_flames(i, dt, out);
         let t = self.time;
         let frame = self.active_frame(t);
         let v = &self.flight.vessels[i];
@@ -911,7 +1110,7 @@ impl Game {
             carry[k] = n.fract();
             n as u32
         };
-        if v.throttle > 0.0 {
+        if v.throttle > 0.0 && v.craft.is_none() {
             let n = count(0, 260.0 + 340.0 * v.throttle as f32);
             out.extend(effects::exhaust(nozzle, -nose, ground, n));
             let air = if v.body == Body::Planet {
@@ -1034,7 +1233,7 @@ impl Game {
                 .map(|ap| (ap - radius, conic.time_to_anomaly(r, PI))),
             periapsis: (conic.periapsis() - radius, conic.time_to_anomaly(r, 0.0)),
             throttle: v.throttle,
-            fuel: v.fuel / FUEL_CAPACITY,
+            fuel: v.fuel / v.fuel_capacity().max(1.0),
             delta_v: v.delta_v(),
             temperature: v.temperature,
             pressure: v.pressure,
@@ -1042,9 +1241,9 @@ impl Game {
             sas_mode: v.sas_mode,
             landed: v.landed.is_some(),
             attitude: Attitude {
-                right: v.attitude * DVec3::X,
+                right: v.right(),
                 nose: v.nose(),
-                dorsal: v.attitude * DVec3::Z,
+                dorsal: v.dorsal(),
                 up,
                 north: up.cross(east),
                 east,
@@ -1153,6 +1352,14 @@ impl Game {
                 }
             }
             "exit" => self.exit_vessel(),
+            "vehicle" => {
+                // vehicle <plane|rover|rocket> [m]: a ready-made one ahead.
+                let distance = number(1).unwrap_or(12.0);
+                self.spawn_preset(args.first().copied().unwrap_or(""), distance);
+            }
+            "sit" => self.sit_in_nearest(),
+            "aboard" => self.step_aboard(args.first() == Some(&"status")),
+            "cockpit" => self.flight.cockpit = !self.flight.cockpit,
             "goto" => {
                 // goto <moon|home> [lat lon]: stand on the ground there (on the moon, by
                 // default where home is overhead).
@@ -1229,19 +1436,29 @@ impl Game {
             }
             "transfer" => self.plan_transfer(),
             "map" => self.toggle_map(),
-            "throttle" | "sas" | "node" | "chase" | "dive" | "fuel" => {
+            "throttle" | "sas" | "node" | "chase" | "dive" | "fuel" | "steer" => {
                 let Some(i) = self.flight.boarded else {
                     self.console.print("Not in a rocket");
                     return true;
                 };
                 match command {
+                    "steer" => {
+                        // steer <pitch> <yaw> <roll> <drive>: holds those controls.
+                        self.flight.held_controls = Controls {
+                            pitch: number(0).unwrap_or(0.0),
+                            yaw: number(1).unwrap_or(0.0),
+                            roll: number(2).unwrap_or(0.0),
+                            drive: number(3).unwrap_or(0.0),
+                            brake: false,
+                        };
+                    }
                     "throttle" => {
                         self.flight.vessels[i].throttle = number(0).unwrap_or(1.0).clamp(0.0, 1.0)
                     }
                     "fuel" => {
                         let v = &mut self.flight.vessels[i];
                         if let Some(percent) = number(0) {
-                            v.fuel = FUEL_CAPACITY * (percent / 100.0).clamp(0.0, 1.0);
+                            v.fuel = v.fuel_capacity() * (percent / 100.0).clamp(0.0, 1.0);
                         }
                         let text = format!(
                             "Fuel {:.0} kg, {:.0} m/s, {:.1} m/s^2",

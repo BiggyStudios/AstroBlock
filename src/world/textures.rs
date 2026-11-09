@@ -153,6 +153,20 @@ textures! {
     Basalt,
     Ash,
     Lava,
+    // Vehicle parts.
+    VehicleCore,
+    HullPlate,
+    SeatCloth,
+    TankSide,
+    PropellerFace,
+    JetFace,
+    RocketFace,
+    OrbitalFace,
+    WingSkin,
+    FlapSkin,
+    GyroFace,
+    Tire,
+    GearFace,
 }
 
 impl Tex {
@@ -240,6 +254,38 @@ fn noisy(r: &mut Rng, base: Rgb, amount: f32, alpha: u8) -> Img {
     for y in 0..TEX_SIZE {
         for x in 0..TEX_SIZE {
             img.set(x, y, scale(base, 1.0 + r.signed() * amount), alpha);
+        }
+    }
+    img
+}
+
+/// A metal plate with a dark seam and rivets at the corners.
+fn panel(r: &mut Rng, base: Rgb) -> Img {
+    let mut img = noisy(r, base, 0.025, 0);
+    for i in 0..TEX_SIZE {
+        for edge in [0, 15] {
+            img.shade(i, edge, 0.72);
+            img.shade(edge, i, 0.72);
+        }
+    }
+    for (x, y) in [(2, 2), (13, 2), (2, 13), (13, 13)] {
+        img.shade(x, y, 1.3);
+    }
+    img
+}
+
+/// A round face on a square plate: `rim` outside, `hole` inside, `hub` at the very centre.
+fn disc(r: &mut Rng, rim: Rgb, hole: Rgb, hub: Rgb) -> Img {
+    let mut img = noisy(r, rim, 0.04, 0);
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            let (dx, dy) = (x as f32 - 7.5, y as f32 - 7.5);
+            let d = (dx * dx + dy * dy).sqrt();
+            if d < 2.5 {
+                img.set(x, y, hub, 0);
+            } else if d < 6.2 {
+                img.set(x, y, hole, 0);
+            }
         }
     }
     img
@@ -859,6 +905,100 @@ fn make(t: Tex) -> Img {
             for _ in 0..12 {
                 let (x, y) = (r.below(16), r.below(16));
                 img.shade(x, y, 1.25);
+            }
+            img
+        }
+        Tex::VehicleCore => {
+            // A dark housing with an amber arrow showing which way is forward.
+            let mut img = panel(r, [58, 62, 72]);
+            for (x, y) in [
+                (7, 3),
+                (8, 3),
+                (6, 4),
+                (7, 4),
+                (8, 4),
+                (9, 4),
+                (5, 5),
+                (6, 5),
+                (7, 5),
+                (8, 5),
+                (9, 5),
+                (10, 5),
+            ] {
+                img.set(x, y, [240, 170, 50], 0);
+            }
+            for y in 6..=12 {
+                for x in 7..=8 {
+                    img.set(x, y, [240, 170, 50], 0);
+                }
+            }
+            img
+        }
+        Tex::HullPlate => panel(r, [186, 192, 200]),
+        Tex::SeatCloth => {
+            let mut img = noisy(r, [58, 84, 128], 0.06, 0);
+            for i in 0..TEX_SIZE {
+                img.shade(i, 5, 0.75);
+                img.shade(i, 10, 0.75);
+                img.shade(5, i, 0.8);
+                img.shade(10, i, 0.8);
+            }
+            img
+        }
+        Tex::TankSide => {
+            let mut img = noisy(r, [226, 122, 44], 0.05, 0);
+            for x in 0..TEX_SIZE {
+                for y in [0, 15] {
+                    img.set(x, y, [150, 154, 162], 0);
+                }
+                for y in 3..=4 {
+                    img.set(x, y, [240, 236, 226], 0);
+                }
+            }
+            img
+        }
+        Tex::PropellerFace => disc(r, [108, 76, 46], [70, 72, 80], [50, 50, 56]),
+        Tex::JetFace => disc(r, [150, 154, 162], [28, 30, 34], [96, 100, 110]),
+        Tex::RocketFace => disc(r, [92, 94, 102], [24, 22, 22], [200, 96, 40]),
+        Tex::OrbitalFace => disc(r, [206, 168, 72], [38, 36, 34], [236, 206, 120]),
+        Tex::WingSkin => {
+            let mut img = noisy(r, [232, 234, 236], 0.02, 0);
+            for x in 0..TEX_SIZE {
+                img.set(x, 13, [200, 58, 46], 0);
+                img.set(x, 14, [200, 58, 46], 0);
+            }
+            img
+        }
+        Tex::FlapSkin => {
+            let mut img = noisy(r, [232, 234, 236], 0.02, 0);
+            for x in 0..TEX_SIZE {
+                img.set(x, 2, [70, 74, 84], 0);
+                for y in 11..16 {
+                    if (x + y) % 6 < 3 {
+                        img.set(x, y, [240, 170, 50], 0);
+                    }
+                }
+            }
+            img
+        }
+        Tex::GyroFace => disc(r, [60, 112, 92], [30, 44, 40], [150, 226, 190]),
+        Tex::Tire => {
+            let mut img = noisy(r, [34, 34, 38], 0.08, 0);
+            for y in (0..TEX_SIZE).step_by(4) {
+                for x in 0..TEX_SIZE {
+                    img.shade(x, y, 0.55);
+                }
+            }
+            img
+        }
+        Tex::GearFace => {
+            let mut img = panel(r, [120, 124, 132]);
+            for x in 0..TEX_SIZE {
+                for y in 0..3 {
+                    if (x + y) % 4 < 2 {
+                        img.set(x, y, [226, 180, 40], 0);
+                    }
+                }
             }
             img
         }

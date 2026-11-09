@@ -79,6 +79,32 @@ pub enum Block {
     Ash,
     /// Molten rock in a volcano's crater: glows, and burns whoever stands on it.
     Lava,
+    // Vehicles are built from these (see `flight::craft`). Except for hull, they only exist
+    // as parts of a vehicle.
+    /// Starts a vehicle: everything else is built onto it.
+    VehicleCore,
+    /// Light metal plating, for building vehicles (and anything else).
+    Hull,
+    Seat,
+    FuelTank,
+    /// Pulls through the air: cheap on fuel, slow.
+    Propeller,
+    /// Needs air, faster than a propeller.
+    JetEngine,
+    /// Works anywhere, drinks fuel.
+    RocketEngine,
+    /// A small engine that sips fuel, weak in air.
+    OrbitalEngine,
+    /// A flat lifting surface.
+    Wing,
+    /// A wing that moves: pitch, yaw and roll in the air.
+    Flap,
+    /// Reaction wheels: turns a vehicle without air.
+    Gyro,
+    /// A driven wheel, for rovers and cars.
+    Wheel,
+    /// A free-rolling wheel on a strut, for landing.
+    LandingGear,
 }
 
 /// What a block sounds like (footsteps, breaking, placing).
@@ -108,7 +134,7 @@ pub enum Tint {
 
 impl Block {
     /// Every block, in declaration order.
-    pub const ALL: [Block; 49] = {
+    pub const ALL: [Block; 62] = {
         use Block::*;
         [
             Air,
@@ -160,8 +186,26 @@ impl Block {
             Basalt,
             Ash,
             Lava,
+            VehicleCore,
+            Hull,
+            Seat,
+            FuelTank,
+            Propeller,
+            JetEngine,
+            RocketEngine,
+            OrbitalEngine,
+            Wing,
+            Flap,
+            Gyro,
+            Wheel,
+            LandingGear,
         ]
     };
+
+    /// Only exists on a vehicle: can't be placed in the world.
+    pub fn is_vehicle_part(self) -> bool {
+        (self as u8) >= (Block::VehicleCore as u8) && self != Block::Hull
+    }
 
     /// Solid and fully hides what's behind it (a full cube).
     pub fn is_opaque(self) -> bool {
@@ -254,6 +298,19 @@ impl Block {
             Basalt => all(Tex::Basalt),
             Ash => all(Tex::Ash),
             Lava => all(Tex::Lava),
+            VehicleCore => all(Tex::VehicleCore),
+            Hull => all(Tex::HullPlate),
+            Seat => all(Tex::SeatCloth),
+            FuelTank => [Tex::HullPlate, Tex::TankSide, Tex::HullPlate],
+            Propeller => all(Tex::PropellerFace),
+            JetEngine => all(Tex::JetFace),
+            RocketEngine => all(Tex::RocketFace),
+            OrbitalEngine => all(Tex::OrbitalFace),
+            Wing => all(Tex::WingSkin),
+            Flap => all(Tex::FlapSkin),
+            Gyro => all(Tex::GyroFace),
+            Wheel => all(Tex::Tire),
+            LandingGear => all(Tex::GearFace),
         }
     }
 
@@ -320,6 +377,6 @@ mod tests {
         for (i, b) in Block::ALL.iter().enumerate() {
             assert_eq!(*b as usize, i);
         }
-        assert_eq!(*Block::ALL.last().unwrap(), Block::Lava);
+        assert_eq!(*Block::ALL.last().unwrap(), Block::LandingGear);
     }
 }

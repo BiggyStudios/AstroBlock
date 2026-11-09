@@ -4,6 +4,9 @@ use glam::{DVec3, Mat4, Quat, Vec3, camera::rh::proj};
 
 /// View-model depth mapping (see `Camera::view_model_projection`): depth = a + b / distance.
 const VIEW_MODEL_DEPTH: (f32, f32) = (0.6, 0.032);
+/// `Camera::ease_up`: how fast the view settles (1/s), and how close counts as there (radians).
+const UP_EASE: f32 = 10.0;
+const UP_ARRIVED: f32 = 0.002;
 
 pub struct Camera {
     /// Absolute world position in meters. f64 so it stays precise at interplanetary
@@ -52,6 +55,23 @@ impl Camera {
             self.pitch = local.y.clamp(-1.0, 1.0).asin().clamp(-limit, limit);
             self.yaw = local.x.atan2(-local.z).rem_euclid(std::f32::consts::TAU);
         }
+    }
+
+    /// `set_up`, but only part of the way (stepping on or off something tilted, where the
+    /// new "up" isn't where the old one was). Returns whether it has got there.
+    pub fn ease_up(&mut self, up: Vec3, dt: f32) -> bool {
+        let Some(up) = up.try_normalize() else {
+            return true;
+        };
+        let current = self.frame * Vec3::Y;
+        if current.angle_between(up) < UP_ARRIVED {
+            self.set_up(up);
+            return true;
+        }
+        let fraction = 1.0 - (-UP_EASE * dt).exp();
+        let turn = Quat::IDENTITY.slerp(Quat::from_rotation_arc(current, up), fraction);
+        self.frame = (turn * self.frame).normalize();
+        false
     }
 
     /// The level frame and view angles (what a saved game keeps).
@@ -133,6 +153,23 @@ impl Camera {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn up_eases_over_without_a_jump() {
+        let mut camera = Camera::new(DVec3::ZERO, Vec3::Y);
+        let tilted = Vec3::new(0.3, 1.0, 0.0).normalize();
+        let total = Vec3::Y.angle_between(tilted);
+        assert!(!camera.ease_up(tilted, 1.0 / 120.0));
+        let first = Vec3::Y.angle_between(camera.up());
+        assert!(first > 0.0 && first < total * 0.1, "a small step: {first}");
+        let mut frames = 1;
+        while !camera.ease_up(tilted, 1.0 / 120.0) {
+            frames += 1;
+            assert!(frames < 240, "it gets there");
+        }
+        assert!(camera.up().angle_between(tilted) < 1e-3);
+        assert!(frames > 30, "over several frames: {frames}");
+    }
 
     #[test]
     fn view_model_depth_stays_in_front() {

@@ -39,16 +39,17 @@ use super::{
 use crate::{
     audio::Sound,
     flight::{
+        craft::{MAX_PARTS, MAX_REACH},
         map_view::Planner,
-        vessel::{FUEL_CAPACITY, Vessel},
+        vessel::Vessel,
     },
     mobs::Mob,
     net::{
         Event, Link, PeerId,
         direct::{self, DirectClient, DirectHost},
         protocol::{
-            self, HOST, MAX_PLAYERS, Msg, NetTornado, NetVolcano, PROTOCOL, PlayerId, PlayerPose,
-            VesselState, WorldBlob, WorldEvent,
+            self, AboardPose, CraftChange, HOST, MAX_PLAYERS, Msg, NetTornado, NetVolcano,
+            PROTOCOL, PlayerId, PlayerPose, VesselState, WorldBlob, WorldEvent,
         },
         steam::{self, Friend, Steam},
     },
@@ -136,6 +137,8 @@ pub(super) struct Remote {
     pub sky: PlayerId,
     /// At another time from this player (they have been told).
     pub apart: bool,
+    /// The team they are on.
+    pub team: Option<PlayerId>,
     pose: Option<PlayerPose>,
     heard: Instant,
     /// Where the model is drawn (eases after the news).
@@ -156,6 +159,7 @@ impl Remote {
             name,
             sky: HOST,
             apart: false,
+            team: None,
             pose: None,
             heard: Instant::now(),
             feet: DVec3::ZERO,
@@ -168,6 +172,16 @@ impl Remote {
             mesh: None,
             item: None,
         }
+    }
+
+    /// Where they are aboard a vehicle, going by what was last heard.
+    pub(super) fn aboard_pose(&self) -> Option<AboardPose> {
+        self.pose.as_ref().and_then(|p| p.aboard)
+    }
+
+    /// Whether they could warp past physics speed, as of the last news.
+    pub(super) fn can_rail(&self) -> bool {
+        self.pose.as_ref().is_none_or(|p| p.can_rail)
     }
 
     /// Their clock now and how fast it is running, going by what was last heard.
@@ -247,6 +261,10 @@ pub(super) struct Multiplayer {
     pub listeners: Vec<PlayerId>,
     /// The other player whose clock and warp this one is attached to.
     pub follow: Option<Follow>,
+    /// The team this player is on (named after whoever started it).
+    pub team: Option<PlayerId>,
+    /// When this player last changed the warp for the team.
+    pub team_warped_at: Instant,
     /// How far this clock is behind the one it keeps to (s).
     pub clock_error: f64,
     /// Sounds to tell the others about.
@@ -287,6 +305,8 @@ impl Multiplayer {
             keyed: [true; 6],
             listeners: Vec::new(),
             follow: None,
+            team: None,
+            team_warped_at: Instant::now(),
             clock_error: 0.0,
             sounds: Vec::new(),
             notice: None,
@@ -670,6 +690,7 @@ impl Game {
         std::thread::sleep(Duration::from_millis(120));
         self.net_forget_players();
         self.net.close();
+        self.net.team = None;
         self.survival.net = NetSide::Offline;
         self.net.records.clear();
     }
@@ -958,7 +979,8 @@ impl Game {
             gravity: &self.gravity,
             drag: self.drag,
         };
-        let can_rail = match self.flight.boarded {
+        let aboard_vessel = self.flight.aboard.as_ref().map(|a| a.vessel);
+        let can_rail = match self.flight.boarded.or(aboard_vessel) {
             Some(i) => self.flight.vessels[i].can_rail_warp(&self.bodies),
             None => {
                 self.flight.eva.is_some() || self.player.can_rail_warp(&physics, &frame, self.time)
@@ -976,11 +998,13 @@ impl Game {
             mining: self.survival.mining.is_some(),
             eating: self.survival.eating > 0.0,
             on_ground: self.player.on_ground,
-            spectator: self.player.mode == GameMode::Spectator,
+            // (Dead: nobody to see until they respawn.)
+            spectator: self.player.mode == GameMode::Spectator || self.death.is_some(),
             vessel: self.flight.boarded.map(|i| self.flight.vessels[i].id),
             can_rail,
             time: self.time,
             rate: self.effective_warp as f32,
+            aboard: self.aboard_pose(),
         }
     }
 
@@ -1289,6 +1313,19 @@ impl Game {
         if our_weather {
             self.net.listeners.push(id);
         }
+        // Who is on which team, for the newcomer.
+        let teams: Vec<(PlayerId, Option<PlayerId>)> = self
+            .net
+            .players
+            .iter()
+            .map(|(who, r)| (*who, r.team))
+            .chain([(HOST, self.net.team)])
+            .collect();
+        for (who, team) in teams {
+            if team.is_some() {
+                self.net.send_reliable_to(i, &Msg::Team { who, team });
+            }
+        }
         let text = format!("{name} joined");
         self.console.print(text.clone());
         self.message = Some((text, Instant::now()));
@@ -1397,7 +1434,7 @@ impl Game {
                 }
             }
             Msg::VesselNew(mut vessel) => {
-                if !finite(vessel.position) {
+                if !finite(vessel.position) || !vessel_is_sound(&vessel) {
                     return;
                 }
                 vessel.pilot = None;
@@ -1442,6 +1479,23 @@ impl Game {
                     Msg::Pilot(vessel, pilot)
                 };
                 self.net.broadcast(&answer, true, None);
+            }
+            Msg::CraftEdit { vessel, change } => {
+                if craft_change_is_sound(&change) {
+                    self.apply_craft_change(vessel, change);
+                    self.net
+                        .broadcast(&Msg::CraftEdit { vessel, change }, true, Some(id));
+                }
+            }
+            Msg::Team { team, .. } => {
+                self.got_team(id, team);
+                self.net
+                    .broadcast(&Msg::Team { who: id, team }, true, Some(id));
+            }
+            Msg::TeamWarp { level, .. } => {
+                self.got_team_warp(id, level);
+                self.net
+                    .broadcast(&Msg::TeamWarp { from: id, level }, true, Some(id));
             }
             Msg::Pilot(vessel, None) => {
                 let t = self.time;
@@ -1624,7 +1678,7 @@ impl Game {
             Msg::MobGone(id) => self.survival.remove_replica(id),
             Msg::MobHandoff { mob, .. } => self.adopt_mob(*mob),
             Msg::VesselNew(vessel) => {
-                if finite(vessel.position) {
+                if finite(vessel.position) && vessel_is_sound(&vessel) {
                     self.add_remote_vessel(*vessel);
                 }
             }
@@ -1635,6 +1689,13 @@ impl Game {
                 }
             }
             Msg::Pilot(vessel, pilot) => self.got_pilot(vessel, pilot),
+            Msg::CraftEdit { vessel, change } => {
+                if craft_change_is_sound(&change) {
+                    self.apply_craft_change(vessel, change);
+                }
+            }
+            Msg::Team { who, team } => self.got_team(who, team),
+            Msg::TeamWarp { from, level } => self.got_team_warp(from, level),
             Msg::Sky { who, watches } => self.got_sky(who, watches),
             Msg::WeatherSystems { from, systems } => {
                 if from == self.net.sky && systems.len() <= MAX_SYSTEMS_SENT {
@@ -1715,6 +1776,8 @@ impl Game {
         self.survival.clear_mobs();
         self.other.state.clear_mobs();
         self.flight.boarded = None;
+        self.flight.aboard = None;
+        self.flight.seat = None;
         self.flight.eva = None;
         self.flight.map = false;
         self.flight.planner = Planner::default();
@@ -1753,6 +1816,8 @@ impl Game {
         self.net.follow = Some(Follow {
             player: HOST,
             once: true,
+            ride: false,
+            team: false,
         });
         self.net.loaded = true;
         self.net.heard = Instant::now();
@@ -1968,7 +2033,7 @@ impl Game {
         timeline::place_vessel(&self.bodies, v, state, t);
         v.spin = state.spin.as_dvec3();
         v.throttle = state.throttle as f64;
-        v.fuel = (state.fuel as f64).clamp(0.0, FUEL_CAPACITY);
+        v.fuel = (state.fuel as f64).clamp(0.0, v.fuel_capacity());
         v.temperature = state.temperature as f64;
         v.heating = state.heating as f64;
         v.landed = state.landed;
@@ -2071,6 +2136,7 @@ impl Game {
                 let ahead = remote.heard.elapsed().as_secs_f64().min(0.25);
                 let target = pose.feet + pose.velocity.as_dvec3() * ahead;
                 remote.feet += (target - remote.feet) * (1.0 - (-dt as f64 * 14.0).exp());
+                let aboard = pose.aboard;
                 remote.look = remote.look.lerp(pose.look, approach(0.0, 1.0, 16.0, dt));
                 let up = remote.feet.normalize_or(DVec3::Y);
                 let speed = (pose.velocity.as_dvec3() - up * pose.velocity.as_dvec3().dot(up))
@@ -2098,17 +2164,32 @@ impl Game {
                 remote.arm = (remote.arm - dt * 4.0).max(working);
                 let near = pose.body == self.active
                     && !pose.spectator
-                    && pose.vessel.is_none()
+                    && (pose.vessel.is_none() || aboard.is_some())
                     && (remote.feet - camera).length() < AVATAR_VIEW;
-                (near, pose.held, pose.time, pose.on_ground, pose.can_rail)
+                (
+                    near,
+                    pose.held,
+                    pose.time,
+                    pose.on_ground,
+                    pose.can_rail,
+                    aboard,
+                )
             };
-            let (visible, item_kind, time, on_ground, can_rail) = visible_info;
+            let (visible, item_kind, time, on_ground, can_rail, aboard) = visible_info;
             let visible = visible && !self.floating_elsewhen(time, on_ground, can_rail);
             if !visible {
                 continue;
             }
+            // Aboard, they are wherever the vehicle has taken them on this machine.
+            let on_vehicle = aboard.and_then(|a| self.aboard_world(&a));
             let remote = self.net.players.get_mut(&id).expect("listed");
-            let up = remote.feet.normalize_or(DVec3::Y);
+            if let Some((feet, _)) = on_vehicle {
+                remote.feet = feet;
+            }
+            let up = match on_vehicle {
+                Some((_, up)) => up.normalize_or(DVec3::Y),
+                None => remote.feet.normalize_or(DVec3::Y),
+            };
             let look = remote.look.as_dvec3();
             let forward = (look - up * look.dot(up)).normalize_or(up.any_orthonormal_vector());
             let look_pitch = look.dot(up).clamp(-1.0, 1.0).asin() as f32;
@@ -2184,7 +2265,10 @@ impl Game {
         let camera = self.camera.position - self.planet.center;
         for remote in self.net.players.values() {
             let Some(pose) = &remote.pose else { continue };
-            if pose.body != self.active || pose.spectator || pose.vessel.is_some() {
+            if pose.body != self.active
+                || pose.spectator
+                || (pose.vessel.is_some() && pose.aboard.is_none())
+            {
                 continue;
             }
             let up = remote.feet.normalize_or(DVec3::Y);
@@ -2237,6 +2321,11 @@ impl Game {
                 None => self.console.print("Nobody by that name"),
             },
             ["unfollow"] => self.unfollow(),
+            ["team", "leave"] => self.leave_team(),
+            ["team", who] => match self.player_named(who) {
+                Some(id) => self.join_team(id),
+                None => self.console.print("Nobody by that name"),
+            },
             ["status"] | [] => {
                 let line = format!(
                     "{:?}, {} players, steam {}",
@@ -2362,8 +2451,23 @@ impl Game {
 }
 
 /// Nothing in a pose that could break the clock or the drawing.
+fn vessel_is_sound(v: &Vessel) -> bool {
+    v.craft
+        .as_ref()
+        .is_none_or(|c| c.parts().len() <= MAX_PARTS)
+}
+
+fn craft_change_is_sound(change: &CraftChange) -> bool {
+    let at = match change {
+        CraftChange::Put(part) => part.at,
+        CraftChange::Take(at) => *at,
+    };
+    at.iter().all(|c| c.abs() <= MAX_REACH)
+}
+
 fn pose_is_sound(pose: &PlayerPose) -> bool {
-    finite(pose.feet)
+    pose.aboard.is_none_or(|a| a.feet.is_finite())
+        && finite(pose.feet)
         && pose.time.is_finite()
         && pose.rate.is_finite()
         && (0.0..=2.0e6).contains(&pose.rate)

@@ -691,7 +691,7 @@ impl Game {
         if hurt {
             let at = self.camera.position - self.planet.center;
             if self.survival.hurt(3.0, false, at) {
-                self.respawn();
+                self.die("hit by something flying", None);
             }
         }
     }
@@ -817,11 +817,11 @@ impl Game {
             .cell_at(feet - up * 0.2)
             .and_then(|c| self.streamer.block(c))
             == Some(Block::Lava);
-        if on_lava {
+        if on_lava && self.death.is_none() {
             self.weather_fx.burn = 0.5;
             let at = self.camera.position - self.planet.center;
             if self.survival.hurt(2.0, true, at) {
-                self.respawn();
+                self.die("burned in lava", None);
             }
         }
     }

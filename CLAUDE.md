@@ -36,7 +36,7 @@ world opens the pause menu (resume, settings, save and leave); F11 toggles fulls
 **Playing together:** "open to others" in the pause menu hosts the world (over Steam and on UDP/TCP
 port 47777); "multiplayer" on the main menu joins by address or a Steam friend who is hosting.
 Everyone warps on their own; "time" in the pause menu syncs to another player's time and weather,
-or follows their warp.
+follows their warp, or joins their team (a team warps as one).
 
 **Controls:** click to capture the mouse. The ` key opens the debug console
 (`help` lists the commands: `gamemode`, `tp`, `orbit`, `launch`, `time`, `warp`, `drag`, ...).
@@ -68,6 +68,11 @@ or follows their warp.
   - **Middle click sorts the inventory.** Clicking outside the panel drops the held stack.
 - **Time warp:** `.` and `,` raise and lower it (x1 up to x1,000,000), as in KSP. In a shared
   game it is your own (see `app/timeline.rs`).
+- **Vehicles** (planes, rockets, rovers, built from blocks): right click a vehicle core on top of a
+  block, then build onto it. R turns the next engine, wing or seat. Right click a seat to sit:
+  the first one in flies it, and F stands up. Walk around on it like anywhere else.
+  Flying: as for rockets, plus W/S drive wheels, A/D steer them, Space brakes, V sees from the
+  seat. `vehicle <plane|rover|rocket>` in the console makes a ready-made one.
 - **Rockets** (test rocket: `give rocket`, or `rocket` in the console):
   - Right click with it on top of a block stands it there; right click a rocket to get in,
     left click a landed one to pick it up.
@@ -94,7 +99,7 @@ or follows their warp.
 | `ASTRO_WARP=<factor>` | Initial time warp. |
 | `ASTRO_FACE_SUN=1` | Turn the camera towards the sun's compass direction (sunset shots). |
 | `ASTRO_MODE=<mode>` | Starting game mode: survival (default), creative or spectator. **Use `spectator` for camera captures**: in survival you fall. |
-| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). For survival tests: `aim <pitch> [yaw]`, `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net sync <who>`, `net follow <who>`, `net unfollow` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
+| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). For survival tests: `aim <pitch> [yaw]`, `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `vehicle <plane|rover|rocket> [m]`, `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
 | `ASTRO_MENU=1` | Start on the main menu even in a capture (otherwise captures and runs with `ASTRO_SPAWN`, `ASTRO_MODE`, `ASTRO_TIME` or `ASTRO_COMMANDS` go straight into an unsaved world). Menu tests: `menu <main\|worlds\|create\|settings\|pause>`, `world create <name> [seed] [mode]`, `world load <name>`, `world leave`, `save`, `settings [vsync on\|off] [fps <n>] [volume <0-100>]`. |
 | `ASTRO_SAVE_DIR=<folder>` | Where worlds and settings are kept. **Automated tests must set this**: a capture without it can't save at all, so it can't touch the owner's worlds. |
 | `ASTRO_STEAM=1` | Use Steam even in a capture. Off by default there: a test run would show the owner as playing on their account. |
@@ -126,7 +131,9 @@ src/
     lava.rs         rivers of lava, lava bombs, lava running into openings, cooling
     worlds.rs       the two block worlds (home, the moon): which is active, switching, the other one's far terrain
     multiplayer.rs  hosting and joining; every message's effect on the game; other players' figures and name tags
-    timeline.rs     each player's own clock and warp: sync, follow, whose weather you watch, rockets at another time
+    timeline.rs     each player's own clock and warp: sync, follow, teams, riding along, whose weather you watch, rockets at another time
+    vehicles.rs     vehicles in the game: starting and building them, walking aboard, seats, passengers
+    death.rs        dying: the death screen, watching the wreck, respawning
   player/
     mod.rs          Player: inertial-frame physics, voxel collision, modes, rails warp, fall height
     interact.rs     ray cast to the targeted block, its outline matrix
@@ -145,6 +152,9 @@ src/
     models.rs       the animals' box models (many small tinted boxes, tiled coats) and their animation
   flight/
     vessel.rs       Vessel: the test rocket's physics (thrust, reaction wheels, SAS, drag, fins, reentry heat, landing, crashing, SOI changes, rails)
+    craft.rs        Craft: a vehicle's grid of parts, and what follows from them (mass, centre of mass, inertia, engines, wings, wheels)
+    craft_physics.rs  a vehicle as one rigid body: engines and wings where they sit, wheels on springs, the hull against the ground
+    craft_model.rs  a vehicle's mesh (rebuilt when its parts change, drawn turned into place)
     rocket_model.rs the rocket's box model (glows when hot)
     hud.rs          flight HUD: attitude ball with direction markers, throttle and heat gauges, SAS buttons, telemetry; `Pointer` + `button` widgets
     map_view.rs     map overlay: patched-conic trajectories, markers, the maneuver planner (`Planner`) and its node panel
@@ -616,6 +626,11 @@ shaders/
   - Models are rebuilt every frame and they use the player's collision sweep. A ray
     against their box (longer in front, where the head is: `MobKind::length`) beats the
     block behind them for targeting.
+- **Death** (`app/death.rs`): `Game::die` drops the items (survival only) and the world carries
+  on until the death screen's button (or `respawn` in the console) calls `Game::respawn`. In a
+  crash the camera circles the wreck; otherwise the view sinks to the ground. A crash stops at the
+  screen in creative too. While dead, `Survival::dead` keeps the player from being hurt or picking
+  up what they dropped, and others see nobody. Dead worlds aren't autosaved, and leaving respawns first.
 - **Hunger** (Minecraft's rules): food 0-20 plus hidden saturation. Exhaustion costs a point
   of saturation, then food, per 4. It comes from sprinting 0.1/m, jumping 0.05 (sprint-jump
   0.2), hits 0.1, mining 0.005 and healing 6.
@@ -815,6 +830,43 @@ shaders/
   encounters, impacts, body names and rings, the moon's orbit, nodes and their panel.
 - **Rendering:** rockets are rebuilt every frame (`rocket_model`).
 
+### Vehicles built from blocks (flight/craft*, app/vehicles.rs)
+- **A vehicle is a `Vessel` with a `Craft`**, so the map, time warp, SOI changes, saving and the
+  network come for free. `Vessel::position` stays the centre of mass; it moves when parts or
+  fuel change, so every change goes through `rebuild_craft`, which keeps the parts where they
+  are in the world. Grid coordinates are meters from the core, +Y up where the core was placed.
+- **Parts** are `Block`s: any ordinary block (by weight: `part_mass`), plus `is_vehicle_part`
+  ones, which only exist on a vehicle. `Part::facing` is a direction index: where an exhaust
+  leaves, which way a wing lifts. `auto_facing` picks it from where the part is put, R overrides.
+- **`Stats`** is everything that follows from the parts (`rebuild`). `forward` is where the
+  engines push, else where the core faces; the pilot's pitch, yaw and roll are about those axes.
+- **Physics** (`craft_physics`, 240 Hz): forces at each part, in grid axes, so position decides
+  the turning. Engines have their own relation to air (`AirUse`). Each surface finds its own
+  angle to the flow and stalls by itself; flaps deflect to give the torque asked for. Body drag
+  uses the silhouette along each axis. Reaction wheels: the core and `Gyro`s. Flaps stop at the
+  stall angle, and are solved together (`FlapPlan`) so they give the turn asked for and no other:
+  a fin asked to help a roll would otherwise swing the nose. Planes need flaps out on the wings
+  to roll well (the ready-made plane's outer wing blocks). The stall guard (`guard_the_stall`) keeps the pilot and SAS from pitching fixed
+  wings past it, so holding the stick back rides the edge of the stall; tests pin this.
+  Numbers to tune: `engine_kind`, `part_mass`, `TANK_FUEL`, the constants at the top of `craft_physics`.
+  Atmosphere is thin high up (1.2 km scale height), so planes top out at a few km.
+- **Ground:** wheels are spring-damper rays along grid -Y that see `STEP_UP` above the axle, so
+  they climb single blocks (the terrain is all terraces). The hull meets the ground at its outer
+  corners with impulses. Hitting faster than `CRASH_SPEED` breaks that part off (and whatever it
+  held on: anything no longer joined to the core comes off), `WRECK_SPEED` or losing the core
+  destroys it. Still for `STILL_TIME`, it becomes `landed` as a rocket does.
+- **Aboard** (`Flight::aboard`): the player is held in grid coordinates and moves there, down
+  is always the deck's -Y whatever the vehicle does, and the view turns with it. On foot, vehicles
+  are solid (`meet_vehicles`, a sweep in grid coordinates); landing on one puts you aboard, and
+  walking off the edge hands you back to the world's physics with the vehicle's speed.
+  `meet_vehicles` must run after `update_vessels`: a parked vehicle's inertial position is only
+  right at the time it was last synced, and the planet turns it over a metre per frame.
+  For the same reason walking off only takes effect at the end of `place_aboard`. Taking off in
+  creative leaves the vehicle (`toggle_flight`), and a flying player never lands on one: to land,
+  stop flying.
+- **Seats:** the first to sit flies it (`boarded`, as a rocket); anyone else aboard rides along
+  and their clock is attached to the pilot's (`keep_ride`).
+
 ### Two worlds: home and the moon (app/worlds.rs)
 - **The moon is a block world** like home: its own `Planet` grid (512 chunks per face edge,
   16,384 columns, an 11 km datum radius, 512 layers above it), `TerrainGenerator::moon`,
@@ -997,6 +1049,9 @@ shaders/
   flight (refused if the path comes down first; in flight only forward). `VesselState` says
   when it was true, and `vessel_at` shows that rocket at the viewer's time. New messages about
   anything tied to the clock must carry the sender's time.
+- **Teams** (`Multiplayer::team`): pressing a warp key sends `TeamWarp`, and the others on the team
+  then follow that player (`Follow::team`) until someone else changes it. Whoever sets the pace is
+  held at physics warp while a team mate is flying through air (`keep_team`).
 - **The menu doesn't pause a game with others** (`paused`).
 - **Steam:** `Client::init_app(480)` at start; nothing else is needed on disk, except that
   `steam_api64.dll` must be next to the executable, even offline (`build.rs` copies it into
@@ -1084,7 +1139,10 @@ shaders/
   - armor drawn on the player
 - Water doesn't flow. Edited cells don't update the fake sky light, and LOD tiles don't show
   edits. Worlds all have the same size; the seed is the only thing that differs.
-- Flight is a first test: one built-in rocket, no staging or parts. Rockets made of blocks would replace it (rigid bodies built from the grid).
+- Vehicles: no docking or staging, no parachutes, no water (they sink through it). Blocks with
+  their own contents (chests, furnaces, torches, crafting tables) can't go on one. Walking aboard
+  has no ladders: build steps of blocks. Deck gravity always points at the deck, even upside down.
+- The built-in test rocket is still there, with its simpler model.
   - It collides as an upright box at its engine:
     tipping over is a rule (more than ~50 degrees off vertical), not physics. Water isn't
     solid for it.

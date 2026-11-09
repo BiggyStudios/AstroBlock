@@ -63,6 +63,8 @@ pub enum Action {
     Delete(usize),
     SettingsChanged,
     Resume,
+    /// The death screen's button.
+    Respawn,
     /// Save and go back to the main menu.
     LeaveWorld,
     Quit,
@@ -84,6 +86,9 @@ pub enum Action {
     /// And stay attached to their time warp.
     FollowTime(u32),
     StopFollowing,
+    /// Joins this player's team.
+    JoinTeam(u32),
+    LeaveTeam,
     CancelJoin,
 }
 
@@ -105,6 +110,8 @@ pub struct TimeRow {
     /// How fast their clock runs.
     pub rate: String,
     pub following: bool,
+    /// On this player's team.
+    pub team: bool,
     pub apart: bool,
 }
 
@@ -655,6 +662,8 @@ impl Menu {
         ui.text(x, y, "sync jumps you to their time and weather", DIM);
         y += ch + 2.0 * s;
         ui.text(x, y, "follow keeps you with them whenever they warp", DIM);
+        y += ch + 2.0 * s;
+        ui.text(x, y, "a team warps as one, whoever presses the key", DIM);
         y += ch + 14.0 * s;
         let bottom_row = ui.height - 30.0 * s;
         let row = ch + 7.0 * s;
@@ -676,7 +685,7 @@ impl Menu {
             } else {
                 "follow"
             };
-            let (follow, _) = button(
+            let (follow, follow_w) = button(
                 ui,
                 pointer,
                 buttons + w + 6.0 * s,
@@ -690,6 +699,27 @@ impl Menu {
                     Action::StopFollowing
                 } else {
                     Action::FollowTime(other.id)
+                });
+            }
+            let team_label = if other.team {
+                "leave team"
+            } else {
+                "join team"
+            };
+            let (team, _) = button(
+                ui,
+                pointer,
+                buttons + w + follow_w + 12.0 * s,
+                y,
+                team_label,
+                other.team,
+                true,
+            );
+            if team {
+                actions.push(if other.team {
+                    Action::LeaveTeam
+                } else {
+                    Action::JoinTeam(other.id)
                 });
             }
             y += row;

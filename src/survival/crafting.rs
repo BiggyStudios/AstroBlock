@@ -101,6 +101,7 @@ fn recipes() -> &'static [Recipe] {
                 1,
             ),
         ];
+        all.extend(vehicle_recipes());
         for tier in Tier::ALL {
             let material = match tier {
                 Tier::Wood => Planks,
@@ -147,6 +148,85 @@ fn recipes() -> &'static [Recipe] {
         }
         all
     })
+}
+
+/// What vehicles are made of.
+fn vehicle_recipes() -> Vec<Recipe> {
+    use Ingredient::*;
+    let iron = ('I', Exactly(Item::IronIngot));
+    let copper = ('C', Exactly(Item::CopperIngot));
+    let gold = ('G', Exactly(Item::GoldIngot));
+    let leather = ('L', Exactly(Item::Leather));
+    let coal = ('O', Coal);
+    let planks = ('P', Planks);
+    let furnace = ('F', Exactly(Item::Block(Block::Furnace)));
+    let wheel = ('W', Exactly(Item::Block(Block::Wheel)));
+    let made = |b| Item::Block(b);
+    vec![
+        recipe(
+            &["IGI", "GCG", "IGI"],
+            &[iron, gold, copper],
+            made(Block::VehicleCore),
+            1,
+        ),
+        recipe(&["II", "II"], &[iron], made(Block::Hull), 8),
+        recipe(
+            &["L  ", "LLL", "I I"],
+            &[leather, iron],
+            made(Block::Seat),
+            1,
+        ),
+        recipe(
+            &["III", "IOI", "III"],
+            &[iron, coal],
+            made(Block::FuelTank),
+            1,
+        ),
+        recipe(
+            &["P P", " I ", "P P"],
+            &[planks, iron],
+            made(Block::Propeller),
+            1,
+        ),
+        recipe(
+            &["III", "CFC", "III"],
+            &[iron, copper, furnace],
+            made(Block::JetEngine),
+            1,
+        ),
+        recipe(
+            &["I I", "IFI", "C C"],
+            &[iron, copper, furnace],
+            made(Block::RocketEngine),
+            1,
+        ),
+        recipe(
+            &["G G", "GFG", " I "],
+            &[gold, furnace, iron],
+            made(Block::OrbitalEngine),
+            1,
+        ),
+        recipe(&["PPP", "III"], &[planks, iron], made(Block::Wing), 2),
+        recipe(
+            &["PPP", "ICI"],
+            &[planks, iron, copper],
+            made(Block::Flap),
+            2,
+        ),
+        recipe(
+            &["ICI", "CGC", "ICI"],
+            &[iron, copper, gold],
+            made(Block::Gyro),
+            1,
+        ),
+        recipe(
+            &[" L ", "LIL", " L "],
+            &[leather, iron],
+            made(Block::Wheel),
+            2,
+        ),
+        recipe(&["I", "W"], &[iron, wheel], made(Block::LandingGear), 1),
+    ]
 }
 
 /// The result of the items in a crafting grid `width` cells wide (row-major), if any.
