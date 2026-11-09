@@ -9,7 +9,8 @@ use std::ops::Range;
 use glam::DVec3;
 
 use crate::{
-    mobs::models::{Rgb, Rig},
+    mobs::models::{Rgb, Rig, multiply},
+    player::HEIGHT,
     render::{
         ChunkMesh,
         models::{Light, build, pitch},
@@ -35,6 +36,35 @@ pub struct AvatarPose {
     pub look_pitch: f32,
     /// Holding something out in front.
     pub holding: bool,
+    /// Just been hit: the figure flashes red.
+    pub hurt: bool,
+}
+
+/// How far the figure reaches from its middle, arms included (m).
+const HALF_WIDTH: f64 = 0.45;
+
+/// Distance along a ray (unit direction) to the box around a figure standing at `feet`, if hit.
+pub fn ray_hit(feet: DVec3, up: DVec3, origin: DVec3, dir: DVec3, reach: f64) -> Option<f64> {
+    let right = up.any_orthonormal_vector();
+    let axes = [right, up.cross(right), up];
+    let rel = origin - (feet + up * (HEIGHT * 0.5));
+    let (mut near, mut far) = (0.0f64, reach);
+    for (axis, half) in axes.iter().zip([HALF_WIDTH, HALF_WIDTH, HEIGHT * 0.5]) {
+        let (o, d) = (rel.dot(*axis), dir.dot(*axis));
+        if d.abs() < 1e-9 {
+            if o.abs() > half {
+                return None;
+            }
+            continue;
+        }
+        let (a, b) = ((-half - o) / d, (half - o) / d);
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+        if near > far {
+            return None;
+        }
+    }
+    Some(near)
 }
 
 /// Where a held item goes, from the feet: (right, forward, up) in metres.
@@ -100,6 +130,12 @@ pub fn avatar_model(pose: &AvatarPose, (forward, up): (DVec3, DVec3), light: Lig
     let look = pose.look_pitch.clamp(-1.2, 1.2);
     rig.turn(head, |p| pitch(p, [0.0, 22.0], look));
 
+    if pose.hurt {
+        for q in &mut rig.quads {
+            q.tint = multiply(q.tint, [1.0, 0.3, 0.3]);
+        }
+    }
+
     let right_axis = forward.cross(up);
     let s = 1.0 / 16.0;
     let place = |[x, y, z]: [f32; 3]| {
@@ -121,9 +157,35 @@ mod tests {
                 arm: 0.5,
                 look_pitch: 0.4,
                 holding: true,
+                hurt: walk > 1.0,
             };
             let mesh = avatar_model(&pose, (DVec3::Y, DVec3::Z), Light::default());
             assert!(!mesh.opaque.is_empty());
         }
+    }
+
+    #[test]
+    fn a_figure_is_hit_where_it_stands() {
+        let up = DVec3::Z;
+        let feet = DVec3::new(0.0, 3.0, 0.0);
+        let eye = DVec3::new(0.0, 0.0, 1.6);
+        let ahead = DVec3::Y;
+        let t = ray_hit(feet, up, eye, ahead, 4.5).expect("straight at it");
+        assert!((t - 2.55).abs() < 1e-6, "{t}");
+        assert!(ray_hit(feet, up, eye, ahead, 2.0).is_none(), "out of reach");
+        let beside = DVec3::new(1.0, 3.0, 0.0);
+        assert!(
+            ray_hit(beside, up, eye, ahead, 4.5).is_none(),
+            "off to the side"
+        );
+        let over = eye + DVec3::Z * 0.5;
+        assert!(
+            ray_hit(feet, up, over, ahead, 4.5).is_none(),
+            "over its head"
+        );
+        assert!(
+            ray_hit(feet, up, eye, -ahead, 4.5).is_none(),
+            "behind the eye"
+        );
     }
 }

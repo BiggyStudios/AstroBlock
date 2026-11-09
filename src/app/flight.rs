@@ -583,7 +583,9 @@ impl Game {
             if Some(i) == self.flight.boarded {
                 continue;
             }
-            if v.landed.is_some() {
+            // (An engine left running keeps running with nobody at the controls.)
+            let burning = v.engines_on();
+            if v.landed.is_some() && !burning {
                 v.sync_landed(&self.bodies, t1);
                 continue;
             }
@@ -599,9 +601,8 @@ impl Game {
                 }
                 continue;
             }
-            v.throttle = 0.0;
             let mut from = t0;
-            if v.can_rail_warp(&self.bodies) {
+            if !burning && v.can_rail_warp(&self.bodies) {
                 from = v.rails(&self.bodies, (t0, t1)).0;
             }
             if client {
@@ -1087,7 +1088,8 @@ impl Game {
         for i in 0..self.flight.vessels.len() {
             let v = &self.flight.vessels[i];
             let near = v.world_position(&self.bodies, self.active, self.time) - eye;
-            if Some(i) != self.flight.boarded && v.pilot.is_some() && near.length() < 6_000.0 {
+            let running = v.pilot.is_some() || v.engines_on();
+            if Some(i) != self.flight.boarded && running && near.length() < 6_000.0 {
                 self.vessel_effects(i, dt, &mut out);
             }
         }

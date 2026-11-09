@@ -94,6 +94,29 @@ pub enum Outgoing {
         creative: bool,
     },
     MobGone(u32),
+    /// Another player was struck (they decide what it does).
+    PlayerHit {
+        to: u32,
+        damage: f32,
+        from: DVec3,
+    },
+}
+
+/// Another player in the line of sight.
+#[derive(Clone, Debug)]
+pub struct Person {
+    pub id: u32,
+    pub name: String,
+    /// Along the line of sight (m).
+    pub distance: f64,
+}
+
+/// What the crosshair is on, when it isn't a block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Aimed {
+    /// An index into `mobs`.
+    Mob(usize),
+    Person,
 }
 
 /// A placed model block (crafting table, furnace, chest, torch).
@@ -1005,16 +1028,27 @@ impl Survival {
             .map(|(i, _)| i)
     }
 
-    /// What the crosshair is on: an animal (returned, as an index into `mobs`) beats the
-    /// block `target`. Names it in `target_name`.
-    pub fn aim(&mut self, pose: &Pose, reach: f64, target: Option<&Hit>) -> Option<usize> {
+    /// What the crosshair is on: the nearest of an animal or another player (returned), which
+    /// beat the block `target` if they are in front of it. Names it in `target_name`.
+    pub fn aim(
+        &mut self,
+        pose: &Pose,
+        reach: f64,
+        target: Option<&Hit>,
+        person: Option<&Person>,
+    ) -> Option<Aimed> {
         let mob = self.mob_target(pose, reach, target);
-        self.target_name = match (mob, target) {
-            (Some(i), _) => Some(self.mobs[i].kind.name().to_string()),
-            (None, Some(hit)) => Some(hit.block.name()),
+        let mob_distance = mob.and_then(|i| self.mobs[i].ray_hit(pose.eye, pose.look, reach));
+        let block_distance = target.map_or(f64::MAX, |hit| hit.distance);
+        let person = person
+            .filter(|p| p.distance < block_distance && mob_distance.is_none_or(|d| p.distance < d));
+        self.target_name = match (person, mob, target) {
+            (Some(p), _, _) => Some(p.name.clone()),
+            (None, Some(i), _) => Some(self.mobs[i].kind.name().to_string()),
+            (None, None, Some(hit)) => Some(hit.block.name()),
             _ => None,
         };
-        mob
+        person.map(|_| Aimed::Person).or(mob.map(Aimed::Mob))
     }
 
     /// Mouse and keys in the world: break / attack (left), use / place / eat / wear (right),
@@ -1027,6 +1061,7 @@ impl Survival {
         mode: GameMode,
         pose: &Pose,
         target: Option<&Hit>,
+        person: Option<&Person>,
         reach: f64,
         dt: f32,
     ) -> Option<String> {
@@ -1034,21 +1069,23 @@ impl Survival {
         self.action_cooldown -= dt;
         self.attack.0 = (self.attack.0 - dt).max(0.0);
         let mut message = None;
-        let mob = self.aim(pose, reach, target);
-        let target = if mob.is_some() { None } else { target };
+        let aimed = self.aim(pose, reach, target, person);
+        let target = if aimed.is_some() { None } else { target };
 
         // Q drops one of the held item, Ctrl+Q the whole stack.
         if input.pressed(KeyCode::KeyQ) {
             self.throw_held(pose, input.held(KeyCode::ControlLeft));
         }
 
-        // Left: attack an animal, break the targeted block, or swing at nothing.
-        if input.button_pressed(MouseButton::Left)
-            && let Some(i) = mob
-        {
-            message = self.attack_mob(i, pose, creative);
+        // Left: attack an animal or another player, break the targeted block, or swing at nothing.
+        if input.button_pressed(MouseButton::Left) {
+            match (aimed, person) {
+                (Some(Aimed::Mob(i)), _) => message = self.attack_mob(i, pose, creative),
+                (Some(Aimed::Person), Some(p)) => message = self.attack_player(p, pose),
+                _ => {}
+            }
         }
-        if input.button_held(MouseButton::Left) && mob.is_none() {
+        if input.button_held(MouseButton::Left) && aimed.is_none() {
             match target {
                 Some(hit) if creative => {
                     if input.button_pressed(MouseButton::Left) || self.action_cooldown <= 0.0 {
@@ -1199,12 +1236,7 @@ impl Survival {
 
     /// Hits an animal with the held item: full damage when the weapon has recharged.
     pub fn attack_mob(&mut self, i: usize, pose: &Pose, creative: bool) -> Option<String> {
-        self.swings += 1;
-        let (damage, speed) = self.held().map_or((1.0, 4.0), |s| s.item.attack());
-        let charge = 1.0 - self.attack.0 / self.attack.1.max(1e-3);
-        let damage = damage * (0.2 + 0.8 * charge * charge);
-        self.attack = (1.0 / speed, 1.0 / speed);
-        self.exert(0.1);
+        let damage = self.strike();
         let mob = &mut self.mobs[i];
         let (kind, at) = (mob.kind, mob.center());
         if mob.remote.is_some() {
@@ -1225,6 +1257,31 @@ impl Survival {
                 self.kill_mob(i, kind, at, creative);
             }
         }
+        self.wear_from_hit()
+    }
+
+    /// Hits another player with the held item, as an animal would be: they decide what it does.
+    pub fn attack_player(&mut self, person: &Person, pose: &Pose) -> Option<String> {
+        let damage = self.strike();
+        self.outbox.push(Outgoing::PlayerHit {
+            to: person.id,
+            damage,
+            from: pose.feet,
+        });
+        self.wear_from_hit()
+    }
+
+    /// Swings the held item at something: how hard it lands, by how far it has recharged.
+    fn strike(&mut self) -> f32 {
+        self.swings += 1;
+        let (damage, speed) = self.held().map_or((1.0, 4.0), |s| s.item.attack());
+        let charge = 1.0 - self.attack.0 / self.attack.1.max(1e-3);
+        self.attack = (1.0 / speed, 1.0 / speed);
+        self.exert(0.1);
+        damage * (0.2 + 0.8 * charge * charge)
+    }
+
+    fn wear_from_hit(&mut self) -> Option<String> {
         // Swords lose 1 durability per hit, other tools 2.
         match self.tool() {
             Some((ToolKind::Sword, _)) => self.wear_tool(1),
@@ -2221,6 +2278,39 @@ mod tests {
             look: DVec3::X,
             feet: DVec3::Y * 98.0,
         }
+    }
+
+    #[test]
+    fn another_player_can_be_struck() {
+        let mut s = Survival::default();
+        let person = Person {
+            id: 3,
+            name: "them".to_string(),
+            distance: 2.0,
+        };
+        assert_eq!(
+            s.aim(&pose(), 4.5, None, Some(&person)),
+            Some(Aimed::Person)
+        );
+        assert_eq!(s.target_name.as_deref(), Some("them"));
+        let blows = |s: &Survival| -> Vec<(u32, f32)> {
+            s.outbox
+                .iter()
+                .filter_map(|o| match o {
+                    Outgoing::PlayerHit { to, damage, .. } => Some((*to, *damage)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // A recharged fist lands in full, and one straight after it hardly at all.
+        s.attack = (0.0, 1.0);
+        s.attack_player(&person, &pose());
+        s.attack_player(&person, &pose());
+        let landed = blows(&s);
+        assert_eq!(landed.len(), 2);
+        assert_eq!(landed[0], (3, 1.0));
+        assert!(landed[1].1 < 0.3, "{}", landed[1].1);
+        assert_eq!(s.swings, 2);
     }
 
     #[test]

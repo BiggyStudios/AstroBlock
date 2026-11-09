@@ -370,6 +370,17 @@ impl Vessel {
         self.broke_off.extend(removed.parts);
     }
 
+    /// The throttle is up and there is an engine with something to burn. (Not for use inside a
+    /// physics step: the craft is taken out of the vessel for that.)
+    pub fn engines_on(&self) -> bool {
+        self.throttle > 0.0
+            && self.fuel > 0.0
+            && self
+                .craft
+                .as_ref()
+                .is_none_or(|c| !c.stats.engines.is_empty())
+    }
+
     /// Mass right now (kg).
     pub fn mass(&self) -> f64 {
         match &self.craft {

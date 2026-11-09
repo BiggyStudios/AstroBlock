@@ -34,7 +34,7 @@ pub const MAX_REACH: i16 = 60;
 /// Fuel in a tank (kg).
 pub const TANK_FUEL: f64 = 100.0;
 /// The speed a propeller has no thrust left at (m/s).
-pub const PROPELLER_TOP: f64 = 170.0;
+pub const PROPELLER_TOP: f64 = 400.0;
 /// Wheels stick this far out of their cell, and the spring gives this much at rest (m).
 pub const WHEEL_RADIUS: f64 = 0.7;
 pub const SPRING_REST: f64 = 0.12;
@@ -105,7 +105,7 @@ pub fn engine_kind(block: Block) -> Option<EngineKind> {
         })
     };
     match block {
-        Block::Propeller => kind(16_000.0, 40_000.0, AirUse::Propeller(PROPELLER_TOP)),
+        Block::Propeller => kind(26_000.0, 65_000.0, AirUse::Propeller(PROPELLER_TOP)),
         Block::JetEngine => kind(26_000.0, 18_000.0, AirUse::Breathes),
         Block::RocketEngine => kind(30_000.0, 4_000.0, AirUse::Rocket),
         Block::OrbitalEngine => kind(7_000.0, 7_000.0, AirUse::Vacuum(0.3)),

@@ -99,7 +99,7 @@ follows their warp, or joins their team (a team warps as one).
 | `ASTRO_WARP=<factor>` | Initial time warp. |
 | `ASTRO_FACE_SUN=1` | Turn the camera towards the sun's compass direction (sunset shots). |
 | `ASTRO_MODE=<mode>` | Starting game mode: survival (default), creative or spectator. **Use `spectator` for camera captures**: in survival you fall. |
-| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). For survival tests: `aim <pitch> [yaw]`, `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `vehicle <plane|rover|rocket> [m]`, `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
+| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). For survival tests: `aim <pitch> [yaw]`, `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `vehicle <plane|rover|rocket> [m]`, `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net punch` (strike the player in the crosshair, full strength), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
 | `ASTRO_MENU=1` | Start on the main menu even in a capture (otherwise captures and runs with `ASTRO_SPAWN`, `ASTRO_MODE`, `ASTRO_TIME` or `ASTRO_COMMANDS` go straight into an unsaved world). Menu tests: `menu <main\|worlds\|create\|settings\|pause>`, `world create <name> [seed] [mode]`, `world load <name>`, `world leave`, `save`, `settings [vsync on\|off] [fps <n>] [volume <0-100>] [sensitivity <25-400>] [smoothing on\|off]`. |
 | `ASTRO_SAVE_DIR=<folder>` | Where worlds and settings are kept. **Automated tests must set this**: a capture without it can't save at all, so it can't touch the owner's worlds. |
 | `ASTRO_STEAM=1` | Use Steam even in a capture. Off by default there: a test run would show the owner as playing on their account. |
@@ -851,7 +851,12 @@ shaders/
   Numbers to tune: `engine_kind`, `part_mass`, `TANK_FUEL`, the constants at the top of `craft_physics`.
   Atmosphere is thin high up (1.2 km scale height), so planes top out at a few km.
 - **Ground:** wheels are spring-damper rays along grid -Y that see `STEP_UP` above the axle, so
-  they climb single blocks (the terrain is all terraces). The hull meets the ground at its outer
+  they climb single blocks (the terrain is all terraces). The ground under a wheel is sampled along
+  the vehicle and rounded into ramps (`ROUND_*`), so it rises before the step and the hull clears
+  it. A wheel hanging off an edge (`DROOP`) still has some grip (`LEAST_GRIP`), and the hull of a
+  vehicle with wheels skids (`SKID_FRICTION`): without these it hangs on a step, the hull taking the
+  weight (a rover was stuck 58% of the time on real terrain). Tipped far over, a vehicle on driven
+  wheels rolls back onto them (`RIGHT_*`). The hull meets the ground at its outer
   corners with impulses. Hitting faster than `CRASH_SPEED` breaks that part off (and whatever it
   held on: anything no longer joined to the core comes off), `WRECK_SPEED` or losing the core
   destroys it. Still for `STILL_TIME`, it becomes `landed` as a rocket does.
@@ -865,7 +870,8 @@ shaders/
   creative leaves the vehicle (`toggle_flight`), and a flying player never lands on one: to land,
   stop flying.
 - **Seats:** the first to sit flies it (`boarded`, as a rocket); anyone else aboard rides along
-  and their clock is attached to the pilot's (`keep_ride`).
+  and their clock is attached to the pilot's (`keep_ride`). Leaving the seat leaves the throttle
+  where it is: an engine left on keeps running with nobody aboard (`Vessel::engines_on`).
 
 ### Two worlds: home and the moon (app/worlds.rs)
 - **The moon is a block world** like home: its own `Planet` grid (512 chunks per face edge,
@@ -1032,6 +1038,11 @@ shaders/
   it for that player, and the client holds it (`early`) until its world is built. Then it
   says `Ready` and gets the live, unreliable traffic.
 - **Things have ids** (`Survival::new_id`: player number << 24 | counter), not indices.
+- **Hitting each other:** left click on another player's figure, aimed at where it is drawn here
+  (`person_in_sights`; not someone at another time). It costs and wears like hitting an animal, and
+  sends `Msg::PlayerHit`. The one hit decides what it does (`player_hit_here`): armor counts, half a
+  second between blows, a shove, a red flash on their figure. Only survival players can hit or be hit
+  (`PlayerPose::survival`): a creative player's clicks go through to whatever is behind.
 - **Survival only reports.** Offline-capable code stays as it was, and `Survival::net` plus
   the `outbox` carry what others must hear; `apply_event` does the same to this copy without
   reporting it. Sounds made here go out from `play_sounds`.

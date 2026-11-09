@@ -1296,13 +1296,29 @@ impl Game {
         let origin = self.camera.position - self.planet.center;
         let dir = self.camera.forward().as_dvec3();
         self.target = interact::raycast(&self.planet, &self.streamer, origin, dir, reach);
-        // A rocket in front of the block beats it, and so does a vehicle.
-        let rocket = self.rocket_target(reach);
-        let vehicle = self.craft_target(reach);
+        // A rocket in front of the block beats it, and so does a vehicle; whoever is nearest of
+        // the others on foot beats those.
+        let mut rocket = self.rocket_target(reach);
+        let mut vehicle = self.craft_target(reach);
+        let mut person = self.person_in_sights(reach);
+        if let Some(p) = &person {
+            let rocket_first = rocket.is_some_and(|i| {
+                self.flight.vessels[i]
+                    .ray_hit(&self.bodies, self.active, self.time, origin, dir, reach)
+                    .is_some_and(|d| d < p.distance)
+            });
+            if rocket_first || vehicle.is_some_and(|v| v.distance < p.distance) {
+                person = None;
+            } else {
+                rocket = None;
+                vehicle = None;
+            }
+        }
         self.flight.pointed = vehicle;
         if self.survival.screen.is_some() || !self.mouse_grabbed {
             let pose = self.pose();
-            self.survival.aim(&pose, reach, self.target.as_ref());
+            self.survival
+                .aim(&pose, reach, self.target.as_ref(), person.as_ref());
             if rocket.is_some() {
                 self.survival.target_name = Some("rocket".to_string());
             }
@@ -1313,7 +1329,7 @@ impl Game {
         if self.input.pressed(KeyCode::KeyR) {
             self.turn_part();
         }
-        if rocket.is_none() && vehicle.is_none() {
+        if rocket.is_none() && vehicle.is_none() && person.is_none() {
             if self.place_rocket(right_click) || self.place_core(right_click) {
                 return;
             }
@@ -1349,6 +1365,7 @@ impl Game {
             self.player.mode,
             &pose,
             target,
+            person.as_ref(),
             reach,
             dt,
         );
@@ -1537,6 +1554,7 @@ impl Game {
                     self.player.mode,
                     &pose,
                     self.target.as_ref(),
+                    None,
                     SURVIVAL_REACH,
                     0.0,
                 );

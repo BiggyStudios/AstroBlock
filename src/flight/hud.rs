@@ -305,7 +305,7 @@ pub fn draw(ui: &mut Ui, info: &FlightInfo, pointer: &mut Pointer, time: f32) ->
     ui.text(
         8.0 * s,
         y + 2.0 * s,
-        "wasd qe steer   shift/ctrl throttle   z/x full/cut   t sas   m map   f get out",
+        "wasd qe steer   shift/ctrl throttle   z/x full/cut   space wheel brake   t sas   m map   f get out",
         [190, 200, 210, 110],
     );
     actions

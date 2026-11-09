@@ -30,7 +30,7 @@ const SEA_AIR: f64 = 1.225;
 const LIFT_SLOPE: f64 = 5.5;
 const STALL: f64 = 0.28;
 const AFTER_STALL: f64 = 0.75;
-const BODY_DRAG: f64 = 0.5;
+const BODY_DRAG: f64 = 0.3;
 /// Stall guard: the pilot and SAS can't take fixed wings past this share of the flow against
 /// them (a little under `STALL`), easing off over the last `GUARD_MARGIN`. It only matters with
 /// this much dynamic pressure (Pa): slower or higher up, the wings aren't carrying the vehicle.
@@ -61,6 +61,23 @@ const ROLLING: f64 = 0.015;
 /// full of them. The spring never pushes harder than this many times its load when they do.
 const STEP_UP: f64 = 1.05;
 const MOST_SQUEEZE: f64 = 3.0;
+/// How wheels see the ground (see `meet_the_ground`): samples each way along the vehicle, how
+/// far apart (m), and how steep the ramps they make of steps are.
+const ROUND_SAMPLES: i32 = 4;
+const ROUND_SPACING: f64 = 0.3;
+const ROUND_SLOPE: f64 = 0.8;
+/// A wheel hanging off an edge still reaches the ground this much further down (m). Its grip
+/// there, and on a wheel hardly carrying anything, as a share of its share of the weight.
+const DROOP: f64 = 1.0;
+const LEAST_GRIP: f64 = 0.5;
+/// The hull on the ground of a vehicle with wheels slides: it is sitting on a step, not parked.
+const SKID_FRICTION: f64 = 0.1;
+/// Rolling back onto driven wheels: past this angle from upright (rad), towards this turn rate
+/// (rad/s), reaching it this fast (s), lifting it this many times its weight.
+const RIGHT_FROM: f64 = 0.65;
+const RIGHT_SPEED: f64 = 2.0;
+const RIGHT_TIME: f64 = 0.2;
+const RIGHT_LIFT: f64 = 1.3;
 /// Sliding sideways this fast (m/s), a tyre gives all its grip.
 const SLIDE_SPEED: f64 = 0.7;
 /// The hull on the ground.
@@ -361,7 +378,8 @@ impl Vessel {
         {
             self.meet_the_ground(craft, &m, ground, env, controls, t + dt, dt);
         }
-        self.settle_craft(bodies, t + dt, controls, dt);
+        let running = self.throttle > 0.0 && self.fuel > 0.0 && !stats.engines.is_empty();
+        self.settle_craft(bodies, t + dt, controls, running, dt);
         self.change_soi(bodies, t + dt);
     }
 
@@ -474,39 +492,59 @@ impl Vessel {
             let down = attitude * DVec3::NEG_Y;
             let body_origin = frame.to_body(origin);
             let body_down = frame.to_body(down);
-            // March down the suspension, then pin the surface down.
-            let mut hit = None;
-            let span = reach + STEP_UP;
-            let steps = (span / 0.1).ceil() as usize;
-            let first = body_origin - body_down * STEP_UP;
-            for i in 0..=steps {
-                let d = span * i as f64 / steps as f64;
-                if solid(first + body_down * d) {
-                    let (mut lo, mut hi) = ((d - span / steps as f64).max(0.0), d);
-                    for _ in 0..5 {
-                        let mid = (lo + hi) * 0.5;
-                        if solid(first + body_down * mid) {
-                            hi = mid;
-                        } else {
-                            lo = mid;
-                        }
-                    }
-                    hit = Some(hi - STEP_UP);
-                    break;
+            let body_ahead = frame.to_body(attitude * ahead);
+            // How far below the axle the ground is at a point `offset` along the vehicle. None:
+            // out of reach, or a wall (it is solid even as high as a wheel can climb).
+            let span = reach + DROOP + STEP_UP;
+            let steps = (span / 0.4).ceil() as usize;
+            let surface = |offset: f64| {
+                let start = body_origin + body_ahead * offset - body_down * STEP_UP;
+                if solid(start) {
+                    return None;
                 }
-            }
+                let mut lo = 0.0;
+                for i in 1..=steps {
+                    let d = span * i as f64 / steps as f64;
+                    if solid(start + body_down * d) {
+                        // Then pin it down. (Nothing is thin enough to step over.)
+                        let mut hi = d;
+                        for _ in 0..7 {
+                            let mid = (lo + hi) * 0.5;
+                            if solid(start + body_down * mid) {
+                                hi = mid;
+                            } else {
+                                lo = mid;
+                            }
+                        }
+                        return Some(hi - STEP_UP);
+                    }
+                    lo = d;
+                }
+                None
+            };
+            // A wheel rolls up a step, it doesn't meet it head on: the ground is rounded off
+            // into ramps, so the wheel starts to rise before the step and the hull clears it.
+            let hit = (-ROUND_SAMPLES..=ROUND_SAMPLES)
+                .filter_map(|i| {
+                    let offset = i as f64 * ROUND_SPACING;
+                    surface(offset).map(|d| d + offset.abs() * ROUND_SLOPE)
+                })
+                .reduce(f64::min);
             let Some(distance) = hit else { continue };
-            self.touching = true;
-            let contact = origin + down * distance;
+            let contact = origin + down * distance.min(reach);
             let arm = contact - self.position;
             let normal = frame.to_inertial(body_origin.normalize_or(DVec3::Y));
             let v = self.velocity + self.spin.cross(arm) - omega.cross(contact);
             let closing = v.dot(normal);
-            if closing < -CRASH_SPEED * WHEEL_TOUGHNESS {
-                self.breaking.push(cell_of(wheel.position));
-            }
             let squeeze = (reach - distance).min(SPRING_REST * MOST_SQUEEZE);
-            let press = (stiffness * squeeze - damping * closing).max(0.0);
+            let mut press = 0.0;
+            if squeeze > 0.0 {
+                self.touching = true;
+                if closing < -CRASH_SPEED * WHEEL_TOUGHNESS {
+                    self.breaking.push(cell_of(wheel.position));
+                }
+                press = (stiffness * squeeze - damping * closing).max(0.0);
+            }
 
             // Which way this wheel rolls.
             let mut roll = attitude * ahead;
@@ -519,7 +557,9 @@ impl Vessel {
             let roll = (roll - normal * roll.dot(normal)).normalize_or(attitude * ahead);
             let side = normal.cross(roll);
             let (along, across) = (v.dot(roll), v.dot(side));
-            let most = GRIP * press;
+            // (A wheel that is hanging, or barely loaded, still has some: enough to drive a
+            // vehicle off the step its hull has come to rest on.)
+            let most = GRIP * press.max(share * gravity * LEAST_GRIP);
             // Grip builds up with how fast the tyre slides sideways, as a real one does.
             // (All or nothing, the rear wheels would cancel any turn the front ones start.)
             let lateral = -most * (across / SLIDE_SPEED).clamp(-1.0, 1.0);
@@ -581,7 +621,12 @@ impl Vessel {
             let tangent = v - normal * closing;
             let mut impulse = normal * j;
             if let Some(dir) = tangent.try_normalize() {
-                let slip = (tangent.length() / leverage(dir)).min(HULL_FRICTION * j);
+                let friction = if on_wheels {
+                    SKID_FRICTION
+                } else {
+                    HULL_FRICTION
+                };
+                let slip = (tangent.length() / leverage(dir)).min(friction * j);
                 impulse -= dir * slip;
             }
             self.velocity += impulse / m.mass;
@@ -590,7 +635,23 @@ impl Vessel {
         if deepest > 0.0 {
             // Out of the ground gently, not by the whole overlap at once.
             self.position += out * (deepest * 0.2).min(0.05);
-            let _ = up_here;
+        }
+
+        // ---- A vehicle on driven wheels that has tipped too far rolls back onto them.
+        if self.touching && stats.wheels.iter().any(|w| w.driven) {
+            let (standing, up) = (attitude * stats.up, up_here);
+            let angle = standing.cross(up).length().atan2(standing.dot(up));
+            if angle > RIGHT_FROM {
+                let axis = standing
+                    .cross(up)
+                    .try_normalize()
+                    .unwrap_or(attitude * stats.forward);
+                let wanted = (0.6 + (angle - RIGHT_FROM) * 3.0).min(RIGHT_SPEED);
+                let turning = (self.spin - omega).dot(axis);
+                self.spin += axis * ((wanted - turning) / RIGHT_TIME).clamp(0.0, 30.0) * dt;
+                // (Pressed against the ground it couldn't turn.)
+                self.velocity += up * gravity * RIGHT_LIFT * dt;
+            }
         }
     }
 
@@ -600,9 +661,10 @@ impl Vessel {
         bodies: &crate::space::bodies::Bodies,
         t: f64,
         controls: &Controls,
+        running: bool,
         dt: f64,
     ) {
-        if !self.touching || self.throttle > 0.0 || controls.drive != 0.0 {
+        if !self.touching || running || controls.drive != 0.0 {
             self.still = 0.0;
             return;
         }
@@ -921,6 +983,152 @@ mod tests {
         assert!(one > 0.8, "got {one} m up a one-block step");
         let three = climbs(3);
         assert!(three < 0.8, "got {three} m up a wall");
+    }
+
+    /// Ground of one-block steps both ways, as most of the terrain is.
+    struct Terraces(i32);
+
+    impl Voxels for Terraces {
+        fn block(&self, _: Face, u: i32, v: i32, k: i32) -> Block {
+            let top = self.0 + (u.div_euclid(3) & 1) + (v.div_euclid(5) & 1);
+            if k < top { Block::Stone } else { Block::Air }
+        }
+    }
+
+    #[test]
+    fn a_rover_doesnt_get_stuck_on_steps() {
+        let (planet, bodies) = setup();
+        let ground = planet.sea_layer + 5;
+        let world = Terraces(ground);
+        let env = Env {
+            bodies: &bodies,
+            ground: Some(Ground {
+                body: Body::Planet,
+                planet: &planet,
+                world: &world,
+            }),
+            drag: true,
+        };
+        let mut v = parked(&bodies, &planet, rover(), ground, 3.0);
+        v.landed = None;
+        let mut t = 0.0;
+        step(&mut v, &env, &mut t, 2.0, &Controls::default());
+        let go = Controls {
+            drive: 1.0,
+            ..Default::default()
+        };
+        let on_the_ground = |v: &Vessel, t: f64| bodies.frame(Body::Planet, t).to_body(v.position);
+        let mut last = on_the_ground(&v, t);
+        let (mut path, mut stopped) = (0.0, 0.0);
+        for _ in 0..40 {
+            step(&mut v, &env, &mut t, 0.5, &go);
+            let here = on_the_ground(&v, t);
+            let moved = (here - last).length();
+            last = here;
+            path += moved;
+            if moved < 0.25 {
+                stopped += 0.5;
+            }
+        }
+        assert!(v.destroyed.is_none(), "{:?}", v.destroyed);
+        assert!(path > 120.0, "drove only {path} m in 20 s");
+        assert!(stopped <= 1.0, "stopped for {stopped} s");
+    }
+
+    #[test]
+    fn a_rover_on_its_roof_rolls_back_onto_its_wheels() {
+        let (planet, bodies) = setup();
+        let ground = planet.sea_layer + 5;
+        let world = Floor(ground);
+        let env = Env {
+            bodies: &bodies,
+            ground: Some(Ground {
+                body: Body::Planet,
+                planet: &planet,
+                world: &world,
+            }),
+            drag: true,
+        };
+        let mut v = parked(&bodies, &planet, rover(), ground, 2.5);
+        v.landed = None;
+        v.attitude = DQuat::from_axis_angle(v.nose(), 3.0) * v.attitude;
+        let mut t = 0.0;
+        step(&mut v, &env, &mut t, 8.0, &Controls::default());
+        assert!(v.destroyed.is_none(), "{:?}", v.destroyed);
+        let standing = (v.attitude * DVec3::Y).dot(v.position.normalize());
+        assert!(standing > 0.9, "still on its side: {standing}");
+    }
+
+    #[test]
+    fn the_throttle_left_up_on_a_rover_doesnt_keep_it_from_parking() {
+        let (planet, bodies) = setup();
+        let ground = planet.sea_layer + 5;
+        let world = Floor(ground);
+        let env = Env {
+            bodies: &bodies,
+            ground: Some(Ground {
+                body: Body::Planet,
+                planet: &planet,
+                world: &world,
+            }),
+            drag: true,
+        };
+        let mut craft = rover();
+        assert!(craft.place(part([1, 1, 2], Block::FuelTank, DVec3::X)));
+        let mut v = parked(&bodies, &planet, craft, ground, 1.0);
+        v.landed = None;
+        v.throttle = 1.0;
+        assert!(!v.engines_on(), "nothing to run");
+        let mut t = 0.0;
+        step(&mut v, &env, &mut t, 4.0, &Controls::default());
+        assert!(v.landed.is_some(), "it parks");
+        assert_eq!(v.throttle, 1.0);
+    }
+
+    #[test]
+    fn a_small_plane_is_quick() {
+        let (planet, bodies) = setup();
+        let ground = planet.sea_layer + 5;
+        let world = Floor(ground);
+        let env = Env {
+            bodies: &bodies,
+            ground: Some(Ground {
+                body: Body::Planet,
+                planet: &planet,
+                world: &world,
+            }),
+            drag: true,
+        };
+        let mut v = parked(&bodies, &planet, full_plane(), ground, 2.0);
+        v.landed = None;
+        let mut t = 0.0;
+        step(&mut v, &env, &mut t, 2.0, &Controls::default());
+        v.throttle = 1.0;
+        let start = t;
+        while ground_speed(&v, &bodies, t) < 50.0 && t < 30.0 {
+            step(&mut v, &env, &mut t, 0.05, &Controls::default());
+        }
+        assert!(t - start < 8.0, "{} s to 50 m/s", t - start);
+
+        // Flat out and level, it gets well past its old 58 m/s.
+        let air = Env {
+            bodies: &bodies,
+            ground: None,
+            drag: true,
+        };
+        let mut v = flying_plane(&bodies, 45.0, 1.0);
+        let mut t = 0.0;
+        for _ in 0..1600 {
+            let (nose, _) = angles(&v, &bodies, t);
+            let level = Controls {
+                pitch: (nose * -0.5).clamp(-1.0, 1.0),
+                ..Default::default()
+            };
+            step(&mut v, &air, &mut t, 0.05, &level);
+        }
+        assert!(v.destroyed.is_none(), "{:?}", v.destroyed);
+        let speed = ground_speed(&v, &bodies, t);
+        assert!(speed > 90.0, "only {speed} m/s");
     }
 
     #[test]

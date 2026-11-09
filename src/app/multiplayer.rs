@@ -7,6 +7,7 @@
 //! | what | decided by |
 //! |---|---|
 //! | where you are, your inventory, health | you (the host keeps a copy with the world) |
+//! | what a blow from another player does | the one hit |
 //! | blocks, models, chests, furnaces | whoever changes them; the host passes it on |
 //! | dropped items | anyone can drop; the host decides who picks up |
 //! | animals | the player they spawned near, handed over when someone else is closer |
@@ -59,7 +60,7 @@ use crate::{
     },
     render::{DrawItem, Fade, MeshHandle, models},
     space::bodies::Body,
-    survival::{NetSide, Outgoing, SavedSurvival},
+    survival::{NetSide, Outgoing, Person, SavedSurvival},
     ui::{
         Ui,
         anim::approach,
@@ -105,6 +106,15 @@ const MOB_RANGE: f64 = 320.0;
 /// An animal goes to another player once its owner is this far away, and they are close.
 const HANDOFF_OWNER: f64 = 72.0;
 const HANDOFF_OTHER: f64 = 60.0;
+/// A blow from another player: how long after one the next doesn't count, how long the figure
+/// shows it (s), how far it throws you (m/s away, m/s up), and the most it can do (health).
+const HIT_COOLDOWN: Duration = Duration::from_millis(500);
+const HURT_SHOW: Duration = Duration::from_millis(350);
+const HIT_KNOCKBACK: f64 = 6.0;
+const HIT_LIFT: f64 = 4.0;
+const MOST_DAMAGE: f32 = 40.0;
+/// Further than this from where they stood (m), the blow can't have reached.
+const HIT_RANGE: f64 = 16.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(super) enum Role {
@@ -149,6 +159,8 @@ pub(super) struct Remote {
     arm: f32,
     swings: u32,
     uses: u32,
+    /// Which way is up for the figure, if it is being drawn (so it can be aimed at).
+    shown: Option<DVec3>,
     mesh: Option<MeshHandle>,
     item: Option<MeshHandle>,
 }
@@ -169,6 +181,7 @@ impl Remote {
             arm: 0.0,
             swings: 0,
             uses: 0,
+            shown: None,
             mesh: None,
             item: None,
         }
@@ -269,6 +282,8 @@ pub(super) struct Multiplayer {
     pub clock_error: f64,
     /// Sounds to tell the others about.
     sounds: Vec<(Sound, Vec3)>,
+    /// When another player last struck this one.
+    last_hit: Option<Instant>,
     /// Why the game ended, to show on the menu.
     pub notice: Option<String>,
     pub friends: Vec<Friend>,
@@ -309,6 +324,7 @@ impl Multiplayer {
             team_warped_at: Instant::now(),
             clock_error: 0.0,
             sounds: Vec::new(),
+            last_hit: None,
             notice: None,
             friends: Vec::new(),
             friends_at: None,
@@ -932,6 +948,20 @@ impl Game {
                     let msg = Msg::MobGone(id);
                     self.send_everyone(&msg, true);
                 }
+                Outgoing::PlayerHit { to, damage, from } => {
+                    let msg = Msg::PlayerHit {
+                        to,
+                        by: self.net.me,
+                        body: self.active,
+                        damage,
+                        from,
+                    };
+                    if self.net.is_host() {
+                        self.route_to_player(to, &msg);
+                    } else {
+                        self.net.send_host(&msg, true);
+                    }
+                }
             }
         }
         if !world_events.is_empty() {
@@ -1000,6 +1030,8 @@ impl Game {
             on_ground: self.player.on_ground,
             // (Dead: nobody to see until they respawn.)
             spectator: self.player.mode == GameMode::Spectator || self.death.is_some(),
+            hurt: self.net.last_hit.is_some_and(|t| t.elapsed() < HURT_SHOW),
+            survival: self.player.mode == GameMode::Survival,
             vessel: self.flight.boarded.map(|i| self.flight.vessels[i].id),
             can_rail,
             time: self.time,
@@ -1426,6 +1458,27 @@ impl Game {
                 self.survival.remove_replica(mob);
                 self.net.broadcast(&Msg::MobGone(mob), true, Some(id));
             }
+            Msg::PlayerHit {
+                to,
+                body,
+                damage,
+                from,
+                ..
+            } => {
+                if to == HOST {
+                    self.player_hit_here(id, body, damage, from);
+                } else {
+                    // (Who it was from is the host's to say.)
+                    let msg = Msg::PlayerHit {
+                        to,
+                        by: id,
+                        body,
+                        damage,
+                        from,
+                    };
+                    self.route_to_player(to, &msg);
+                }
+            }
             Msg::MobHandoff { to, mob } => {
                 if to == HOST {
                     self.adopt_mob(*mob);
@@ -1676,6 +1729,13 @@ impl Game {
                 ..
             } => self.mob_hit_here(id, damage, from, creative),
             Msg::MobGone(id) => self.survival.remove_replica(id),
+            Msg::PlayerHit {
+                by,
+                body,
+                damage,
+                from,
+                ..
+            } => self.player_hit_here(by, body, damage, from),
             Msg::MobHandoff { mob, .. } => self.adopt_mob(*mob),
             Msg::VesselNew(vessel) => {
                 if finite(vessel.position) && vessel_is_sound(&vessel) {
@@ -1929,6 +1989,66 @@ impl Game {
         remote.pose = Some(pose);
     }
 
+    /// Whoever can be hit in the crosshair, among the figures drawn here at this time: players
+    /// only fight each other in survival.
+    pub(super) fn person_in_sights(&self, reach: f64) -> Option<Person> {
+        if self.player.mode != GameMode::Survival {
+            return None;
+        }
+        let eye = self.camera.position - self.planet.center;
+        let look = self.camera.forward().as_dvec3();
+        self.net
+            .players
+            .iter()
+            .filter(|(id, r)| {
+                **id != self.net.me && !r.apart && r.pose.as_ref().is_some_and(|p| p.survival)
+            })
+            .filter_map(|(id, r)| {
+                let distance = avatar::ray_hit(r.feet, r.shown?, eye, look, reach)?;
+                Some(Person {
+                    id: *id,
+                    name: r.name.clone(),
+                    distance,
+                })
+            })
+            .min_by(|a, b| a.distance.total_cmp(&b.distance))
+    }
+
+    /// Another player has struck this one (which only counts in survival).
+    fn player_hit_here(&mut self, by: PlayerId, body: Body, damage: f32, from: DVec3) {
+        let (feet, _) = self.feet_and_up();
+        let cooling = self
+            .net
+            .last_hit
+            .is_some_and(|t| t.elapsed() < HIT_COOLDOWN);
+        if body != self.active
+            || cooling
+            || !hit_is_sound(damage, from, feet)
+            || self.death.is_some()
+            || self.player.mode != GameMode::Survival
+            || self.flight.boarded.is_some()
+        {
+            return;
+        }
+        self.net.last_hit = Some(Instant::now());
+        if self.flight.aboard.is_none() && self.flight.eva.is_none() {
+            let up = feet.normalize_or(DVec3::Y);
+            let away = feet - from;
+            let away = (away - up * away.dot(up)).normalize_or(self.camera.forward().as_dvec3());
+            let frame = self.active_frame(self.time);
+            self.player.velocity += frame.to_inertial(away * HIT_KNOCKBACK + up * HIT_LIFT);
+            self.player.on_ground = false;
+        }
+        let at = self.camera.position - self.planet.center;
+        if self.survival.hurt(damage, false, at) {
+            let cause = match self.net.players.get(&by) {
+                Some(r) => format!("killed by {}", r.name),
+                None => "killed by another player".to_string(),
+            };
+            self.die(&cause, None);
+        }
+    }
+
     fn play_remote_sounds(&mut self, body: Body, sounds: &[(Sound, Vec3)]) {
         if body != self.active {
             return;
@@ -2129,6 +2249,7 @@ impl Game {
         for id in ids {
             let visible_info = {
                 let remote = self.net.players.get_mut(&id).expect("listed");
+                remote.shown = None;
                 let Some(pose) = remote.pose.clone() else {
                     continue;
                 };
@@ -2190,6 +2311,8 @@ impl Game {
                 Some((_, up)) => up.normalize_or(DVec3::Y),
                 None => remote.feet.normalize_or(DVec3::Y),
             };
+            remote.shown = Some(up);
+            let hurt = remote.pose.as_ref().is_some_and(|p| p.hurt);
             let look = remote.look.as_dvec3();
             let forward = (look - up * look.dot(up)).normalize_or(up.any_orthonormal_vector());
             let look_pitch = look.dot(up).clamp(-1.0, 1.0).asin() as f32;
@@ -2204,6 +2327,7 @@ impl Game {
                     arm: remote.arm,
                     look_pitch,
                     holding: item_kind.is_some(),
+                    hurt,
                 },
                 (forward, up),
                 light,
@@ -2378,6 +2502,8 @@ impl Game {
                 );
                 self.console.print(self.together_line().unwrap_or_default());
                 self.console.print(line);
+                self.console
+                    .print(format!("health {:.1}", self.survival.health));
                 let hit = self
                     .target
                     .as_ref()
@@ -2407,6 +2533,18 @@ impl Game {
                     self.survival.attack = (0.0, 1.0);
                     self.survival.attack_mob(i, &pose, false);
                     self.console.print("Hit it");
+                }
+            }
+            // For tests: strike whoever is in the crosshair, at full strength.
+            ["punch"] => {
+                let pose = self.pose();
+                match self.person_in_sights(crate::player::interact::CREATIVE_REACH) {
+                    Some(person) => {
+                        self.survival.attack = (0.0, 1.0);
+                        self.survival.attack_player(&person, &pose);
+                        self.console.print(format!("Hit {}", person.name));
+                    }
+                    None => self.console.print("Nobody in the crosshair"),
                 }
             }
             // For tests: stand on the ground some metres ahead.
@@ -2463,6 +2601,11 @@ fn craft_change_is_sound(change: &CraftChange) -> bool {
         CraftChange::Take(at) => *at,
     };
     at.iter().all(|c| c.abs() <= MAX_REACH)
+}
+
+/// Whether a blow can be believed: a real amount, from about where it could have reached.
+fn hit_is_sound(damage: f32, from: DVec3, feet: DVec3) -> bool {
+    finite(from) && (0.0..=MOST_DAMAGE).contains(&damage) && (from - feet).length() <= HIT_RANGE
 }
 
 fn pose_is_sound(pose: &PlayerPose) -> bool {
@@ -2534,6 +2677,18 @@ mod tests {
         assert_eq!(clean_name("\u{1f680}"), "player");
         assert_eq!(clean_name(""), "player");
         assert_eq!(clean_name(&"x".repeat(99)).len(), MAX_NAME);
+    }
+
+    #[test]
+    fn a_blow_has_to_be_believable() {
+        let feet = DVec3::new(1000.0, 0.0, 0.0);
+        let near = feet + DVec3::Y * 3.0;
+        assert!(hit_is_sound(7.0, near, feet));
+        assert!(!hit_is_sound(f32::NAN, near, feet));
+        assert!(!hit_is_sound(-1.0, near, feet));
+        assert!(!hit_is_sound(MOST_DAMAGE * 2.0, near, feet));
+        assert!(!hit_is_sound(1.0, DVec3::splat(f64::NAN), feet));
+        assert!(!hit_is_sound(1.0, feet + DVec3::Y * 100.0, feet));
     }
 
     #[test]

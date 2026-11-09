@@ -28,7 +28,7 @@ use crate::{
 };
 
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 6;
 /// The host is always player 0.
 pub const HOST: PlayerId = 0;
 /// Most people in one game, the host included.
@@ -55,6 +55,10 @@ pub struct PlayerPose {
     pub eating: bool,
     pub on_ground: bool,
     pub spectator: bool,
+    /// Just been hit (the figure flashes).
+    pub hurt: bool,
+    /// In survival: only then can they hit or be hit by other players.
+    pub survival: bool,
     /// The rocket they are in (their model isn't drawn then).
     pub vessel: Option<u32>,
     /// On the ground or on an orbit (not somewhere only physics can say).
@@ -207,6 +211,14 @@ pub enum Msg {
     /// A client's own state (JSON `PlayerRecord`), for the host to keep with the world.
     PlayerSave(Vec<u8>),
     Sounds(Body, Vec<(Sound, Vec3)>),
+    /// `by` has struck `to`, standing at `from` (`to` decides what that does).
+    PlayerHit {
+        to: PlayerId,
+        by: PlayerId,
+        body: Body,
+        damage: f32,
+        from: DVec3,
+    },
 
     // ---- The world ---------------------------------------------------------------------------
     World(Body, Vec<WorldEvent>),
@@ -375,6 +387,8 @@ mod tests {
             eating: false,
             on_ground: true,
             spectator: false,
+            hurt: false,
+            survival: true,
             vessel: Some(u32::MAX),
             can_rail: true,
             time: 1.0e9,
