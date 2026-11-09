@@ -54,6 +54,13 @@ pub fn root(unattended: bool) -> Option<PathBuf> {
         .map(|home| PathBuf::from(home).join(".local/share/astro_block"))
 }
 
+/// `Settings::mouse_sensitivity` goes from one over this to this.
+pub const SENSITIVITY_RANGE: f32 = 4.0;
+
+pub fn clamp_sensitivity(value: f32) -> f32 {
+    value.clamp(1.0 / SENSITIVITY_RANGE, SENSITIVITY_RANGE)
+}
+
 /// The options on the settings screen.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -64,6 +71,10 @@ pub struct Settings {
     pub fps_cap: u32,
     /// 0..1
     pub volume: f32,
+    /// How fast the mouse turns the view, as a multiple of the normal speed.
+    pub mouse_sensitivity: f32,
+    /// Spreads mouse movement over a few frames (`input::MouseSmoother`).
+    pub mouse_smoothing: bool,
     /// What others see, when not signed in to Steam.
     pub player_name: String,
     /// The address last connected to.
@@ -79,6 +90,8 @@ impl Default for Settings {
             vsync: true,
             fps_cap: 0,
             volume: 1.0,
+            mouse_sensitivity: 1.0,
+            mouse_smoothing: true,
             player_name: String::new(),
             last_address: String::new(),
             client_id: String::new(),
@@ -89,9 +102,12 @@ impl Default for Settings {
 impl Settings {
     /// The saved settings, or the defaults if there are none (or they're unreadable).
     pub fn load(root: Option<&Path>) -> Self {
-        root.and_then(|r| fs::read(r.join("settings.json")).ok())
+        let mut settings: Self = root
+            .and_then(|r| fs::read(r.join("settings.json")).ok())
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        settings.mouse_sensitivity = clamp_sensitivity(settings.mouse_sensitivity);
+        settings
     }
 
     /// Picks a `client_id` the first time. Returns whether it did.
@@ -370,6 +386,10 @@ mod tests {
         let partial = Settings::load(Some(&root));
         assert_eq!(partial.fps_cap, 60);
         assert!(partial.vsync);
+        assert_eq!(partial.mouse_sensitivity, 1.0);
+        // A number no slider could have set still leaves the mouse usable.
+        fs::write(root.join("settings.json"), r#"{"mouse_sensitivity": 0}"#).unwrap();
+        assert_eq!(Settings::load(Some(&root)).mouse_sensitivity, 0.25);
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -698,6 +698,12 @@ impl Game {
         self.audio.set_volume(settings.volume);
     }
 
+    /// Turns the first-person view by this much mouse movement.
+    pub(super) fn turn_view(&mut self, dx: f64, dy: f64) {
+        let scale = super::MOUSE_SENSITIVITY * self.settings.mouse_sensitivity;
+        self.camera.rotate(dx as f32 * scale, -dy as f32 * scale);
+    }
+
     fn store_settings(&mut self) {
         if !std::mem::take(&mut self.settings_dirty) {
             return;
@@ -815,6 +821,12 @@ impl Game {
                         self.settings.volume =
                             value.parse::<f32>().unwrap_or(100.0).clamp(0.0, 100.0) / 100.0;
                     }
+                    ["sensitivity", value] => {
+                        let percent = value.parse::<u32>().unwrap_or(100);
+                        self.settings.mouse_sensitivity =
+                            save::clamp_sensitivity(percent as f32 / 100.0);
+                    }
+                    ["smoothing", value] => self.settings.mouse_smoothing = on(value),
                     ["fullscreen", value] => self.settings.fullscreen = on(value),
                     _ => {
                         self.console.print(format!("{:?}", self.settings));

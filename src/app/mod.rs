@@ -26,7 +26,7 @@ mod weather;
 mod worlds;
 
 use flight::Flight;
-use input::Input;
+use input::{Input, MouseSmoother};
 use save::{Settings, WorldEntry};
 use weather::WeatherFx;
 use worlds::OtherWorld;
@@ -200,6 +200,9 @@ struct Game {
     /// Spectator fly speed in m/s; the scroll wheel scales it exponentially.
     fly_speed: f64,
     mouse_grabbed: bool,
+    /// Mouse look on foot, and right-drags of the other cameras.
+    look_smoothing: MouseSmoother,
+    drag_smoothing: MouseSmoother,
     last_frame: Instant,
     stats: FrameStats,
     render_stats: RenderStats,
@@ -724,6 +727,8 @@ impl Game {
             rain: None,
             fly_speed: 12.0,
             mouse_grabbed: false,
+            look_smoothing: MouseSmoother::default(),
+            drag_smoothing: MouseSmoother::default(),
             last_frame: Instant::now(),
             stats: FrameStats::default(),
             render_stats: RenderStats::default(),
@@ -1020,11 +1025,12 @@ impl Game {
         }
 
         if self.mouse_grabbed && on_foot {
-            let (dx, dy) = self.input.mouse_delta;
-            self.camera.rotate(
-                dx as f32 * MOUSE_SENSITIVITY,
-                -dy as f32 * MOUSE_SENSITIVITY,
-            );
+            let moved = self.input.mouse_delta;
+            let on = self.settings.mouse_smoothing;
+            let (dx, dy) = self.look_smoothing.step(moved, dt, on);
+            self.turn_view(dx, dy);
+        } else {
+            self.look_smoothing.clear();
         }
 
         // Double-tapping jump toggles creative flight.

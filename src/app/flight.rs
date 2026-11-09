@@ -15,7 +15,7 @@ use glam::{DVec3, Quat};
 use winit::{event::MouseButton, keyboard::KeyCode};
 
 use super::{
-    Game, MAX_PHYSICS_WARP, MOUSE_SENSITIVITY, WARP_LEVELS, WorldVoxels,
+    Game, MAX_PHYSICS_WARP, WARP_LEVELS, WorldVoxels,
     vehicles::{Aboard, CraftHit, cockpit_turn, seat_feet},
 };
 use crate::{
@@ -322,12 +322,20 @@ impl Game {
         }
         // Mouse drags (right button) turn the camera, the wheel zooms.
         let cursor = self.input.cursor;
-        let (dx, dy) = (
+        let moved = (
             (cursor.0 - self.flight.last_cursor.0) as f64,
             (cursor.1 - self.flight.last_cursor.1) as f64,
         );
         self.flight.last_cursor = cursor;
-        let dragging = self.input.button_held(MouseButton::Right);
+        let moved = if self.input.button_held(MouseButton::Right) {
+            moved
+        } else {
+            (0.0, 0.0)
+        };
+        // (Still coming through for a moment after the button is let go.)
+        let on = self.settings.mouse_smoothing;
+        let (dx, dy) = self.drag_smoothing.step(moved, dt, on);
+        let drag_turn = DRAG_SENSITIVITY * self.settings.mouse_sensitivity as f64;
         let scroll = if self.flight.over_ui {
             0.0
         } else {
@@ -339,10 +347,8 @@ impl Game {
                 Focus::Body(b) => self.bodies.radius(b) * 1.1,
             };
             let cam = &mut self.flight.map_cam;
-            if dragging {
-                cam.yaw -= dx * DRAG_SENSITIVITY;
-                cam.pitch = (cam.pitch + dy * DRAG_SENSITIVITY).clamp(-1.5, 1.5);
-            }
+            cam.yaw -= dx * drag_turn;
+            cam.pitch = (cam.pitch + dy * drag_turn).clamp(-1.5, 1.5);
             cam.distance = (cam.distance * 0.85f64.powf(scroll)).clamp(min, 5e11);
             if self.input.pressed(KeyCode::Tab) {
                 self.flight.focus = match self.flight.focus {
@@ -363,17 +369,12 @@ impl Game {
             }
         } else if self.flight.boarded.is_some() || self.watching_wreck() {
             let cam = &mut self.flight.chase;
-            if dragging {
-                cam.yaw += dx * DRAG_SENSITIVITY;
-                cam.pitch = (cam.pitch + dy * DRAG_SENSITIVITY).clamp(-1.4, 1.4);
-            }
+            cam.yaw += dx * drag_turn;
+            cam.pitch = (cam.pitch + dy * drag_turn).clamp(-1.4, 1.4);
             cam.distance = (cam.distance * 0.88f64.powf(scroll)).clamp(9.0, 600.0);
-        } else if self.death.is_some() && dragging {
+        } else if self.death.is_some() {
             // Dead on foot: the cursor is for the button, the right button still looks around.
-            self.camera.rotate(
-                dx as f32 * MOUSE_SENSITIVITY,
-                -dy as f32 * MOUSE_SENSITIVITY,
-            );
+            self.turn_view(dx, dy);
         }
 
         let Some(i) = self.flight.boarded else {

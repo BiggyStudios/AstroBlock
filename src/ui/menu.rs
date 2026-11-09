@@ -34,6 +34,29 @@ const DOUBLE_CLICK: f32 = 0.35;
 const PAGE_FADE: f32 = 0.18;
 const LOADING_FADE: f32 = 0.35;
 
+/// The sliders on the settings page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slider {
+    Volume,
+    Sensitivity,
+}
+
+/// Where along its slider (0..1) a volume is, and back. In whole percents, so the file and the
+/// number agree.
+fn volume_at(level: f32) -> f32 {
+    (level * 100.0).round() / 100.0
+}
+
+/// The sensitivity slider is by ratios, so the normal speed is in the middle. In steps of 5%,
+/// so it is easy to land on.
+fn sensitivity_at(level: f32) -> f32 {
+    (save::SENSITIVITY_RANGE.powf(2.0 * level - 1.0) * 20.0).round() / 20.0
+}
+
+fn sensitivity_level(value: f32) -> f32 {
+    (value.ln() / save::SENSITIVITY_RANGE.ln() + 1.0) * 0.5
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
     Main,
@@ -149,7 +172,7 @@ pub struct Menu {
     cancellable: bool,
     invited: Vec<u64>,
 
-    dragging_volume: bool,
+    dragging: Option<Slider>,
 
     loading: String,
     /// The world is ready: fading out, then this page opens (None closes the menu).
@@ -192,7 +215,7 @@ impl Menu {
             player: String::new(),
             cancellable: false,
             invited: Vec::new(),
-            dragging_volume: false,
+            dragging: None,
             loading: String::new(),
             loaded: None,
         }
@@ -1092,28 +1115,66 @@ impl Menu {
         }
         y += spacing;
 
-        // Volume: a thin line with a handle.
-        ui.text(x, y + s, "volume", DIM);
-        let width = 110.0 * s;
-        let height = ch + 3.0 * s;
-        if pointer.pressed && pointer.inside(values, y, width, height) {
-            self.dragging_volume = true;
+        // A thin line with a handle, and the value in percent. `at` turns a place on the line
+        // (0..1) into a value, `level` a value into its place.
+        let mut slider = |ui: &mut Ui,
+                          pointer: &mut Pointer,
+                          which: Slider,
+                          y: f32,
+                          label: &str,
+                          value: &mut f32,
+                          at: fn(f32) -> f32,
+                          level: fn(f32) -> f32| {
+            ui.text(x, y + s, label, DIM);
+            let width = 110.0 * s;
+            let height = ch + 3.0 * s;
+            if pointer.pressed && pointer.inside(values, y, width, height) {
+                self.dragging = Some(which);
+            }
+            if !pointer.held {
+                self.dragging = None;
+            }
+            if self.dragging == Some(which) {
+                *value = at(((pointer.pos.0 - values) / width).clamp(0.0, 1.0));
+            }
+            let middle = (y + height * 0.5).round();
+            let filled = width * level(*value);
+            ui.rect(values, middle, width, s, FAINT);
+            ui.rect(values, middle, filled, s, AMBER);
+            ui.rect(values + filled - s, y + s, 2.0 * s, height - 2.0 * s, TEXT);
+            let percent = format!("{}", (*value * 100.0).round() as u32);
+            ui.text(values + width + 6.0 * s, y + s, &percent, TEXT);
+        };
+
+        slider(
+            ui,
+            pointer,
+            Slider::Volume,
+            y,
+            "volume",
+            &mut settings.volume,
+            volume_at,
+            |value| value,
+        );
+        y += spacing;
+        slider(
+            ui,
+            pointer,
+            Slider::Sensitivity,
+            y,
+            "sensitivity",
+            &mut settings.mouse_sensitivity,
+            sensitivity_at,
+            sensitivity_level,
+        );
+        y += spacing;
+        let smoothing = [
+            ("on", settings.mouse_smoothing),
+            ("off", !settings.mouse_smoothing),
+        ];
+        if let Some(i) = row(ui, pointer, y, "smoothing", &smoothing) {
+            settings.mouse_smoothing = i == 0;
         }
-        if !pointer.held {
-            self.dragging_volume = false;
-        }
-        if self.dragging_volume {
-            let level = (pointer.pos.0 - values) / width;
-            // In whole percents, so the file and the number agree.
-            settings.volume = (level.clamp(0.0, 1.0) * 100.0).round() / 100.0;
-        }
-        let middle = (y + height * 0.5).round();
-        let filled = width * settings.volume;
-        ui.rect(values, middle, width, s, FAINT);
-        ui.rect(values, middle, filled, s, AMBER);
-        ui.rect(values + filled - s, y + s, 2.0 * s, height - 2.0 * s, TEXT);
-        let percent = format!("{}", (settings.volume * 100.0).round() as u32);
-        ui.text(values + width + 6.0 * s, y + s, &percent, TEXT);
         y += spacing + 8.0 * s;
 
         if *settings != before {
@@ -1241,6 +1302,24 @@ mod tests {
         let x = 342.0 + (60.0 + 12.0 + 12.0) + (30.0 + 12.0 + 12.0) + 10.0;
         click(&mut menu, &mut settings, &[], (x, 408.0));
         assert_eq!(settings.fps_cap, 60);
+        // Sensitivity: the normal speed in the middle, by ratios either side of it.
+        let line = |part: f32| (342.0 + 330.0 * part, 538.0);
+        for (part, expected) in [(0.25, 0.5), (0.5, 1.0), (0.75, 2.0)] {
+            let actions = click(&mut menu, &mut settings, &[], line(part));
+            assert!(matches!(actions.as_slice(), [Action::SettingsChanged]));
+            assert_eq!(settings.mouse_sensitivity, expected);
+        }
+        // Mouse smoothing: on until it is turned off.
+        assert!(settings.mouse_smoothing);
+        click(&mut menu, &mut settings, &[], (410.0, 597.0));
+        assert!(!settings.mouse_smoothing);
+    }
+
+    #[test]
+    fn the_sensitivity_handle_is_where_the_value_says() {
+        for part in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            assert!((sensitivity_level(sensitivity_at(part)) - part).abs() < 1e-5);
+        }
     }
 
     #[test]

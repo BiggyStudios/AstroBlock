@@ -102,6 +102,7 @@ pub const HELP: &[&str] = &[
     "   what the sky is doing here, or hold a condition here; erupt   the nearest volcano",
     "world create <name> [seed] [mode], world load <name>, world leave, save",
     "settings [vsync on|off] [fps <n>] [volume <0-100>] [fullscreen on|off]",
+    "   [sensitivity <25-400>] [smoothing on|off]",
     "net host [address:port] | join <address:port> | leave | status   play with others",
     "weather strike   a lightning bolt ahead; weather approach [m]   go near the tornado",
     "clear   clear the console",
