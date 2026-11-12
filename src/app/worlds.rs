@@ -66,6 +66,8 @@ impl Game {
             return;
         }
         let (old, t) = (self.active, self.time);
+        // A milestone (and a big change): worth saving soon.
+        self.save_soon();
         self.survival.apply_lights(&mut self.streamer);
         let (p, v) = self
             .bodies

@@ -57,11 +57,14 @@ void main() {
     float level = float((v_look >> 16u) & 15u) / 15.0;
     float sky = float((v_look >> 20u) & 15u) / 15.0;
     float torch = level / (4.0 - 3.0 * level);
+    // The headlamp (as in block.frag): in caves, what flies about near you isn't black.
+    float lamp = (1.0 - sky) * pow(clamp(1.0 - length(v_rel) / 16.0, 0.0, 1.0), 2.0) * 0.08;
     // A small flat sprite has no real normal: take most of the sun, all of the sky.
     vec3 irradiance = sun_light * (0.7 * sky)
         + sky_light * mix(0.03, 1.0, sky)
         + vec3(0.45, 0.6, 1.0) * frame.misc.z
         + vec3(0.8, 0.86, 1.0) * frame.clouds.w * sky
+        + vec3(1.0, 0.85, 0.7) * lamp
         + vec3(1.0, 0.78, 0.55) * torch * TORCH_IRRADIANCE;
     vec3 color = c.rgb / PI * irradiance;
     if ((flags & P_GLOW) != 0u) {

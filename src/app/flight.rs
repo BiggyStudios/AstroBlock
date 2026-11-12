@@ -37,7 +37,10 @@ use crate::{
     },
     survival::items::{Item, ItemStack},
     ui::Ui,
-    world::block::Material,
+    world::{
+        block::{Block, Material},
+        chunk::BlockCell,
+    },
 };
 
 /// Throttle change per second while Shift / Ctrl is held.
@@ -87,6 +90,8 @@ pub(super) struct Flight {
     /// The part the crosshair is on, and its outline.
     pub pointed: Option<CraftHit>,
     pub outline: Option<MeshHandle>,
+    /// The pilot's own figure in the seat, seen from outside.
+    pub figure: Option<MeshHandle>,
     pub outline_for: Option<At>,
     /// How the vehicle under you was turned last frame.
     pub turned_with: Option<Quat>,
@@ -130,6 +135,7 @@ impl Default for Flight {
             part_turn: None,
             pointed: None,
             outline: None,
+            figure: None,
             outline_for: None,
             turned_with: None,
             stepping_off: false,
@@ -275,9 +281,25 @@ impl Game {
             (t0, t1),
             vessel::RAILS_CLEARANCE,
         );
+        let (mut r, mut v, mut t) = (r, v, t);
+        let burning = self
+            .bodies
+            .hot_zone(body)
+            .is_some_and(|hot| r.length() <= hot + 1.0);
+        if burning && self.player.mode != GameMode::Creative {
+            self.flight.eva = None;
+            self.time = t;
+            self.die("you burned up near the sun", None);
+            return;
+        }
+        if burning && t < t1 {
+            // Creative: the sun can't hurt you. Straight on, wherever the conic goes.
+            (r, v) = propagate(self.bodies.mu(body), r, v, t1 - t);
+            t = t1;
+        }
         (eva.body, eva.position, eva.velocity) = (body, r, v);
         self.time = t;
-        if stopped {
+        if stopped && !burning {
             self.warp = 0;
         }
         let (pos, vel) = self.bodies.rebase(body, self.active, r, v, t);
@@ -494,6 +516,9 @@ impl Game {
             terrain: &self.terrain,
         };
         let vessel = &mut self.flight.vessels[i];
+        if self.infinite_fuel {
+            vessel.fill_up();
+        }
         if rails {
             let (t, stopped) = vessel.rails(&self.bodies, (t0, t1));
             self.time = t;
@@ -582,8 +607,10 @@ impl Game {
             }),
             drag: self.drag,
         };
-        let mut destroyed = Vec::new();
         let client = self.net.is_client();
+        for v in &mut self.flight.vessels {
+            v.ease_news(t1 - t0);
+        }
         for (i, v) in self.flight.vessels.iter_mut().enumerate() {
             if Some(i) == self.flight.boarded {
                 continue;
@@ -613,21 +640,160 @@ impl Game {
             if client {
                 if (t1 - from).abs() <= 1.0 {
                     v.position += v.velocity * (t1 - from);
+                    let turn = glam::DQuat::from_scaled_axis(v.spin * (t1 - from));
+                    v.attitude = (turn * v.attitude).normalize();
                 }
+                continue;
+            }
+            let worlds = [
+                (
+                    self.active,
+                    &*self.planet,
+                    &*self.terrain,
+                    Some(&self.streamer),
+                ),
+                (
+                    self.other.body,
+                    &*self.other.planet,
+                    &*self.other.terrain,
+                    None,
+                ),
+            ];
+            if from < t1 && !burning && ground_unknown(v, &self.bodies, from, worlds) {
+                park_in_place(v, &self.bodies, from, t1);
                 continue;
             }
             if from < t1 {
                 v.update(&env, &Controls::default(), (from, t1), None);
             }
-            if let Some(reason) = v.destroyed {
-                destroyed.push((i, reason));
-            }
         }
+        self.vehicles_meet();
+        self.fell_trees();
         for i in 0..self.flight.vessels.len() {
             self.report_broken_parts(i);
         }
+        // (The one being flown is the flying code's to finish.)
+        let boarded = self.flight.boarded;
+        let destroyed: Vec<(usize, &str)> = (self.flight.vessels.iter().enumerate())
+            .filter(|&(i, _)| Some(i) != boarded)
+            .filter_map(|(i, v)| v.destroyed.map(|r| (i, r)))
+            .collect();
         for (i, reason) in destroyed.into_iter().rev() {
             self.destroy_vessel(i, reason);
+        }
+    }
+
+    /// Vehicles against each other. Each machine moves what it simulates (the one it flies,
+    /// and for the host the ones nobody flies); the others' machines see the same touch.
+    fn vehicles_meet(&mut self) {
+        let client = self.net.is_client();
+        let boarded = self.flight.boarded;
+        let mine = |i: usize, v: &Vessel| Some(i) == boarded || (v.pilot.is_none() && !client);
+        let n = self.flight.vessels.len();
+        for j in 1..n {
+            let (left, right) = self.flight.vessels.split_at_mut(j);
+            let b = &mut right[0];
+            for (i, a) in left.iter_mut().enumerate() {
+                let moves = [mine(i, a), mine(j, b)];
+                crate::flight::meet_each_other(a, b, moves);
+            }
+        }
+    }
+
+    /// Trees the world grew that a vehicle ran into: the whole tree comes down.
+    fn fell_trees(&mut self) {
+        let mut cells = Vec::new();
+        for v in &mut self.flight.vessels {
+            cells.append(&mut v.felled);
+        }
+        for cell in cells {
+            self.fell_tree(cell);
+        }
+    }
+
+    /// Knocks down the grown tree that `hit` (a block of it) belongs to: its trunk and crown,
+    /// as far as nobody has changed them. Without a tree to be found, just that block.
+    fn fell_tree(&mut self, hit: BlockCell) {
+        if !self.streamer.grown(hit) {
+            return;
+        }
+        let mut cells = vec![hit];
+        let surface = self.planet.res_at(hit.k) == self.planet.face_blocks;
+        let tree = (surface && !self.terrain.lunar)
+            .then(|| {
+                let mut near: Vec<(i32, i32)> = (-3..=3)
+                    .flat_map(|du| (-3..=3).map(move |dv| (du, dv)))
+                    .collect();
+                near.sort_by_key(|&(du, dv)| du * du + dv * dv);
+                near.into_iter().find_map(|(du, dv)| {
+                    let (u, v) = (hit.u + du, hit.v + dv);
+                    let tree = self.terrain.tree_at(hit.face, u, v)?;
+                    let (bottom, top) = (tree.base + 1, tree.base + tree.height + 2);
+                    (bottom..=top)
+                        .contains(&hit.k)
+                        .then_some((u, v, bottom, top))
+                })
+            })
+            .flatten();
+        if let Some((tu, tv, bottom, top)) = tree {
+            // In a forest the crowns run into each other: a leaf is this tree's if no other
+            // trunk is nearer.
+            let others: Vec<(i32, i32)> = (-6..=6)
+                .flat_map(|du| (-6..=6).map(move |dv| (tu + du, tv + dv)))
+                .filter(|&(u, v)| (u, v) != (tu, tv))
+                .filter(|&(u, v)| self.terrain.tree_at(hit.face, u, v).is_some())
+                .collect();
+            let ours = |u: i32, v: i32| {
+                let d = |(a, b): (i32, i32)| (u - a).pow(2) + (v - b).pow(2);
+                others.iter().all(|&o| d((tu, tv)) <= d(o))
+            };
+            for k in bottom..=top {
+                for du in -3..=3 {
+                    for dv in -3..=3 {
+                        let (u, v) = (tu + du, tv + dv);
+                        let Some(cell) = self.planet.cell(hit.face, u, v, k) else {
+                            continue;
+                        };
+                        // Logs only up its own trunk.
+                        let trunk = du == 0 && dv == 0;
+                        let leaves = matches!(
+                            self.streamer.block(cell),
+                            Some(Block::OakLeaves | Block::SpruceLeaves | Block::JungleLeaves)
+                        ) && ours(u, v);
+                        if (trunk || leaves) && cell != hit && self.streamer.grown(cell) {
+                            cells.push(cell);
+                        }
+                    }
+                }
+            }
+        }
+        log::debug!("a vehicle knocked down a tree: {} blocks", cells.len());
+        let mut sounded = false;
+        for (n, cell) in cells.into_iter().enumerate() {
+            let Some(block) = self.streamer.block(cell) else {
+                continue;
+            };
+            self.streamer.set_block(cell, Block::Air);
+            self.survival.announce_broken(cell);
+            let center = crate::player::interact::cell_center(&self.planet, cell);
+            // (A crown is a lot of blocks: crumbs from some of them.)
+            if !matches!(
+                block,
+                Block::OakLeaves | Block::SpruceLeaves | Block::JungleLeaves
+            ) || n % 3 == 0
+            {
+                let up = center.normalize_or(DVec3::Y);
+                self.survival
+                    .effects
+                    .queue
+                    .push(effects::block_break(block, center, up));
+            }
+            if !sounded {
+                sounded = true;
+                self.survival
+                    .sounds
+                    .push((Sound::Break(block.material()), center));
+            }
         }
     }
 
@@ -640,7 +806,21 @@ impl Game {
         let v = &self.flight.vessels[i];
         let id = v.id;
         let (grid, to_world) = self.grid_pose(v);
-        let at = grid + to_world * crate::flight::craft::center(first.at);
+        self.crash_bang(grid + to_world * crate::flight::craft::center(first.at));
+        // (The first with its bang; what came off with it is gone from theirs too then.)
+        use crate::net::protocol::CraftChange;
+        for (n, part) in broke.into_iter().enumerate() {
+            let change = if n == 0 {
+                CraftChange::Crash(part.at)
+            } else {
+                CraftChange::Take(part.at)
+            };
+            self.send_craft_change(id, change);
+        }
+    }
+
+    /// A part knocked off a vehicle at `at` (the active body's frame): fire, smoke, a bang.
+    pub(super) fn crash_bang(&mut self, at: DVec3) {
         let up = at.normalize_or(DVec3::Y);
         self.flight
             .pending
@@ -649,9 +829,6 @@ impl Game {
         let right = self.camera.right().as_dvec3();
         self.audio
             .play_gain(Sound::Explosion, at - listener, right, 0.5);
-        for part in broke {
-            self.send_craft_change(id, crate::net::protocol::CraftChange::Take(part.at));
-        }
     }
 
     fn destroy_vessel(&mut self, i: usize, reason: &str) {
@@ -662,7 +839,7 @@ impl Game {
 
     /// A rocket stops existing, with a bang.
     pub(super) fn explode_vessel(&mut self, i: usize, reason: &str) {
-        let v = self.flight.vessels.remove(i);
+        let mut v = self.flight.vessels.remove(i);
         let at = v.world_position(&self.bodies, self.active, self.time);
         let ground =
             self.bodies
@@ -671,7 +848,7 @@ impl Game {
         self.flight
             .pending
             .extend(effects::explosion(at, ground * 0.2, up));
-        if let Some(mesh) = v.mesh {
+        for mesh in v.take_meshes() {
             self.renderer.destroy_mesh(mesh);
         }
         let listener = self.camera.position - self.planet.center;
@@ -686,10 +863,33 @@ impl Game {
         self.shift_aboard(i);
         let cause = format!("your {noun} {reason}");
         match self.flight.boarded {
-            Some(b) if b == i => {
-                // (Creative or not: there is nothing left to be in.)
+            Some(b) if b == i && self.player.mode == GameMode::Survival => {
                 self.flight.boarded = None;
                 self.die(&cause, Some(at));
+            }
+            Some(b) if b == i => {
+                // Creative: thrown clear, flying, a little above the wreck.
+                self.flight.boarded = None;
+                self.flight.seat = None;
+                self.flight.map = false;
+                self.flight.cockpit = false;
+                self.flight.planner = Planner::default();
+                if v.body == self.active {
+                    let frame = self.active_frame(self.time);
+                    self.player.teleport(at + up * 2.0, &frame);
+                    self.player.flying = true;
+                } else {
+                    // Out in space: floating on, where it was going.
+                    self.flight.eva = Some(Eva {
+                        body: v.body,
+                        position: v.position,
+                        velocity: v.velocity,
+                    });
+                }
+                self.reset_camera();
+                if self.capture.is_none() {
+                    self.set_mouse_grab(true);
+                }
             }
             Some(b) if b > i => self.flight.boarded = Some(b - 1),
             _ => {}
@@ -719,8 +919,8 @@ impl Game {
 
     /// Takes a rocket away quietly (someone picked it up).
     pub(super) fn remove_vessel(&mut self, i: usize) {
-        let v = self.flight.vessels.remove(i);
-        if let Some(mesh) = v.mesh {
+        let mut v = self.flight.vessels.remove(i);
+        for mesh in v.take_meshes() {
             self.renderer.destroy_mesh(mesh);
         }
         self.shift_aboard(i);
@@ -771,7 +971,7 @@ impl Game {
     }
 
     /// Climbs out next to a landed rocket.
-    fn exit_vessel(&mut self) {
+    pub(super) fn exit_vessel(&mut self) {
         let Some(i) = self.flight.boarded else { return };
         self.release_seat(i);
         if self.flight.vessels[i].craft.is_some() {
@@ -909,7 +1109,8 @@ impl Game {
             } else {
                 com - up * 2.5
             };
-            self.camera.position = self.planet.center + target + dir * c.distance;
+            let eye = self.camera_clear_of_blocks(target, target + dir * c.distance);
+            self.camera.position = self.planet.center + eye;
             self.camera.look_at(-dir.as_vec3(), up.as_vec3());
         } else if let Some(at) = self.death.as_ref().and_then(|d| d.wreck()) {
             // Dead: the same view, on where the vehicle came apart. It is standing still now,
@@ -922,9 +1123,48 @@ impl Game {
             if eye.length() < ground {
                 eye = along * ground;
             }
+            let eye = self.camera_clear_of_blocks(at + up * 1.0, eye);
             self.camera.position = self.planet.center + eye;
             self.camera.look_at((at - eye).as_vec3(), up.as_vec3());
         }
+    }
+
+    /// The chase camera wants to be at `eye`, looking at `from` (both planet-relative): it is
+    /// pulled in front of the first solid block between them, so it never sees from inside
+    /// the ground (where every block shows its insides). Where chunks aren't loaded, it stays
+    /// above the terrain's height.
+    pub(super) fn camera_clear_of_blocks(&self, from: DVec3, eye: DVec3) -> DVec3 {
+        const MARGIN: f64 = 0.35;
+        let Some(dir) = (eye - from).try_normalize() else {
+            return eye;
+        };
+        let length = (eye - from).length();
+        let mut t = 0.0;
+        let mut cell = None;
+        // (A wreck may be half buried: the march only counts blocks once it is in the open.)
+        let mut in_the_open = false;
+        while t < length + MARGIN {
+            let p = from + dir * t;
+            let here = self.planet.cell_at(p);
+            if here != cell {
+                cell = here;
+                let solid = here
+                    .and_then(|c| self.streamer.block(c))
+                    .is_some_and(|b| b.is_opaque());
+                if solid && in_the_open {
+                    return from + dir * (t - MARGIN).max(0.0);
+                }
+                in_the_open |= !solid;
+            }
+            t += 0.05 + t * 0.01;
+        }
+        // Beyond the loaded chunks: above the terrain.
+        let along = eye.normalize_or(DVec3::Y);
+        let ground = Self::ground_position(&self.planet, &self.terrain, along).length() + 0.5;
+        if eye.length() < ground && here_unloaded(self, eye) {
+            return along * ground;
+        }
+        eye
     }
 
     /// From the thing the chase camera circles towards the camera.
@@ -1045,26 +1285,36 @@ impl Game {
     }
 
     /// Meshes for the rockets (rebuilt every frame: they move and glow).
-    pub(super) fn flight_draw_items(&mut self, objects: &mut Vec<DrawItem>) -> Result<()> {
+    pub(super) fn flight_draw_items(&mut self, objects: &mut Vec<DrawItem>, dt: f32) -> Result<()> {
         let t = self.time;
         let frame = self.active_frame(t);
         self.vehicle_outline(objects)?;
         for i in 0..self.flight.vessels.len() {
             if self.flight.vessels[i].craft.is_some() {
-                self.vehicle_draw_item(i, objects)?;
+                self.vehicle_draw_item(i, objects, dt)?;
             }
         }
-        for v in self.flight.vessels.iter_mut().filter(|v| v.craft.is_none()) {
+        self.own_figure_draw_item(objects)?;
+        let lights: Vec<Light> = self
+            .flight
+            .vessels
+            .iter()
+            .filter(|v| v.craft.is_none())
+            .map(|v| self.light_at(v.world_position(&self.bodies, self.active, t)))
+            .collect();
+        for (v, light) in self
+            .flight
+            .vessels
+            .iter_mut()
+            .filter(|v| v.craft.is_none())
+            .zip(lights)
+        {
             let com = v.world_position(&self.bodies, self.active, t);
-            let to_body = frame.rotation.inverse() * v.attitude;
+            let to_body = frame.rotation.inverse() * v.shown_attitude();
             let axes = (to_body * DVec3::X, to_body * DVec3::Y, to_body * DVec3::Z);
             let heat = ((v.temperature - 750.0) / (vessel::MAX_TEMPERATURE - 750.0)).clamp(0.0, 1.0)
                 as f32;
-            let block = self
-                .planet
-                .cell_at(com)
-                .map_or(0, |c| self.streamer.light(c)) as u32;
-            let mesh = rocket_model(axes, heat, Light { sky: 15, block });
+            let mesh = rocket_model(axes, heat, light);
             if let Some(handle) = self.renderer.create_mesh(&mesh)?
                 && let Some(old) = v.mesh.replace(handle)
             {
@@ -1366,6 +1616,46 @@ impl Game {
                 }
             }
             "exit" => self.exit_vessel(),
+            "vehicle" if args.first() == Some(&"take") => {
+                // vehicle take <x> <y> <z>: breaks that part off the nearest vehicle, as a
+                // click would (a test without aiming).
+                let at: Vec<i16> = args[1..].iter().filter_map(|a| a.parse().ok()).collect();
+                let here = self.player.body_position(&self.active_frame(self.time));
+                let nearest = (0..self.flight.vessels.len())
+                    .filter(|&i| self.flight.vessels[i].craft.is_some())
+                    .min_by(|&a, &b| {
+                        let d = |i: usize| {
+                            (self.flight.vessels[i].world_position(
+                                &self.bodies,
+                                self.active,
+                                self.time,
+                            ) - here)
+                                .length()
+                        };
+                        d(a).total_cmp(&d(b))
+                    });
+                match (nearest, at.as_slice()) {
+                    (Some(vessel), &[x, y, z]) => {
+                        let at = [x, y, z];
+                        let there = self.flight.vessels[vessel]
+                            .craft
+                            .as_ref()
+                            .is_some_and(|c| c.get(at).is_some());
+                        if there {
+                            self.break_vehicle_part(CraftHit {
+                                vessel,
+                                at,
+                                face: 0,
+                                distance: 0.0,
+                            });
+                        } else {
+                            self.console.print("No part there");
+                        }
+                    }
+                    (None, _) => self.console.print("No vehicle"),
+                    _ => self.console.print("vehicle take <x> <y> <z>"),
+                }
+            }
             "vehicle" => {
                 // vehicle <plane|rover|rocket> [m]: a ready-made one ahead.
                 let distance = number(1).unwrap_or(12.0);
@@ -1450,6 +1740,19 @@ impl Game {
             }
             "transfer" => self.plan_transfer(),
             "map" => self.toggle_map(),
+            "fuel" if matches!(args.first().copied(), Some("infinite" | "inf")) => {
+                // fuel infinite [on|off]: whatever you fly keeps a full tank.
+                self.infinite_fuel = match args.get(1).copied() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => !self.infinite_fuel,
+                };
+                self.console.print(if self.infinite_fuel {
+                    "Infinite fuel on: whatever you fly keeps a full tank"
+                } else {
+                    "Infinite fuel off"
+                });
+            }
             "throttle" | "sas" | "node" | "chase" | "dive" | "fuel" | "steer" | "brake" => {
                 let Some(i) = self.flight.boarded else {
                     self.console.print("Not in a rocket");
@@ -1591,4 +1894,64 @@ impl Game {
         }
         true
     }
+}
+
+/// One of the two block worlds, for `ground_unknown`: its body, grid, terrain, and its loaded
+/// chunks if it is the active one.
+type GroundWorld<'a> = (
+    Body,
+    &'a crate::world::planet::Planet,
+    &'a crate::world::terrain::TerrainGenerator,
+    Option<&'a crate::world::streaming::WorldStreamer>,
+);
+
+/// A vessel nobody flies is near the ground, slowly, where no chunks are loaded here: the
+/// physics would only have a guess from the terrain height, which knows nothing of what was
+/// built or dug (a vehicle in a pit was pushed up out of it, and flew off; one on a bridge
+/// would fall through), or nothing at all on the other world.
+fn ground_unknown(
+    v: &Vessel,
+    bodies: &crate::space::bodies::Bodies,
+    t: f64,
+    worlds: [GroundWorld; 2],
+) -> bool {
+    let Some((_, planet, terrain, streamer)) = worlds.into_iter().find(|w| w.0 == v.body) else {
+        return false;
+    };
+    let frame = bodies.frame(v.body, t);
+    if frame.relative_velocity(v.position, v.velocity).length() > UNKNOWN_GROUND_SPEED {
+        return false;
+    }
+    let p = frame.to_body(v.position);
+    let loaded = planet
+        .cell_at(p)
+        .is_some_and(|c| streamer.is_some_and(|s| s.block(c).is_some()));
+    if loaded {
+        return false;
+    }
+    let ground = Game::ground_position(planet, terrain, p.normalize_or(DVec3::Y));
+    p.length() - ground.length() < UNKNOWN_GROUND_HEIGHT
+}
+
+/// Beyond what is loaded, a vessel slower than this (m/s over the ground) and lower than this
+/// (m over the terrain) stays where it is (`ground_unknown`).
+const UNKNOWN_GROUND_SPEED: f64 = 6.0;
+const UNKNOWN_GROUND_HEIGHT: f64 = 30.0;
+
+/// Holds a vessel where it is (its state is as of `at`), as if it had come to rest there.
+fn park_in_place(v: &mut Vessel, bodies: &crate::space::bodies::Bodies, at: f64, now: f64) {
+    let frame = bodies.frame(v.body, at);
+    v.landed = Some(vessel::Landed {
+        position: frame.to_body(v.position),
+        attitude: (frame.rotation.inverse() * v.attitude).normalize(),
+    });
+    v.touching = false;
+    v.sync_landed(bodies, now);
+}
+
+/// Whether the block at `p` (planet-relative) isn't loaded.
+fn here_unloaded(game: &Game, p: DVec3) -> bool {
+    game.planet
+        .cell_at(p)
+        .is_none_or(|c| game.streamer.block(c).is_none())
 }

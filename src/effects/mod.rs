@@ -99,6 +99,43 @@ pub fn block_place(block: Block, center: DVec3, up: DVec3) -> ParticleEmitter {
     }
 }
 
+/// A puff of coal smoke from a generator's chimney at `at`, rising and drifting with the wind.
+pub fn chimney_smoke(at: DVec3, up: DVec3) -> ParticleEmitter {
+    ParticleEmitter {
+        count: 1,
+        origin: at,
+        extent: Vec3::splat(0.04),
+        velocity: up.as_vec3() * 0.9,
+        spread: 0.1,
+        life: (0.9, 1.8),
+        size: (0.1, 0.26),
+        gravity: -0.02,
+        drag: 0.12,
+        tint: [58, 56, 58, 120],
+        flags: flags::BLEND | flags::ROUND,
+        ..ParticleEmitter::default()
+    }
+}
+
+/// Dust and grit thrown up where a miner's drill goes into the ground at `at`.
+pub fn drill_dust(at: DVec3, up: DVec3) -> ParticleEmitter {
+    ParticleEmitter {
+        count: 3,
+        origin: at,
+        extent: Vec3::splat(0.12),
+        velocity: up.as_vec3() * 0.5,
+        burst: 0.6,
+        spread: 0.3,
+        life: (0.6, 1.2),
+        size: (0.05, 0.14),
+        gravity: 0.4,
+        drag: 1.0,
+        tint: [128, 112, 94, 190],
+        flags: flags::BLEND | flags::ROUND,
+        ..ParticleEmitter::default()
+    }
+}
+
 /// Rain falling around `around` (planet-relative) with local up `up`: `count` drops this
 /// frame, already at their terminal speed, disappearing where they hit something.
 pub fn rain(around: DVec3, up: DVec3, count: u32) -> ParticleEmitter {

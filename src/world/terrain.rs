@@ -1531,7 +1531,7 @@ fn trilerp(c: [[f32; 3]; 8], fu: f32, fv: f32, fk: f32) -> [f32; 3] {
 // Ores
 // ----------------------------------------------------------------------------------------
 
-const ORE_COUNT: usize = 7;
+const ORE_COUNT: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 enum Ore {
@@ -1542,6 +1542,8 @@ enum Ore {
     Diamond,
     Bauxite,
     Uranium,
+    /// Oil shale: rolled for only after all the others, so it changes none of theirs.
+    Oil,
 }
 
 impl Ore {
@@ -1554,6 +1556,7 @@ impl Ore {
             Ore::Diamond => Block::DiamondOre,
             Ore::Bauxite => Block::BauxiteOre,
             Ore::Uranium => Block::UraniumOre,
+            Ore::Oil => Block::OilShale,
         }
     }
 
@@ -1566,6 +1569,7 @@ impl Ore {
             Ore::Diamond => (1.0, 1.5),
             Ore::Bauxite => (2.4, 3.2),
             Ore::Uranium => (1.2, 1.8),
+            Ore::Oil => (2.6, 3.4),
         };
         (min + (max - min) * t) as f32
     }
@@ -1573,6 +1577,7 @@ impl Ore {
     fn can_replace(self, block: Block) -> bool {
         match self {
             Ore::Bauxite => matches!(block, Block::Stone | Block::Dirt),
+            Ore::Oil => matches!(block, Block::Stone | Block::Sandstone | Block::Dirt),
             _ => matches!(block, Block::Stone | Block::Deepstone),
         }
     }
@@ -1588,7 +1593,7 @@ fn choose_ore(roll: f64, depth: i32, biome: Biome, province: impl Fn(Ore) -> f64
     let arid = matches!(biome, Desert | Badlands);
     let in_range = |min: i32, max: i32| (min..=max).contains(&depth);
 
-    let mut chances: [(Ore, f64); ORE_COUNT] = [
+    let mut chances: [(Ore, f64); ORE_COUNT - 1] = [
         (
             Ore::Coal,
             if in_range(4, 120) {
@@ -1658,7 +1663,15 @@ fn choose_ore(roll: f64, depth: i32, biome: Biome, province: impl Fn(Ore) -> f64
         }
         roll -= chance;
     }
-    None
+    // Oil shale in the old seabeds under dry plains, deserts and the cold flats, in what is
+    // left of the roll (so every cell that held another ore still does).
+    let basin = matches!(biome, Desert | Badlands | Plains | Savanna | Tundra);
+    let oil = if basin && in_range(6, 90) {
+        0.12 * (1.0 + 2.0 * province(Ore::Oil))
+    } else {
+        0.0
+    };
+    (roll < oil).then_some(Ore::Oil)
 }
 
 // ----------------------------------------------------------------------------------------
@@ -1939,6 +1952,29 @@ mod tests {
             }
         }
         assert!(seen.contains(&Block::Regolith), "{seen:?}");
+    }
+
+    #[test]
+    fn oil_shale_lies_under_dry_plains_and_changes_no_other_ore() {
+        let rolls = (0..1000).map(|i| i as f64 / 1000.0);
+        let picks = |biome: Biome, depth: i32| -> Vec<Option<Block>> {
+            rolls
+                .clone()
+                .map(|r| choose_ore(r, depth, biome, |_| 0.0).map(Ore::block))
+                .collect()
+        };
+        let oil = |p: &[Option<Block>]| p.iter().filter(|b| **b == Some(Block::OilShale)).count();
+        let desert = picks(Biome::Desert, 30);
+        assert!(oil(&desert) > 50, "{} cells of 1000", oil(&desert));
+        assert_eq!(oil(&picks(Biome::Forest, 30)), 0);
+        assert_eq!(oil(&picks(Biome::Desert, 300)), 0);
+        // Oil only takes rolls above all the others' (ones that used to give nothing), so every
+        // cell that held another ore still does.
+        let last_other = desert
+            .iter()
+            .rposition(|b| b.is_some_and(|b| b != Block::OilShale));
+        let first_oil = desert.iter().position(|b| *b == Some(Block::OilShale));
+        assert!(last_other < first_oil, "{last_other:?} {first_oil:?}");
     }
 
     /// The LOD system draws trees from `tree_at`; they must be exactly the chunk's trees.

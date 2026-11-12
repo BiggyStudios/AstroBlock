@@ -38,6 +38,8 @@ pub struct AvatarPose {
     pub holding: bool,
     /// Just been hit: the figure flashes red.
     pub hurt: bool,
+    /// In a seat: thighs forward, shins down, arms out to the controls.
+    pub sitting: bool,
 }
 
 /// How far the figure reaches from its middle, arms included (m).
@@ -98,12 +100,39 @@ pub fn avatar_model(pose: &AvatarPose, (forward, up): (DVec3, DVec3), light: Lig
     };
     let swing = pose.walk.sin() * 0.75 * pose.swing;
 
-    // Legs, swinging opposite each other from the hip.
-    let hip = 12.0;
-    let left = limb(&mut rig, -2.1, (0.0, hip), 1.8, 2.5, SUIT);
-    rig.turn(left, |p| pitch(p, [0.0, hip], swing));
-    let right = limb(&mut rig, 2.1, (0.0, hip), 1.8, 2.5, SUIT);
-    rig.turn(right, |p| pitch(p, [0.0, hip], -swing));
+    // Sitting, everything above the hips is this much lower: the hips are on the cushion.
+    let drop = if pose.sitting { 9.0 } else { 0.0 };
+    let hip = 12.0 - drop;
+    if pose.sitting {
+        // Thighs along the cushion, shins hanging over its front edge.
+        for x in [-2.1, 2.1] {
+            rig.part(
+                [x - 1.8, -1.8, hip - 3.6],
+                [x + 1.8, 9.0, hip],
+                Tex::Hide,
+                SUIT,
+            );
+            rig.part(
+                [x - 1.8, 5.4, hip - 11.0],
+                [x + 1.8, 9.0, hip - 3.6],
+                Tex::Hide,
+                SUIT,
+            );
+            rig.part(
+                [x - 2.1, 5.1, hip - 13.5],
+                [x + 2.1, 10.0, hip - 11.0],
+                Tex::Hide,
+                DARK,
+            );
+        }
+    } else {
+        // Legs, swinging opposite each other from the hip.
+        let left = limb(&mut rig, -2.1, (0.0, hip), 1.8, 2.5, SUIT);
+        rig.turn(left, |p| pitch(p, [0.0, hip], swing));
+        let right = limb(&mut rig, 2.1, (0.0, hip), 1.8, 2.5, SUIT);
+        rig.turn(right, |p| pitch(p, [0.0, hip], -swing));
+    }
+    let upper = rig.mark();
 
     // The body.
     rig.part([-4.1, -2.4, 12.0], [4.1, 2.4, 21.0], Tex::Hide, SUIT);
@@ -116,7 +145,11 @@ pub fn avatar_model(pose: &AvatarPose, (forward, up): (DVec3, DVec3), light: Lig
     let shoulder = 20.0;
     let left = limb(&mut rig, -5.7, (11.5, shoulder + 1.0), 1.5, 0.0, SUIT);
     rig.turn(left, |p| pitch(p, [0.0, shoulder], -swing));
-    let raised = if pose.holding { 0.9 } else { 0.0 };
+    let raised = if pose.holding || pose.sitting {
+        0.9
+    } else {
+        0.0
+    };
     let right_angle = swing * (1.0 - raised) + raised + 1.5 * pose.arm;
     let right = limb(&mut rig, 5.7, (11.5, shoulder + 1.0), 1.5, 0.0, SUIT);
     rig.turn(right, |p| pitch(p, [0.0, shoulder], right_angle));
@@ -129,6 +162,9 @@ pub fn avatar_model(pose: &AvatarPose, (forward, up): (DVec3, DVec3), light: Lig
     let head = head.start..rig.mark().end;
     let look = pose.look_pitch.clamp(-1.2, 1.2);
     rig.turn(head, |p| pitch(p, [0.0, 22.0], look));
+    if drop > 0.0 {
+        rig.turn(upper, |[x, y, z]| [x, y, z - drop]);
+    }
 
     if pose.hurt {
         for q in &mut rig.quads {
@@ -158,6 +194,7 @@ mod tests {
                 look_pitch: 0.4,
                 holding: true,
                 hurt: walk > 1.0,
+                sitting: walk > 3.0,
             };
             let mesh = avatar_model(&pose, (DVec3::Y, DVec3::Z), Light::default());
             assert!(!mesh.opaque.is_empty());

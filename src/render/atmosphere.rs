@@ -188,8 +188,28 @@ impl Atmosphere {
     pub fn sun_transmittance(&self, luts: &AtmosphereLuts, r: f32, mu_s: f32) -> Vec3 {
         let horizon = self.horizon_mu(r);
         let visible = smoothstep(horizon - 0.01, horizon + 0.01, mu_s);
-        let (x, y) = self.transmittance_coords(r, mu_s.max(horizon));
+        let (r, mu) = match self.entering_air(r, mu_s.max(horizon)) {
+            Some(entry) => entry,
+            None => return Vec3::ONE * visible,
+        };
+        let (x, y) = self.transmittance_coords(r, mu);
         luts.transmittance.sample(x, y) * visible
+    }
+
+    /// A ray from radius `r` at zenith cosine `mu`, from where it enters the air: unchanged
+    /// inside it, None if it starts above the air and misses it. (As `transmittance_lut` in
+    /// atmosphere.glsl.)
+    fn entering_air(&self, r: f32, mu: f32) -> Option<(f32, f32)> {
+        let top = self.top_radius;
+        if r <= top {
+            return Some((r, mu));
+        }
+        let disc = r * r * (mu * mu - 1.0) + top * top;
+        if mu >= 0.0 || disc <= 0.0 {
+            return None;
+        }
+        let d = -r * mu - disc.sqrt();
+        Some((top, ((r * mu + d) / top).clamp(-1.0, 1.0)))
     }
 
     fn compute_multiscattering(&self, transmittance: &Lut, r: f32, mu_s: f32) -> Vec3 {
@@ -461,5 +481,30 @@ mod tests {
         }
         // Night: no sun.
         assert_eq!(atmosphere.sun_transmittance(&luts, r, -0.3), Vec3::ZERO);
+    }
+    #[test]
+    fn far_above_the_air_the_sun_is_white_unless_the_air_is_in_the_way() {
+        // From the moon's distance, the sun off to the side of the planet: no air between.
+        // (It used to be looked up as a grazing ray at the top of the air: a red sun.)
+        let atmosphere = Atmosphere::earth_like(41_700.0);
+        let luts = atmosphere.luts();
+        let r = 880_000.0;
+        for mu in [1.0f32, 0.3, 0.0, -0.5, -0.99] {
+            let sun = atmosphere.sun_transmittance(&luts, r, mu);
+            assert!(sun.min_element() > 0.99, "mu {mu}: {sun}");
+        }
+        // Just past the planet's limb, through the air: reddened, as at sunset.
+        let top = atmosphere.top_radius;
+        let bottom = atmosphere.bottom_radius;
+        let grazing = (bottom + 0.3 * (top - bottom)) / r;
+        let mu = -(1.0 - grazing * grazing).sqrt();
+        let sun = atmosphere.sun_transmittance(&luts, r, mu);
+        assert!(sun.x > sun.z * 1.5, "through the air {sun}");
+        // Low orbit, looking along the horizon: the same as from the top of the air.
+        let (a, b) = (
+            atmosphere.sun_transmittance(&luts, top + 2_000.0, 0.5),
+            atmosphere.sun_transmittance(&luts, top, 0.5),
+        );
+        assert!((a - b).length() < 0.05, "{a} {b}");
     }
 }

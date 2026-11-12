@@ -6,6 +6,8 @@
 
 use crate::render::TextureArrayData;
 
+mod industry;
+
 pub const TEX_SIZE: usize = 16;
 
 /// Declares the texture enum and `Tex::ALL` (every variant, in declaration order) together.
@@ -167,6 +169,60 @@ textures! {
     GyroFace,
     Tire,
     GearFace,
+    // Factories.
+    ConveyorBelt,
+    MachineSide,
+    MachineTop,
+    GeneratorFront,
+    GeneratorFrontLit,
+    ElectricFront,
+    ElectricFrontLit,
+    // Item sprites (transparent around them).
+    PoleIcon,
+    Cable,
+    Insulator,
+    CableSkin,
+    // Industry: oil, machines (idle and working), and what they make.
+    OilShale,
+    CleanPanel,
+    MinerFront,
+    MinerFrontLit,
+    PumpFront,
+    PumpFrontLit,
+    RefineryFront,
+    RefineryFrontLit,
+    ArcFront,
+    ArcFrontLit,
+    AssemblerFront,
+    AssemblerFrontLit,
+    FabFront,
+    FabFrontLit,
+    AccumulatorFront,
+    AccumulatorFrontLit,
+    // (Lamp: white, its alpha all tint mask: lamps and glowing parts take their colour from a tint.)
+    Lamp,
+    RigSteel,
+    Hazard,
+    CrudeOil,
+    FuelCan,
+    Plastic,
+    Rubber,
+    Silicon,
+    Wafer,
+    SteelIngot,
+    CopperWire,
+    InsulatedWire,
+    CircuitBoard,
+    Battery,
+    Led,
+    MemoryChip,
+    Cpu,
+    AiChip,
+    Monitor,
+    Motherboard,
+    PowerSupply,
+    ComputerCase,
+    Computer,
 }
 
 impl Tex {
@@ -1033,6 +1089,120 @@ fn make(t: Tex) -> Img {
                 None
             }
         }),
+        Tex::ConveyorBelt => {
+            // Dark rubber between two metal edges, amber chevrons pointing the way it runs
+            // (towards the top of the image, the model's front).
+            let mut img = noisy(r, [46, 48, 54], 0.06, 0);
+            for y in 0..TEX_SIZE {
+                for x in [0, 1, 14, 15] {
+                    img.set(x, y, scale([140, 146, 156], 1.0 + r.signed() * 0.04), 0);
+                }
+                if y % 4 == 0 {
+                    for x in 2..14 {
+                        img.shade(x, y, 0.7);
+                    }
+                }
+            }
+            for tip in [2, 9] {
+                for d in 0..4usize {
+                    for thick in 0..2 {
+                        let y = tip + d + thick;
+                        img.set(7 - d, y, [240, 170, 50], 0);
+                        img.set(8 + d, y, [240, 170, 50], 0);
+                    }
+                }
+            }
+            img
+        }
+        Tex::MachineSide => {
+            // Steel housing with vents.
+            let mut img = panel(r, [96, 102, 112]);
+            for y in [5, 7, 9, 11] {
+                for x in 4..12 {
+                    img.set(x, y, [44, 46, 52], 0);
+                }
+            }
+            img
+        }
+        Tex::MachineTop => panel(r, [112, 118, 128]),
+        Tex::GeneratorFront | Tex::GeneratorFrontLit => {
+            // A round firebox hatch behind a grille; it glows while burning.
+            let lit = t == Tex::GeneratorFrontLit;
+            let mut img = panel(r, [78, 82, 92]);
+            for y in 0..TEX_SIZE {
+                for x in 0..TEX_SIZE {
+                    let (dx, dy) = (x as f32 - 7.5, y as f32 - 8.5);
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < 5.2 {
+                        let glow = if lit {
+                            scale([255, 150, 50], 1.0 - d / 9.0 + r.signed() * 0.08)
+                        } else {
+                            scale([34, 30, 30], 1.0 + r.signed() * 0.1)
+                        };
+                        let bar = y % 3 == 0;
+                        img.set(x, y, if bar { [70, 72, 80] } else { glow }, 0);
+                    } else if d < 6.2 {
+                        img.set(x, y, [150, 154, 162], 0);
+                    }
+                }
+            }
+            img
+        }
+        Tex::ElectricFront | Tex::ElectricFrontLit => {
+            // A window onto the heating coil, red hot while it works.
+            let lit = t == Tex::ElectricFrontLit;
+            let mut img = panel(r, [96, 102, 112]);
+            for y in 4..12 {
+                for x in 3..13 {
+                    let coil = y % 2 == 0 && (4..12).contains(&x);
+                    let c = match (lit, coil) {
+                        (true, true) => [255, 196, 90],
+                        (true, false) => [230, 96, 36],
+                        (false, true) => [168, 98, 60],
+                        (false, false) => [30, 34, 40],
+                    };
+                    img.set(x, y, scale(c, 1.0 + r.signed() * 0.05), 0);
+                }
+            }
+            for x in 3..13 {
+                img.set(x, 3, [150, 154, 162], 0);
+                img.set(x, 12, [150, 154, 162], 0);
+            }
+            img
+        }
+        Tex::PoleIcon => sprite(|x, y| {
+            let (x, y) = (x as i32, y as i32);
+            let post = (7..=8).contains(&x) && (3..=15).contains(&y);
+            let arm = (2..=13).contains(&x) && (4..=5).contains(&y);
+            let insulator = (x == 3 || x == 12) && (1..=3).contains(&y);
+            if insulator {
+                Some([206, 226, 210])
+            } else if post || arm {
+                Some(if x == 8 || y == 5 {
+                    [104, 78, 46]
+                } else {
+                    [136, 104, 62]
+                })
+            } else {
+                None
+            }
+        }),
+        Tex::Cable => sprite(|x, y| {
+            // A coil of insulated copper wire, its copper end showing.
+            let (dx, dy) = ((x - 8.0) / 1.15, y - 8.0);
+            let d = (dx * dx + dy * dy).sqrt();
+            if (3.0..6.0).contains(&d) {
+                let ring = (d * 2.0) as i32 % 2 == 0;
+                Some(if ring { [52, 50, 48] } else { [34, 32, 30] })
+            } else if (12.0..15.0).contains(&x) && (9.0..11.0).contains(&y) {
+                Some([222, 128, 76])
+            } else {
+                None
+            }
+        }),
+        Tex::Insulator => noisy(r, [204, 222, 208], 0.04, 0),
+        Tex::CableSkin => noisy(r, [40, 38, 36], 0.06, 0),
+        _ if t as usize >= Tex::OilShale as usize => industry::make(t, r),
         _ if t as usize >= Tex::LeatherHelmet as usize => {
             let i = t as usize - Tex::LeatherHelmet as usize;
             let (piece, tier) = (i / 4, i % 4);

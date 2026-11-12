@@ -175,6 +175,112 @@ pub enum Item {
     Armor(ArmorPiece, ArmorTier),
     /// A test rocket: placed on the ground, then boarded.
     Rocket,
+    /// Insulated copper wire: runs power between poles and machines.
+    Cable,
+    // Industry (see `factory::recipes` for how each is made).
+    /// A barrel of it, from an oil pump.
+    CrudeOil,
+    /// A can of it: burns five times as long as coal.
+    Fuel,
+    Plastic,
+    Rubber,
+    Silicon,
+    SiliconWafer,
+    SteelIngot,
+    CopperWire,
+    InsulatedWire,
+    CircuitBoard,
+    Battery,
+    Led,
+    MemoryChip,
+    Cpu,
+    AiChip,
+    Screen,
+    Motherboard,
+    PowerSupply,
+    ComputerCase,
+    /// (Saves from when there were AI servers load them as computers.)
+    #[serde(alias = "AiServer")]
+    Computer,
+}
+
+/// What industry makes, in catalog order.
+pub const INDUSTRY: [Item; 20] = [
+    Item::CrudeOil,
+    Item::Fuel,
+    Item::Plastic,
+    Item::Rubber,
+    Item::Silicon,
+    Item::SiliconWafer,
+    Item::SteelIngot,
+    Item::CopperWire,
+    Item::InsulatedWire,
+    Item::CircuitBoard,
+    Item::Battery,
+    Item::Led,
+    Item::MemoryChip,
+    Item::Cpu,
+    Item::AiChip,
+    Item::Screen,
+    Item::Motherboard,
+    Item::PowerSupply,
+    Item::ComputerCase,
+    Item::Computer,
+];
+
+/// The creative catalog's sections (the tabs down its left side).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Category {
+    /// What the worlds are made of: rock, soil, ores, trees, ice, lava.
+    #[default]
+    Terrain,
+    /// Made blocks: planks, glass, wool, and the workbench, furnace, chest and torch.
+    Building,
+    /// Conveyors, poles, machines, cable.
+    Factory,
+    /// Vehicle parts, hull plating and the test rocket.
+    Vehicles,
+    /// Ores raw and smelted, coal, sticks, leather; oil and what is refined from it.
+    Materials,
+    /// Wire, boards, chips, screens and computers.
+    Electronics,
+    /// Tools, weapons and armor.
+    Gear,
+    Food,
+}
+
+impl Category {
+    pub const ALL: [Category; 8] = [
+        Category::Terrain,
+        Category::Building,
+        Category::Factory,
+        Category::Vehicles,
+        Category::Materials,
+        Category::Electronics,
+        Category::Gear,
+        Category::Food,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Category::Terrain => "terrain",
+            Category::Building => "building",
+            Category::Factory => "factory",
+            Category::Vehicles => "vehicles",
+            Category::Materials => "materials",
+            Category::Electronics => "electronics",
+            Category::Gear => "gear",
+            Category::Food => "food",
+        }
+    }
+
+    /// Its items, in catalog order.
+    pub fn items(self) -> Vec<Item> {
+        Item::all()
+            .into_iter()
+            .filter(|i| i.category() == self)
+            .collect()
+    }
 }
 
 /// How an item looks in the inventory and on the ground.
@@ -227,7 +333,70 @@ impl Item {
             items.extend(ArmorTier::ALL.iter().map(|&t| Item::Armor(piece, t)));
         }
         items.push(Item::Rocket);
+        items.push(Item::Cable);
+        items.extend(INDUSTRY);
         items
+    }
+
+    /// Which tab of the creative catalog it is under. New blocks land in terrain unless they
+    /// are factory or vehicle parts, or listed under building here.
+    pub fn category(self) -> Category {
+        match self {
+            Item::Block(b) if b.is_factory() => Category::Factory,
+            Item::Cable => Category::Factory,
+            Item::Block(b) if b.is_vehicle_part() => Category::Vehicles,
+            Item::Block(Block::Hull) | Item::Rocket => Category::Vehicles,
+            Item::Block(
+                Block::OakPlanks
+                | Block::SprucePlanks
+                | Block::Cobblestone
+                | Block::Glass
+                | Block::WhiteWool
+                | Block::CraftingTable
+                | Block::Furnace
+                | Block::Chest
+                | Block::Torch,
+            ) => Category::Building,
+            Item::Block(_) => Category::Terrain,
+            Item::Tool(..) | Item::Armor(..) => Category::Gear,
+            Item::RawBeef
+            | Item::Steak
+            | Item::RawPorkchop
+            | Item::CookedPorkchop
+            | Item::RawMutton
+            | Item::CookedMutton => Category::Food,
+            Item::Stick
+            | Item::Coal
+            | Item::Charcoal
+            | Item::RawIron
+            | Item::RawCopper
+            | Item::RawGold
+            | Item::IronIngot
+            | Item::CopperIngot
+            | Item::GoldIngot
+            | Item::Diamond
+            | Item::Leather
+            | Item::CrudeOil
+            | Item::Fuel
+            | Item::Plastic
+            | Item::Rubber
+            | Item::Silicon
+            | Item::SteelIngot => Category::Materials,
+            Item::SiliconWafer
+            | Item::CopperWire
+            | Item::InsulatedWire
+            | Item::CircuitBoard
+            | Item::Battery
+            | Item::Led
+            | Item::MemoryChip
+            | Item::Cpu
+            | Item::AiChip
+            | Item::Screen
+            | Item::Motherboard
+            | Item::PowerSupply
+            | Item::ComputerCase
+            | Item::Computer => Category::Electronics,
+        }
     }
 
     pub fn name(self) -> String {
@@ -246,7 +415,21 @@ impl Item {
             Item::RawMutton => "Raw Mutton".into(),
             Item::CookedMutton => "Cooked Mutton".into(),
             Item::Armor(piece, tier) => format!("{} {:?}", tier.adjective(), piece),
-            other => format!("{other:?}"),
+            Item::Cpu => "CPU".into(),
+            Item::Led => "LED".into(),
+            Item::AiChip => "AI Chip".into(),
+            other => {
+                // "SiliconWafer" -> "Silicon Wafer"
+                let raw = format!("{other:?}");
+                let mut out = String::new();
+                for (i, c) in raw.chars().enumerate() {
+                    if i > 0 && c.is_uppercase() {
+                        out.push(' ');
+                    }
+                    out.push(c);
+                }
+                out
+            }
         }
     }
 
@@ -270,6 +453,7 @@ impl Item {
     pub fn icon(self) -> Icon {
         match self {
             Item::Block(Block::Torch) => Icon::Sprite(Tex::TorchSide),
+            Item::Block(Block::PowerPole) => Icon::Sprite(Tex::PoleIcon),
             Item::Block(b) => Icon::Block(b),
             Item::Stick => Icon::Sprite(Tex::Stick),
             Item::Coal => Icon::Sprite(Tex::Coal),
@@ -291,6 +475,27 @@ impl Item {
             Item::Leather => Icon::Sprite(Tex::Leather),
             Item::Armor(piece, tier) => Icon::Sprite(Tex::armor(piece as usize, tier as usize)), // Torches show as their sprite, not a cube.
             Item::Rocket => Icon::Sprite(Tex::Rocket),
+            Item::Cable => Icon::Sprite(Tex::Cable),
+            Item::CrudeOil => Icon::Sprite(Tex::CrudeOil),
+            Item::Fuel => Icon::Sprite(Tex::FuelCan),
+            Item::Plastic => Icon::Sprite(Tex::Plastic),
+            Item::Rubber => Icon::Sprite(Tex::Rubber),
+            Item::Silicon => Icon::Sprite(Tex::Silicon),
+            Item::SiliconWafer => Icon::Sprite(Tex::Wafer),
+            Item::SteelIngot => Icon::Sprite(Tex::SteelIngot),
+            Item::CopperWire => Icon::Sprite(Tex::CopperWire),
+            Item::InsulatedWire => Icon::Sprite(Tex::InsulatedWire),
+            Item::CircuitBoard => Icon::Sprite(Tex::CircuitBoard),
+            Item::Battery => Icon::Sprite(Tex::Battery),
+            Item::Led => Icon::Sprite(Tex::Led),
+            Item::MemoryChip => Icon::Sprite(Tex::MemoryChip),
+            Item::Cpu => Icon::Sprite(Tex::Cpu),
+            Item::AiChip => Icon::Sprite(Tex::AiChip),
+            Item::Screen => Icon::Sprite(Tex::Monitor),
+            Item::Motherboard => Icon::Sprite(Tex::Motherboard),
+            Item::PowerSupply => Icon::Sprite(Tex::PowerSupply),
+            Item::ComputerCase => Icon::Sprite(Tex::ComputerCase),
+            Item::Computer => Icon::Sprite(Tex::Computer),
         }
     }
 
@@ -312,7 +517,9 @@ impl Item {
     /// Seconds this item burns in a furnace.
     pub fn fuel(self) -> Option<f32> {
         match self {
+            Item::Fuel => Some(400.0),
             Item::Coal | Item::Charcoal => Some(80.0),
+            Item::Block(Block::OilShale) => Some(30.0),
             Item::Block(Block::OakLog | Block::SpruceLog) => Some(15.0),
             Item::Block(
                 Block::OakPlanks | Block::SprucePlanks | Block::CraftingTable | Block::Chest,
@@ -473,6 +680,11 @@ pub fn mining(block: Block) -> Mining {
         Wing | Flap | Seat => m(0.5, None, None),
         Hull | FuelTank | Wheel | LandingGear | Propeller => m(0.8, None, None),
         VehicleCore | JetEngine | RocketEngine | OrbitalEngine | Gyro => m(1.2, None, None),
+        Conveyor => m(1.0, Some(Pickaxe), None),
+        PowerPole => m(1.5, Some(Axe), None),
+        CoalGenerator | ElectricFurnace | Miner | OilPump | Refinery | ArcFurnace | Assembler
+        | ChipFab | Accumulator => m(3.5, Some(Pickaxe), Some(0)),
+        OilShale => m(2.0, Some(Pickaxe), Some(0)),
     }
 }
 
@@ -563,6 +775,19 @@ mod tests {
             drops(Block::Grass, hand, 0.0).map(|s| s.item),
             Some(Item::Block(Block::Dirt))
         );
+    }
+
+    #[test]
+    fn every_catalog_tab_has_items_and_every_item_one_tab() {
+        let tabs: Vec<Vec<Item>> = Category::ALL.iter().map(|c| c.items()).collect();
+        for (c, items) in Category::ALL.iter().zip(&tabs) {
+            assert!(!items.is_empty(), "{c:?} is empty");
+        }
+        assert_eq!(tabs.iter().map(Vec::len).sum::<usize>(), Item::all().len());
+        let factory = &tabs[Category::Factory as usize];
+        assert!(factory.contains(&Item::Cable) && factory.contains(&Item::Block(Block::Conveyor)));
+        assert_eq!(Item::Block(Block::Wheel).category(), Category::Vehicles);
+        assert_eq!(Item::Block(Block::Basalt).category(), Category::Terrain);
     }
 
     #[test]

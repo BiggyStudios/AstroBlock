@@ -88,9 +88,27 @@ pub(super) fn vessel_at(
     t: f64,
 ) -> (Body, DVec3, DVec3, DQuat) {
     let dt = t - state.time;
-    let raw = (state.body, state.position, state.velocity, state.attitude);
-    if dt.abs() < 0.5 || state.landed.is_some() {
-        return raw;
+    if let Some(l) = state.landed {
+        // Resting on the ground: where it rests, as the ground has turned by `t`. (Placed at
+        // the sender's time, a parked vehicle's news moved it by the planet's turn between
+        // the clocks, and someone sitting still in one sends that 20 times a second.)
+        let frame = bodies.frame(state.body, t);
+        return (
+            state.body,
+            frame.to_inertial(l.position),
+            frame.inertial_velocity(l.position, DVec3::ZERO),
+            (frame.rotation * l.attitude).normalize(),
+        );
+    }
+    if dt.abs() < 0.5 {
+        // On the way here (or a clock a little behind): carried on as it was going.
+        let turn = DQuat::from_scaled_axis(state.spin.as_dvec3() * dt);
+        return (
+            state.body,
+            state.position + state.velocity * dt,
+            state.velocity,
+            (turn * state.attitude).normalize(),
+        );
     }
     if vessel::coasting(bodies, state.body, state.position, state.throttle as f64) {
         if dt > 0.0 {
@@ -274,6 +292,7 @@ impl Game {
             }
         } else {
             self.survival.run_furnaces(to - from);
+            self.survival.run_factory(&self.planet, to - from);
         }
         self.update_vessels(from);
         self.weather.clock_jumped(to);
@@ -744,6 +763,9 @@ mod tests {
             temperature: 0.0,
             heating: 0.0,
             landed: None,
+            touching: false,
+            steer: 0.0,
+            flaps: Vec::new(),
         }
     }
 
@@ -812,10 +834,11 @@ mod tests {
     }
 
     #[test]
-    fn close_clocks_change_nothing() {
+    fn news_a_moment_old_is_carried_on_as_it_was_going() {
         let bodies = bodies();
         let s = state(DVec3::X * 90_000.0, DVec3::Y * 700.0, 0.0, 50.0);
         let (_, p, v, _) = vessel_at(&bodies, &s, 50.2);
-        assert_eq!((p, v), (s.position, s.velocity));
+        assert!((p - (s.position + s.velocity * 0.2)).length() < 1e-9);
+        assert_eq!(v, s.velocity);
     }
 }

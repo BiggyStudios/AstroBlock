@@ -144,6 +144,18 @@ impl WorldEdits {
             .insert(local_index(local), block);
     }
 
+    /// Whether someone has changed this cell (broken or placed something there).
+    pub fn edited(&self, planet: &Planet, cell: BlockCell) -> bool {
+        let chunks = self.chunks.read().unwrap();
+        if chunks.is_empty() {
+            return false;
+        }
+        let (key, local) = planet.cell_chunk(cell);
+        chunks
+            .get(&key)
+            .is_some_and(|c| c.contains_key(&local_index(local)))
+    }
+
     /// True if `key` or any chunk whose blocks reach into its padding has edits.
     pub fn touches(&self, planet: &Planet, key: ChunkKey) -> bool {
         let chunks = self.chunks.read().unwrap();

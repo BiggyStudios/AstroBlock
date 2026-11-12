@@ -102,6 +102,7 @@ fn recipes() -> &'static [Recipe] {
             ),
         ];
         all.extend(vehicle_recipes());
+        all.extend(factory_recipes());
         for tier in Tier::ALL {
             let material = match tier {
                 Tier::Wood => Planks,
@@ -226,6 +227,96 @@ fn vehicle_recipes() -> Vec<Recipe> {
             2,
         ),
         recipe(&["I", "W"], &[iron, wheel], made(Block::LandingGear), 1),
+    ]
+}
+
+/// What factories are made of: iron, copper and furnaces.
+fn factory_recipes() -> Vec<Recipe> {
+    use Ingredient::*;
+    let iron = ('I', Exactly(Item::IronIngot));
+    let copper = ('C', Exactly(Item::CopperIngot));
+    let stick = ('S', Exactly(Item::Stick));
+    let furnace = ('F', Exactly(Item::Block(Block::Furnace)));
+    let glass = ('G', Exactly(Item::Block(Block::Glass)));
+    let made = |b| Item::Block(b);
+    vec![
+        recipe(&["III", "C C"], &[iron, copper], made(Block::Conveyor), 4),
+        recipe(
+            &["CSC", " S ", " S "],
+            &[copper, stick],
+            made(Block::PowerPole),
+            2,
+        ),
+        recipe(&["CCC"], &[copper], Item::Cable, 8),
+        recipe(
+            &["ICI", "IFI", "III"],
+            &[iron, copper, furnace],
+            made(Block::CoalGenerator),
+            1,
+        ),
+        recipe(
+            &["III", "CFC", "CCC"],
+            &[iron, copper, furnace],
+            made(Block::ElectricFurnace),
+            1,
+        ),
+        // Industry. The first machines need only metal, glass and furnaces; the chip fab
+        // needs circuit boards out of an assembler, the accumulator batteries.
+        recipe(
+            &["ICI", "IPI", "I I"],
+            &[
+                iron,
+                copper,
+                ('P', Exactly(Item::Tool(ToolKind::Pickaxe, Tier::Iron))),
+            ],
+            made(Block::Miner),
+            1,
+        ),
+        recipe(
+            &["III", "CIC", "I I"],
+            &[iron, copper],
+            made(Block::OilPump),
+            1,
+        ),
+        recipe(
+            &["IGI", "IFI", "CCC"],
+            &[iron, glass, furnace, copper],
+            made(Block::Refinery),
+            1,
+        ),
+        recipe(
+            &["O O", "IFI", "III"],
+            &[('O', Coal), iron, furnace],
+            made(Block::ArcFurnace),
+            1,
+        ),
+        recipe(
+            &["ICI", "CTC", "ICI"],
+            &[
+                iron,
+                copper,
+                ('T', Exactly(Item::Block(Block::CraftingTable))),
+            ],
+            made(Block::Assembler),
+            1,
+        ),
+        recipe(
+            &["GBG", "IAI", "III"],
+            &[
+                glass,
+                ('B', Exactly(Item::CircuitBoard)),
+                ('A', Exactly(Item::Block(Block::Assembler))),
+                iron,
+            ],
+            made(Block::ChipFab),
+            1,
+        ),
+        recipe(
+            &["IBI", "BCB", "IBI"],
+            &[iron, ('B', Exactly(Item::Battery)), copper],
+            made(Block::Accumulator),
+            1,
+        ),
     ]
 }
 

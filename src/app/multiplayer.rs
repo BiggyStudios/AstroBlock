@@ -17,6 +17,8 @@
 //! | the weather, tornadoes, eruptions | one player for everyone at the same time: the host, or whoever has warped away |
 //! | tornadoes tearing up ground | whoever has that ground loaded |
 //! | lava rivers | worked out by each player from the same eruption (not sent) |
+//! | conveyors taking from and putting into containers | the host (it sends what rides the conveyors near each player, and the containers they changed) |
+//! | machines (generators, electric furnaces) and power | everyone works them out, as furnaces; the host's word wins |
 //!
 //! Peers are trusted (you are playing with friends), but anything from the network is still
 //! checked enough that a broken or hostile message can't crash the game or write a file.
@@ -39,6 +41,7 @@ use super::{
 };
 use crate::{
     audio::Sound,
+    factory::NetBelts,
     flight::{
         craft::{MAX_PARTS, MAX_REACH},
         map_view::Planner,
@@ -49,8 +52,8 @@ use crate::{
         Event, Link, PeerId,
         direct::{self, DirectClient, DirectHost},
         protocol::{
-            self, AboardPose, CraftChange, HOST, MAX_PLAYERS, Msg, NetTornado, NetVolcano,
-            PROTOCOL, PlayerId, PlayerPose, VesselState, WorldBlob, WorldEvent,
+            self, AboardPose, CraftChange, HOST, MAX_PLAYERS, MAX_UNRELIABLE, Msg, NetTornado,
+            NetVolcano, PROTOCOL, PlayerId, PlayerPose, VesselState, WorldBlob, WorldEvent,
         },
         steam::{self, Friend, Steam},
     },
@@ -66,7 +69,7 @@ use crate::{
         anim::approach,
         menu::{Menu, Page},
     },
-    util::FastMap,
+    util::{FastMap, FastSet},
     weather::{self, sim},
     world::{chunk::BlockCell, planet::Planet},
 };
@@ -75,8 +78,10 @@ use crate::{
 const TICK: f32 = 1.0 / 20.0;
 const MOB_TICK: f32 = 1.0 / 8.0;
 const LIVE_TICK: f32 = 0.33;
-/// An idle rocket's position is corrected this often (s).
-const VESSEL_TICK: f32 = 0.5;
+/// Rockets and vehicles nobody flies are sent this often while physics moves them (s).
+const VESSEL_TICK: f32 = 0.1;
+/// Coasting vessels (on rails) go out every this many vessel ticks.
+const COASTING_ROUNDS: u32 = 5;
 /// One cube face of the weather goes out this often (s), so all six take 9 s.
 const WEATHER_TICK: f32 = 1.5;
 /// A client hands the host its state this often (s), for when it disappears.
@@ -115,6 +120,11 @@ const HIT_LIFT: f64 = 4.0;
 const MOST_DAMAGE: f32 = 40.0;
 /// Further than this from where they stood (m), the blow can't have reached.
 const HIT_RANGE: f64 = 16.0;
+/// What rides the conveyors goes to the players within `BELT_RANGE` (m) this often (s), and
+/// the containers conveyors changed go to everyone this often.
+const BELT_TICK: f32 = 0.2;
+const BELT_RANGE: f64 = 56.0;
+const FACTORY_TICK: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub(super) enum Role {
@@ -261,6 +271,11 @@ pub(super) struct Multiplayer {
     mob_tick: f32,
     live_tick: f32,
     vessel_tick: f32,
+    vessel_round: u32,
+    /// Vessels nobody flies that the others have been told are parked.
+    parked: FastSet<u32>,
+    belt_tick: f32,
+    factory_tick: f32,
     weather_tick: f32,
     record_tick: f32,
     /// Each weather face as last sent (our own weather) or received (someone else's).
@@ -312,6 +327,10 @@ impl Multiplayer {
             mob_tick: 0.0,
             live_tick: 0.0,
             vessel_tick: 0.0,
+            vessel_round: 0,
+            parked: FastSet::default(),
+            belt_tick: 0.0,
+            factory_tick: 0.0,
             weather_tick: 0.0,
             record_tick: RECORD_TICK,
             weather_faces: Vec::new(),
@@ -410,6 +429,38 @@ impl Multiplayer {
                 peer.queued += data.len();
                 peer.out.push_back(data.clone());
             } else if peer.ready {
+                self.link.send(&mut self.steam, peer.link, &data, false);
+            }
+        }
+    }
+
+    /// (Host.) What is on the conveyors near each player, from `factory_of` (the factory of
+    /// a world, if it is loaded here), in datagrams of whole groups.
+    fn send_belts<'a>(&mut self, factory_of: &dyn Fn(Body) -> Option<&'a crate::factory::Factory>) {
+        for peer in &mut self.peers {
+            if !peer.ready {
+                continue;
+            }
+            let Some(pose) = &peer.pose else { continue };
+            let Some(factory) = factory_of(pose.body) else {
+                continue;
+            };
+            let groups = factory.belts_near(pose.feet, BELT_RANGE);
+            let mut batch: Vec<NetBelts> = Vec::new();
+            let mut size = 0;
+            let body = pose.body;
+            for group in groups {
+                let bytes = postcard::to_stdvec(&group).map_or(0, |b| b.len());
+                if size + bytes > MAX_UNRELIABLE - 48 && !batch.is_empty() {
+                    let data = protocol::encode(&Msg::Belts(body, std::mem::take(&mut batch)));
+                    self.link.send(&mut self.steam, peer.link, &data, false);
+                    size = 0;
+                }
+                size += bytes;
+                batch.push(group);
+            }
+            if !batch.is_empty() {
+                let data = protocol::encode(&Msg::Belts(body, batch));
                 self.link.send(&mut self.steam, peer.link, &data, false);
             }
         }
@@ -888,21 +939,65 @@ impl Game {
         }
     }
 
+    /// (Host.) The factories: what rides the conveyors near each player, and the containers
+    /// the conveyors have changed.
+    fn factory_ticks(&mut self, dt: f32) {
+        self.net.belt_tick -= dt;
+        if self.net.belt_tick <= 0.0 {
+            self.net.belt_tick = BELT_TICK;
+            let (active, other) = (self.active, self.other.body);
+            let (here, there) = (&self.survival.factory, self.other.state.factory());
+            self.net.send_belts(&|body| {
+                if body == active {
+                    Some(here)
+                } else if body == other {
+                    Some(there)
+                } else {
+                    None
+                }
+            });
+        }
+        self.net.factory_tick -= dt;
+        if self.net.factory_tick <= 0.0 {
+            self.net.factory_tick = FACTORY_TICK;
+            for (body, events) in [
+                (self.active, self.survival.factory_news()),
+                (self.other.body, self.other.state.factory_news()),
+            ] {
+                if !events.is_empty() {
+                    self.net.broadcast(&Msg::World(body, events), true, None);
+                }
+            }
+        }
+    }
+
     fn host_ticks(&mut self, dt: f32) {
+        self.factory_ticks(dt);
+        // Vessels nobody flies are the host's: moving under physics they go out often, coasting
+        // less often, and coming to rest once, reliably (otherwise the others would carry a
+        // parked vehicle on in a straight line, off into the sky).
         self.net.vessel_tick -= dt;
         if self.net.vessel_tick <= 0.0 {
             self.net.vessel_tick = VESSEL_TICK;
+            self.net.vessel_round = self.net.vessel_round.wrapping_add(1);
+            let coasting_too = self.net.vessel_round.is_multiple_of(COASTING_ROUNDS);
             let t = self.time;
-            let states: Vec<_> = self
-                .flight
-                .vessels
-                .iter()
-                .filter(|v| v.pilot.is_none() && v.landed.is_none())
-                .map(|v| vessel_state(v, t))
-                .collect();
-            for state in states {
+            let mut states = Vec::new();
+            for v in self.flight.vessels.iter().filter(|v| v.pilot.is_none()) {
+                if v.landed.is_some() {
+                    if self.net.parked.insert(v.id) {
+                        states.push((vessel_state(v, t), true));
+                    }
+                    continue;
+                }
+                self.net.parked.remove(&v.id);
+                if coasting_too || !v.can_rail_warp(&self.bodies) {
+                    states.push((vessel_state(v, t), false));
+                }
+            }
+            for (state, reliable) in states {
                 self.net
-                    .broadcast(&Msg::VesselState(Box::new(state)), false, None);
+                    .broadcast(&Msg::VesselState(Box::new(state)), reliable, None);
             }
         }
     }
@@ -1720,6 +1815,15 @@ impl Game {
                 self.apply_world_events(body, events);
             }
             Msg::Give(stack) => self.got_item(stack),
+            Msg::Belts(body, groups) => {
+                if body == self.active {
+                    for group in &groups {
+                        self.survival.factory.apply_belts(group);
+                    }
+                } else if body == self.other.body {
+                    self.other.state.apply_belts(&groups);
+                }
+            }
             Msg::Mobs { owner, body, list } => self.got_mobs(owner, body, &list),
             Msg::MobHit {
                 id,
@@ -2147,10 +2251,29 @@ impl Game {
             return;
         }
         let t = self.time;
+        if state
+            .landed
+            .is_some_and(|l| !finite(l.position) || !l.attitude.is_finite())
+        {
+            return;
+        }
         let Some(v) = self.flight.vessels.iter_mut().find(|v| v.id == state.id) else {
             return;
         };
+        // Late news. Nothing gets a vessel at rest that nobody flies moving again but its
+        // engines, so news of it moving with them off was sent before it came to rest. (What
+        // can arrive unreliably can overtake the reliable word that it is parked, and then
+        // it was carried on in a straight line here, off into the sky.)
+        if v.pilot.is_none()
+            && v.landed.is_some()
+            && state.landed.is_none()
+            && state.throttle <= 0.0
+        {
+            return;
+        }
+        let before = (v.body, (v.position + v.shown_offset, v.shown_attitude()));
         timeline::place_vessel(&self.bodies, v, state, t);
+        v.news_moved(before.0, before.1);
         v.spin = state.spin.as_dvec3();
         v.throttle = state.throttle as f64;
         v.fuel = (state.fuel as f64).clamp(0.0, v.fuel_capacity());
@@ -2160,6 +2283,16 @@ impl Game {
         if v.landed.is_some() {
             v.sync_landed(&self.bodies, t);
         }
+        v.touching = state.touching;
+        v.steer = if state.steer.is_finite() {
+            state.steer.clamp(-1.0, 1.0)
+        } else {
+            0.0
+        };
+        let surfaces = v.craft.as_ref().map_or(0, |c| c.stats.surfaces.len());
+        v.flaps.clear();
+        v.flaps
+            .extend(state.flaps.iter().take(surfaces).map(|&f| f as f32 / 127.0));
     }
 
     fn got_pilot(&mut self, id: u32, pilot: Option<PlayerId>) {
@@ -2303,23 +2436,26 @@ impl Game {
             }
             // Aboard, they are wherever the vehicle has taken them on this machine.
             let on_vehicle = aboard.and_then(|a| self.aboard_world(&a));
-            let remote = self.net.players.get_mut(&id).expect("listed");
-            if let Some((feet, _)) = on_vehicle {
-                remote.feet = feet;
-            }
-            let up = match on_vehicle {
-                Some((_, up)) => up.normalize_or(DVec3::Y),
-                None => remote.feet.normalize_or(DVec3::Y),
+            let feet = match on_vehicle {
+                Some((feet, _, _)) => feet,
+                None => self.net.players[&id].feet,
             };
+            let seated = on_vehicle.and_then(|(_, _, facing)| facing);
+            let up = match on_vehicle {
+                Some((_, up, _)) => up.normalize_or(DVec3::Y),
+                None => feet.normalize_or(DVec3::Y),
+            };
+            let light = self.light_at(feet + up);
+            let remote = self.net.players.get_mut(&id).expect("listed");
+            remote.feet = feet;
             remote.shown = Some(up);
             let hurt = remote.pose.as_ref().is_some_and(|p| p.hurt);
             let look = remote.look.as_dvec3();
-            let forward = (look - up * look.dot(up)).normalize_or(up.any_orthonormal_vector());
+            let forward = seated.unwrap_or(look);
+            let forward =
+                (forward - up * forward.dot(up)).normalize_or(up.any_orthonormal_vector());
             let look_pitch = look.dot(up).clamp(-1.0, 1.0).asin() as f32;
             let right = forward.cross(up);
-            let cell = self.planet.cell_at(remote.feet + up);
-            let block = cell.map_or(0, |c| self.streamer.light(c)) as u32;
-            let light = models::Light { sky: 15, block };
             let mesh = avatar_model(
                 &AvatarPose {
                     walk: remote.walk,
@@ -2328,6 +2464,7 @@ impl Game {
                     look_pitch,
                     holding: item_kind.is_some(),
                     hurt,
+                    sitting: seated.is_some(),
                 },
                 (forward, up),
                 light,
@@ -2346,7 +2483,7 @@ impl Game {
                     fade: Fade::Visible,
                 });
             }
-            match item_kind {
+            match item_kind.filter(|_| seated.is_none()) {
                 Some(item) => {
                     let mesh = models::drop_model(item, (right, forward, up), light);
                     if let Some(handle) = self.renderer.create_mesh(&mesh)?
@@ -2450,6 +2587,41 @@ impl Game {
                 Some(id) => self.join_team(id),
                 None => self.console.print("Nobody by that name"),
             },
+            ["vessels"] => {
+                // Every vessel here: who flies it, parked or not, how high over the terrain.
+                let t = self.time;
+                let lines: Vec<String> = self
+                    .flight
+                    .vessels
+                    .iter()
+                    .map(|v| {
+                        let at = v.world_position(&self.bodies, self.active, t);
+                        let ground = Self::ground_position(
+                            &self.planet,
+                            &self.terrain,
+                            at.normalize_or(DVec3::Y),
+                        );
+                        format!(
+                            "vessel {}: pilot {:?}, {}, {:.2} m over the terrain, drawn {:.2} m from the news",
+                            v.id,
+                            v.pilot,
+                            if v.landed.is_some() {
+                                "parked"
+                            } else {
+                                "moving"
+                            },
+                            at.length() - ground.length(),
+                            v.shown_offset.length()
+                        )
+                    })
+                    .collect();
+                if lines.is_empty() {
+                    self.console.print("No vessels");
+                }
+                for line in lines {
+                    self.console.print(line);
+                }
+            }
             ["status"] | [] => {
                 let line = format!(
                     "{:?}, {} players, steam {}",
@@ -2578,6 +2750,56 @@ impl Game {
             .min_by(|a, b| (*a - eye).length().total_cmp(&(*b - eye).length()))
     }
 
+    /// `tp <who>`: stands beside another player (on their world, if that is the other one).
+    pub(super) fn teleport_to_player(&mut self, who: &str) {
+        if !self.net.in_session() {
+            self.console
+                .print("Not playing with anyone: tp <lat> <lon> [altitude]");
+            return;
+        }
+        let Some(id) = self.player_named(who) else {
+            self.console
+                .print(format!("Nobody called {who} (net status lists everyone)"));
+            return;
+        };
+        let remote = &self.net.players[&id];
+        let name = remote.name.clone();
+        let Some(pose) = remote
+            .pose
+            .clone()
+            .filter(|p| finite(p.feet) && p.feet != DVec3::ZERO)
+        else {
+            self.console.print(format!("Waiting to hear from {name}"));
+            return;
+        };
+        if !matches!(pose.body, Body::Planet | Body::Moon) {
+            self.console.print(format!("{name} is out in space"));
+            return;
+        }
+        if self.flight.boarded.is_some() {
+            self.console.print("Get out first (F)");
+            return;
+        }
+        self.flight.eva = None;
+        self.flight.aboard = None;
+        if pose.body != self.active {
+            self.switch_world(pose.body);
+        }
+        // A step to their side, not inside them.
+        let up = pose.feet.normalize_or(DVec3::Y);
+        let look = pose.look.as_dvec3();
+        let side = up
+            .cross(look)
+            .try_normalize()
+            .unwrap_or_else(|| up.any_orthonormal_vector());
+        let feet = pose.feet + side * 1.2 + up * 0.05;
+        let frame = self.active_frame(self.time);
+        self.player.teleport(feet, &frame);
+        self.player.on_ground = false;
+        self.reset_camera();
+        self.console.print(format!("Teleported to {name}"));
+    }
+
     /// The menus' view of the session.
     pub(super) fn join_error_shown(&mut self) {
         if let (Some(notice), Some(menu)) = (self.net.notice.take(), &mut self.menu) {
@@ -2598,7 +2820,7 @@ fn vessel_is_sound(v: &Vessel) -> bool {
 fn craft_change_is_sound(change: &CraftChange) -> bool {
     let at = match change {
         CraftChange::Put(part) => part.at,
-        CraftChange::Take(at) => *at,
+        CraftChange::Take(at) | CraftChange::Crash(at) => *at,
     };
     at.iter().all(|c| c.abs() <= MAX_REACH)
 }
@@ -2630,6 +2852,9 @@ fn vessel_state(v: &Vessel, time: f64) -> VesselState {
         temperature: v.temperature as f32,
         heating: v.heating as f32,
         landed: v.landed,
+        touching: v.touching,
+        steer: v.steer,
+        flaps: v.flaps.iter().map(|f| (f * 127.0).round() as i8).collect(),
     }
 }
 
@@ -2639,9 +2864,23 @@ fn valid_event(planet: &Planet, event: &WorldEvent) -> bool {
         WorldEvent::Placed { cell, support, .. } => {
             valid_cell(planet, *cell) && support.is_none_or(|s| valid_cell(planet, s))
         }
-        WorldEvent::Chest { cell, .. } | WorldEvent::Furnace { cell, .. } => {
+        WorldEvent::Chest { cell, .. }
+        | WorldEvent::Furnace { cell, .. }
+        | WorldEvent::Turned { cell, .. } => valid_cell(planet, *cell),
+        WorldEvent::Machine { cell, machine } => {
             valid_cell(planet, *cell)
+                && machine.cell == *cell
+                && [
+                    machine.progress,
+                    machine.energy,
+                    machine.energy_total,
+                    machine.power,
+                    machine.supply,
+                ]
+                .iter()
+                .all(|x| x.is_finite())
         }
+        WorldEvent::Cable { a, b, .. } => valid_cell(planet, *a) && valid_cell(planet, *b),
         WorldEvent::DropNew(drop) => finite(drop.position) && finite(drop.velocity),
         WorldEvent::DropGone(_) => true,
     }

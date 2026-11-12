@@ -105,6 +105,33 @@ pub enum Block {
     Wheel,
     /// A free-rolling wheel on a strut, for landing.
     LandingGear,
+    // Factories (see `factory`). Models; what they hold lives in `Factory`.
+    /// A belt that carries items the way its arrow points: it takes them out of whatever is
+    /// behind it and puts them into whatever is in front.
+    Conveyor,
+    /// Carries power: cables run from pole to pole and to machines.
+    PowerPole,
+    /// Burns fuel for power.
+    CoalGenerator,
+    /// Smelts on power, twice as fast as a furnace.
+    ElectricFurnace,
+    /// Dark rock soaked with crude oil, deep under dry plains, deserts and the cold flats. An
+    /// oil pump over it brings the oil up.
+    OilShale,
+    /// Digs up whatever is under it, for ever, on power (see `factory`).
+    Miner,
+    /// Pumps crude oil out of oil shale below it.
+    OilPump,
+    /// Crude oil into fuel, plastic and rubber.
+    Refinery,
+    /// A very hot electric furnace: silicon from sand, steel from iron.
+    ArcFurnace,
+    /// Puts parts together into what is picked on its screen.
+    Assembler,
+    /// Makes wafers and chips out of silicon.
+    ChipFab,
+    /// Stores power when there is more than is used, and gives it back when there isn't enough.
+    Accumulator,
 }
 
 /// What a block sounds like (footsteps, breaking, placing).
@@ -134,7 +161,7 @@ pub enum Tint {
 
 impl Block {
     /// Every block, in declaration order.
-    pub const ALL: [Block; 62] = {
+    pub const ALL: [Block; 74] = {
         use Block::*;
         [
             Air,
@@ -199,12 +226,51 @@ impl Block {
             Gyro,
             Wheel,
             LandingGear,
+            Conveyor,
+            PowerPole,
+            CoalGenerator,
+            ElectricFurnace,
+            OilShale,
+            Miner,
+            OilPump,
+            Refinery,
+            ArcFurnace,
+            Assembler,
+            ChipFab,
+            Accumulator,
         ]
     };
 
     /// Only exists on a vehicle: can't be placed in the world.
     pub fn is_vehicle_part(self) -> bool {
-        (self as u8) >= (Block::VehicleCore as u8) && self != Block::Hull
+        (Block::VehicleCore as u8..=Block::LandingGear as u8).contains(&(self as u8))
+            && self != Block::Hull
+    }
+
+    /// Part of a factory (see `factory`): conveyors, poles and machines.
+    pub fn is_factory(self) -> bool {
+        self == Block::Conveyor || self.is_electric()
+    }
+
+    /// Cables can run to it: poles and machines.
+    pub fn is_electric(self) -> bool {
+        self == Block::PowerPole || self.is_machine()
+    }
+
+    /// A machine of a factory (`factory::MachineKind`).
+    pub fn is_machine(self) -> bool {
+        matches!(
+            self,
+            Block::CoalGenerator
+                | Block::ElectricFurnace
+                | Block::Miner
+                | Block::OilPump
+                | Block::Refinery
+                | Block::ArcFurnace
+                | Block::Assembler
+                | Block::ChipFab
+                | Block::Accumulator
+        )
     }
 
     /// Solid and fully hides what's behind it (a full cube).
@@ -219,7 +285,22 @@ impl Block {
 
     /// Things walk into it (torches don't stop you).
     pub fn collides(self) -> bool {
-        self.is_solid() && self != Block::Torch
+        // (A conveyor is a low belt you walk over, as you walk through a torch.)
+        self.is_solid() && !matches!(self, Block::Torch | Block::Conveyor)
+    }
+
+    /// Trees and cacti: a tornado takes several at a time, and vehicles knock down the ones
+    /// the world grew (`Voxels::grown`).
+    pub fn is_plant(self) -> bool {
+        matches!(
+            self,
+            Block::OakLeaves
+                | Block::SpruceLeaves
+                | Block::JungleLeaves
+                | Block::OakLog
+                | Block::SpruceLog
+                | Block::Cactus
+        )
     }
 
     /// Light level this block gives off by itself (its own faces glow; see `world::light`
@@ -242,7 +323,7 @@ impl Block {
         matches!(
             self,
             Block::CraftingTable | Block::Furnace | Block::Torch | Block::Chest
-        )
+        ) || self.is_factory()
     }
 
     /// Textures for (top, side, bottom) faces. "Top" is radially outward.
@@ -311,6 +392,12 @@ impl Block {
             Gyro => all(Tex::GyroFace),
             Wheel => all(Tex::Tire),
             LandingGear => all(Tex::GearFace),
+            Conveyor => [Tex::ConveyorBelt, Tex::MachineSide, Tex::MachineSide],
+            PowerPole => [Tex::LogTop, Tex::OakLogSide, Tex::LogTop],
+            OilShale => all(Tex::OilShale),
+            CoalGenerator | ElectricFurnace | Miner | OilPump | Refinery | ArcFurnace
+            | Assembler | Accumulator => [Tex::MachineTop, Tex::MachineSide, Tex::MachineSide],
+            ChipFab => [Tex::CleanPanel, Tex::CleanPanel, Tex::CleanPanel],
         }
     }
 
@@ -319,9 +406,8 @@ impl Block {
         match self {
             Grass | SnowyGrass | Cactus => Material::Grass,
             Dirt => Material::Dirt,
-            OakLog | SpruceLog | OakPlanks | SprucePlanks | CraftingTable | Chest | Torch => {
-                Material::Wood
-            }
+            OakLog | SpruceLog | OakPlanks | SprucePlanks | CraftingTable | Chest | Torch
+            | PowerPole => Material::Wood,
             Sand | RedSand | IlmeniteSand | Regolith | Ash => Material::Sand,
             Gravel => Material::Gravel,
             Snow => Material::Snow,
@@ -337,6 +423,17 @@ impl Block {
         match self {
             Block::Furnace => [Tex::FurnaceTop, Tex::FurnaceFront, Tex::Cobblestone],
             Block::Chest => [Tex::ChestTop, Tex::ChestFront, Tex::ChestSide],
+            Block::Conveyor => [Tex::ConveyorBelt, Tex::ConveyorBelt, Tex::MachineSide],
+            Block::PowerPole => [Tex::LogTop, Tex::PoleIcon, Tex::OakLogSide],
+            Block::CoalGenerator => [Tex::MachineTop, Tex::GeneratorFront, Tex::MachineSide],
+            Block::ElectricFurnace => [Tex::MachineTop, Tex::ElectricFront, Tex::MachineSide],
+            Block::Miner => [Tex::MachineTop, Tex::MinerFront, Tex::MachineSide],
+            Block::OilPump => [Tex::MachineTop, Tex::PumpFront, Tex::MachineSide],
+            Block::Refinery => [Tex::MachineTop, Tex::RefineryFront, Tex::MachineSide],
+            Block::ArcFurnace => [Tex::MachineTop, Tex::ArcFront, Tex::MachineSide],
+            Block::Assembler => [Tex::MachineTop, Tex::AssemblerFront, Tex::MachineSide],
+            Block::ChipFab => [Tex::CleanPanel, Tex::FabFront, Tex::CleanPanel],
+            Block::Accumulator => [Tex::MachineTop, Tex::AccumulatorFront, Tex::MachineSide],
             _ => {
                 let [top, side, _] = self.textures();
                 [top, side, side]
@@ -377,6 +474,10 @@ mod tests {
         for (i, b) in Block::ALL.iter().enumerate() {
             assert_eq!(*b as usize, i);
         }
-        assert_eq!(*Block::ALL.last().unwrap(), Block::LandingGear);
+        assert_eq!(*Block::ALL.last().unwrap(), Block::Accumulator);
+        assert!(Block::Assembler.is_machine() && Block::Assembler.is_model());
+        assert!(!Block::OilShale.is_model() && !Block::OilShale.is_factory());
+        assert!(Block::Wheel.is_vehicle_part() && !Block::Hull.is_vehicle_part());
+        assert!(!Block::Conveyor.is_vehicle_part() && Block::Conveyor.is_model());
     }
 }

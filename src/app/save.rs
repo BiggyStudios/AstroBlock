@@ -7,6 +7,7 @@
 //! <data folder>/worlds/<folder>/home.edits    blocks changed at home (`WorldEdits::to_bytes`)
 //! <data folder>/worlds/<folder>/moon.edits    and on the moon
 //! <data folder>/worlds/<folder>/players.json  what those who joined this world had
+//! <data folder>/worlds/<folder>/backups/<unix time>[-crash]/   copies of the above (`write_backup`)
 //! ```
 //!
 //! The data folder is `%APPDATA%\AstroBlock` on Windows (`ASTRO_SAVE_DIR` overrides it).
@@ -263,6 +264,74 @@ pub fn write_files(dir: &Path, files: Vec<(String, Vec<u8>)>) -> Result<()> {
     Ok(())
 }
 
+/// A world's backups live in this folder inside it, one folder each (named by when, with
+/// `-crash` for what was saved as the game went down): the newest `KEEP_BACKUPS` regular ones
+/// and `KEEP_CRASHES` crash ones (so a game crashing again and again can't push out the rest).
+pub const BACKUPS: &str = "backups";
+pub const KEEP_BACKUPS: usize = 6;
+pub const KEEP_CRASHES: usize = 2;
+
+/// One of a world's backups.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Backup {
+    pub dir: PathBuf,
+    /// When it was written (Unix seconds).
+    pub time: u64,
+    /// Saved as the game crashed.
+    pub crash: bool,
+}
+
+/// Writes a backup of a world (the same files as its save), and forgets the oldest.
+pub fn write_backup(world: &Path, files: Vec<(String, Vec<u8>)>, crash: bool) -> Result<()> {
+    let name = format!("{}{}", unix_now(), if crash { "-crash" } else { "" });
+    write_files(&world.join(BACKUPS).join(name), files)?;
+    let all = backups(world);
+    let (crashes, regular): (Vec<_>, Vec<_>) = all.into_iter().partition(|b| b.crash);
+    let old = crashes
+        .into_iter()
+        .skip(KEEP_CRASHES)
+        .chain(regular.into_iter().skip(KEEP_BACKUPS));
+    for old in old {
+        fs::remove_dir_all(&old.dir)
+            .with_context(|| format!("removing the old backup {}", old.dir.display()))?;
+    }
+    Ok(())
+}
+
+/// A world's backups, newest first.
+pub fn backups(world: &Path) -> Vec<Backup> {
+    let Ok(entries) = fs::read_dir(world.join(BACKUPS)) else {
+        return Vec::new();
+    };
+    let mut found: Vec<Backup> = entries
+        .flatten()
+        .filter(|e| e.path().join("state.json").is_file())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let (time, crash) = match name.strip_suffix("-crash") {
+                Some(time) => (time, true),
+                None => (name.as_str(), false),
+            };
+            Some(Backup {
+                dir: e.path(),
+                time: time.parse().ok()?,
+                crash,
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| b.time.cmp(&a.time).then(b.crash.cmp(&a.crash)));
+    found
+}
+
+/// When a file was last written (Unix seconds; 0 if that can't be told).
+pub fn written_at(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs())
+}
+
 /// "2h 05m", "12m"
 pub fn format_played(seconds: f64) -> String {
     let minutes = (seconds / 60.0) as u64;
@@ -331,6 +400,33 @@ mod tests {
             .collect();
         assert_eq!(names, ["new", "old"]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn backups_are_kept_newest_first_crashes_apart() {
+        let world = scratch("backups");
+        let files = || vec![("state.json".to_string(), b"{}".to_vec())];
+        for t in 100..108 {
+            write_files(&world.join(BACKUPS).join(t.to_string()), files()).unwrap();
+        }
+        for t in [50, 60, 70] {
+            write_files(&world.join(BACKUPS).join(format!("{t}-crash")), files()).unwrap();
+        }
+        // (Not a backup: no save in it.)
+        fs::create_dir_all(world.join(BACKUPS).join("99")).unwrap();
+        write_backup(&world, files(), false).unwrap();
+
+        let kept = backups(&world);
+        let times: Vec<(u64, bool)> = kept.iter().map(|b| (b.time, b.crash)).collect();
+        let now = unix_now();
+        assert_eq!(times[0], (now, false), "{times:?}");
+        let regular: Vec<u64> = times.iter().filter(|t| !t.1).map(|t| t.0).collect();
+        assert_eq!(regular, vec![now, 107, 106, 105, 104, 103]);
+        let crashes: Vec<u64> = times.iter().filter(|t| t.1).map(|t| t.0).collect();
+        assert_eq!(crashes, vec![70, 60]);
+        assert!(!world.join(BACKUPS).join("100").exists());
+        assert!(!world.join(BACKUPS).join("50-crash").exists());
+        fs::remove_dir_all(world).unwrap();
     }
 
     #[test]

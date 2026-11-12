@@ -23,6 +23,7 @@ use crate::{
     app::input::Input,
     audio::Sound,
     effects::{self, Effects},
+    factory::{self, Factory, SavedFactory, Stores},
     mobs::{Mob, MobKind},
     net::protocol::{MobState, NetDrop, WorldEvent},
     player::{
@@ -35,7 +36,7 @@ use crate::{
     },
     ui::{
         Ui,
-        screen::{self, CHEST_SLOTS, Layout, Screen, ScreenAnim, SlotId, View},
+        screen::{self, CHEST_SLOTS, Catalog, Layout, Screen, ScreenAnim, SlotId, View},
     },
     util::FastMap,
     world::{
@@ -47,7 +48,7 @@ use crate::{
 use drops::Drop;
 use furnace::Furnace;
 use inventory::{HOTBAR, Inventory, SLOTS, Slot};
-use items::{ArmorPiece, Item, ItemStack, Tier, ToolKind};
+use items::{ArmorPiece, Category, Item, ItemStack, Tier, ToolKind};
 
 pub const MAX_HEALTH: f32 = 20.0;
 pub const MAX_FOOD: f32 = 20.0;
@@ -69,6 +70,8 @@ const MOB_DESPAWN: f64 = 128.0;
 /// Torch and lit furnace light levels.
 const TORCH_LIGHT: u8 = 14;
 const FURNACE_LIGHT: u8 = 13;
+/// A working electric furnace's glow.
+const MACHINE_LIGHT: u8 = 11;
 /// Meters walked per footstep sound.
 const STEP_LENGTH: f64 = 1.6;
 
@@ -134,6 +137,39 @@ pub struct Object {
     /// The sky light estimate at the model (costly to compute: terrain sampling).
     #[serde(skip)]
     sky: Option<u32>,
+    /// Where its cell's centre is (planet-relative; costly to work out every frame).
+    #[serde(skip)]
+    center: Option<DVec3>,
+    /// How far its mesh reaches from that centre.
+    #[serde(skip)]
+    radius: f32,
+    /// A machine's moving parts and how far along they are.
+    #[serde(skip)]
+    motion: Motion,
+}
+
+/// A moving part as drawn: its mesh, where it turns about and which way (planet-relative), one
+/// model unit up, its reach, and how it moves.
+#[derive(Clone, Copy)]
+struct Part {
+    mesh: MeshHandle,
+    pivot: DVec3,
+    axis: DVec3,
+    up: DVec3,
+    radius: f32,
+    motion: models::Motion,
+}
+
+/// A machine model's moving parts (`models::moving_parts`): their meshes, and how far its work
+/// has carried them.
+#[derive(Clone, Default)]
+struct Motion {
+    parts: Vec<Part>,
+    /// Seconds of work so far (as fast as it was going), and how fast it goes now (0..1, eased).
+    work: f64,
+    speed: f32,
+    /// Smoke or dust owed (a puff each when it reaches 1).
+    puffs: f32,
 }
 
 /// The parts of the world this module changes.
@@ -173,6 +209,7 @@ pub struct WorldState {
     drops: Vec<Drop>,
     mobs: Vec<Mob>,
     pending_lights: Vec<(BlockCell, u8)>,
+    factory: Factory,
 }
 
 /// One world's state in a saved game (maps as lists: JSON keys must be strings).
@@ -183,6 +220,8 @@ pub struct SavedWorldState {
     objects: Vec<(BlockCell, Object)>,
     drops: Vec<Drop>,
     mobs: Vec<Mob>,
+    #[serde(default)]
+    factory: SavedFactory,
 }
 
 impl SavedWorldState {
@@ -192,6 +231,7 @@ impl SavedWorldState {
         objects: &FastMap<BlockCell, Object>,
         drops: &[Drop],
         mobs: &[Mob],
+        factory: &Factory,
     ) -> Self {
         Self {
             furnaces: furnaces.iter().map(|(c, f)| (*c, *f)).collect(),
@@ -204,6 +244,7 @@ impl SavedWorldState {
                 .filter(|m| m.remote.is_none())
                 .cloned()
                 .collect(),
+            factory: factory.saved(),
         }
     }
 
@@ -213,7 +254,12 @@ impl SavedWorldState {
             .iter()
             .filter_map(|(cell, object)| match object.block {
                 Block::Torch => Some((*cell, TORCH_LIGHT)),
-                Block::Furnace if object.state.lit => Some((*cell, FURNACE_LIGHT)),
+                Block::Furnace | Block::CoalGenerator if object.state.lit => {
+                    Some((*cell, FURNACE_LIGHT))
+                }
+                Block::ElectricFurnace | Block::ArcFurnace if object.state.lit => {
+                    Some((*cell, MACHINE_LIGHT))
+                }
                 _ => None,
             })
             .collect()
@@ -238,6 +284,7 @@ impl SavedWorldState {
             drops: self.drops,
             mobs: self.mobs,
             pending_lights,
+            factory: Factory::restored(self.factory),
         }
     }
 }
@@ -254,11 +301,63 @@ impl WorldState {
             &self.objects,
             &self.drops,
             &self.mobs,
+            &self.factory,
         )
     }
 
     pub fn restored(saved: SavedWorldState) -> Self {
         saved.into_state()
+    }
+
+    /// The world nobody is on goes on too: furnaces burn and factories run (`authority`:
+    /// moving what conveyors carry in and out of containers, see `factory`).
+    pub fn run(&mut self, planet: &Planet, dt: f64, net: NetSide) {
+        let mut lit = Vec::new();
+        for (cell, furnace) in &mut self.furnaces {
+            let was = furnace.lit();
+            furnace.update(dt as f32);
+            if furnace.lit() != was {
+                lit.push((*cell, furnace.lit()));
+            }
+        }
+        self.factory.authority = net != NetSide::Client;
+        self.factory.locate(planet);
+        let mut stores = Stores {
+            chests: &mut self.chests,
+            furnaces: &mut self.furnaces,
+        };
+        self.factory.run(dt, &mut stores);
+        lit.append(&mut self.factory.lit_changed);
+        // (Its lights go up when someone is there to see them.)
+        for (cell, on) in lit {
+            if let Some(object) = self.objects.get_mut(&cell) {
+                object.state.lit = on;
+                if gives_light(object.block) {
+                    self.pending_lights.retain(|(c, _)| *c != cell);
+                    self.pending_lights
+                        .push((cell, machine_light(object.block, on)));
+                }
+            }
+        }
+        bend_conveyors(&mut self.factory, &mut self.objects);
+        if net == NetSide::Offline {
+            self.factory.changed.clear();
+        }
+    }
+
+    pub fn factory_news(&mut self) -> Vec<WorldEvent> {
+        news(&mut self.factory, &self.chests, &self.furnaces)
+    }
+
+    pub fn factory(&self) -> &Factory {
+        &self.factory
+    }
+
+    /// What the host says rides this world's conveyors.
+    pub fn apply_belts(&mut self, groups: &[factory::NetBelts]) {
+        for group in groups {
+            self.factory.apply_belts(group);
+        }
     }
 }
 
@@ -318,7 +417,10 @@ pub struct Survival {
     /// creative breaks) and uses (placing, opening, putting on). Mining shows as `mining`.
     pub swings: u32,
     pub uses: u32,
+    /// The creative catalog: the open tab, its items, and how many rows it is scrolled down.
     pub catalog: Vec<Item>,
+    pub catalog_tab: Category,
+    pub catalog_scroll: usize,
     /// Sounds to play (sound, planet-relative position), drained by the app.
     pub sounds: Vec<(Sound, DVec3)>,
     /// Particle effects to spawn (planet-relative), drained by the app.
@@ -334,6 +436,8 @@ pub struct Survival {
     spawn_timer: f32,
     /// Meshes to free (removed models, drops and mobs).
     garbage: Vec<MeshHandle>,
+    /// Real seconds of play (what machines' lights blink and flicker by).
+    clock: f64,
     rng: u64,
     /// This player's part in a multiplayer game, its number, and what to tell the others.
     pub net: NetSide,
@@ -342,6 +446,13 @@ pub struct Survival {
     pub outbox: Vec<Outgoing>,
     /// The open chest or furnace as last seen (to notice changes).
     watched: Option<(BlockCell, Vec<Slot>)>,
+    /// The player clicked in a screen since the last look at `watched` (only that is theirs
+    /// to tell: the rest is furnaces and conveyors, which everyone works out).
+    clicked: bool,
+    /// Conveyors and machines on this world.
+    pub factory: Factory,
+    /// A cable being run: the pole or machine it starts from.
+    pub cable_from: Option<BlockCell>,
 }
 
 impl Default for Survival {
@@ -373,7 +484,9 @@ impl Default for Survival {
             dead: false,
             swings: 0,
             uses: 0,
-            catalog: Item::all(),
+            catalog: Category::default().items(),
+            catalog_tab: Category::default(),
+            catalog_scroll: 0,
             sounds: Vec::new(),
             effects: Effects::default(),
             lights: Vec::new(),
@@ -383,12 +496,16 @@ impl Default for Survival {
             walked: 0.0,
             spawn_timer: 1.0,
             garbage: Vec::new(),
+            clock: 0.0,
             rng: 0x2545_f491_4f6c_dd1d,
             net: NetSide::Offline,
             me: 0,
             next_id: 0,
             outbox: Vec::new(),
             watched: None,
+            clicked: false,
+            factory: Factory::default(),
+            cable_from: None,
         }
     }
 }
@@ -417,6 +534,7 @@ impl Survival {
                 &self.objects,
                 &self.drops,
                 &self.mobs,
+                &self.factory,
             ),
         }
     }
@@ -430,6 +548,8 @@ impl Survival {
         self.drops = state.drops;
         self.mobs = state.mobs;
         self.pending_lights = state.pending_lights;
+        self.factory = state.factory;
+        self.cable_from = None;
         self.restore_player(saved, feet);
     }
 
@@ -502,7 +622,7 @@ impl Survival {
         self.mobs = mobs;
     }
 
-    fn tell(&mut self, event: WorldEvent) {
+    pub fn tell(&mut self, event: WorldEvent) {
         if self.net != NetSide::Offline {
             self.outbox.push(Outgoing::World(event));
         }
@@ -534,6 +654,7 @@ impl Survival {
         std::mem::swap(&mut self.drops, &mut other.drops);
         std::mem::swap(&mut self.mobs, &mut other.mobs);
         std::mem::swap(&mut self.pending_lights, &mut other.pending_lights);
+        std::mem::swap(&mut self.factory, &mut other.factory);
     }
 
     /// Another player did something to this world. `here`: it is the world around us (so it
@@ -565,6 +686,27 @@ impl Survival {
                     }
                 }
             }
+            WorldEvent::Machine { cell, machine } => {
+                self.factory.set_machine(machine);
+                if self.watched.as_ref().is_some_and(|(c, _)| c == cell) {
+                    self.watched = Some((*cell, machine_slots(machine)));
+                }
+            }
+            WorldEvent::Cable { a, b, on } => {
+                if *on {
+                    self.factory.connect(*a, *b);
+                } else {
+                    self.factory.disconnect(*a, *b);
+                }
+            }
+            WorldEvent::Turned { cell, facing } => {
+                if let Some(object) = self.objects.get_mut(cell)
+                    && object.block == Block::Conveyor
+                {
+                    object.state.facing = *facing % 4;
+                    self.factory.turn(world.planet, *cell, *facing);
+                }
+            }
             WorldEvent::DropNew(drop) => {
                 if !self.drops.iter().any(|d| d.id == drop.id) {
                     let mut new =
@@ -592,17 +734,24 @@ impl Survival {
         }
         if let Some(object) = self.objects.remove(&cell) {
             self.garbage.extend(object.mesh);
-            if matches!(object.block, Block::Torch | Block::Furnace) {
+            self.garbage
+                .extend(object.motion.parts.iter().map(|p| p.mesh));
+            if gives_light(object.block) {
                 world.streamer.set_light(cell, 0);
             }
         }
         self.pending_lights.retain(|(c, _)| *c != cell);
-        if matches!(self.screen, Some(Screen::Crafting(c) | Screen::Furnace(c) | Screen::Chest(c)) if c == cell)
-        {
+        if self.screen.and_then(Screen::cell) == Some(cell) {
             self.screen = None;
         }
-        self.furnaces.remove(&cell);
-        self.chests.remove(&cell);
+        if self.cable_from == Some(cell) {
+            self.cable_from = None;
+        }
+        // (Whoever broke it spills what it held.)
+        self.factory.remove(cell);
+        if self.furnaces.remove(&cell).is_some() || self.chests.remove(&cell).is_some() {
+            self.factory.touch();
+        }
     }
 
     fn remote_placed(
@@ -632,17 +781,23 @@ impl Survival {
                 mesh: None,
                 built: None,
                 sky: None,
+                center: None,
+                radius: 1.6,
+                motion: Motion::default(),
             },
         );
         match block {
             Block::Furnace => {
                 self.furnaces.insert(cell, Furnace::default());
+                self.factory.touch();
             }
             Block::Chest => {
                 self.chests.insert(cell, [None; CHEST_SLOTS]);
+                self.factory.touch();
             }
             // (Waits for the chunks around it, which may not be loaded here.)
             Block::Torch => self.pending_lights.push((cell, TORCH_LIGHT)),
+            b if b.is_factory() => self.factory.add(world.planet, cell, b, state.facing),
             _ => {}
         }
     }
@@ -742,21 +897,31 @@ impl Survival {
             Some(Screen::Furnace(cell)) => {
                 self.furnaces.get(&cell).map(|f| (cell, furnace_slots(f)))
             }
+            Some(Screen::Machine(cell, _)) => {
+                self.factory.machine(cell).map(|m| (cell, machine_slots(m)))
+            }
             _ => None,
         };
+        let clicked = std::mem::take(&mut self.clicked);
         let Some((cell, slots)) = open else {
             self.watched = None;
             return;
         };
-        let changed = self
-            .watched
-            .as_ref()
-            .is_some_and(|(c, old)| *c == cell && *old != slots);
+        let changed = clicked
+            && self
+                .watched
+                .as_ref()
+                .is_some_and(|(c, old)| *c == cell && *old != slots);
         if changed {
             match self.screen {
                 Some(Screen::Furnace(_)) => {
                     if let Some(furnace) = self.furnaces.get(&cell).copied() {
                         self.tell(WorldEvent::Furnace { cell, furnace });
+                    }
+                }
+                Some(Screen::Machine(..)) => {
+                    if let Some(machine) = self.factory.machine(cell).copied() {
+                        self.tell(WorldEvent::Machine { cell, machine });
                     }
                 }
                 _ => self.tell(WorldEvent::Chest {
@@ -795,10 +960,8 @@ impl Survival {
         self.swap_contents(other);
         self.mining = None;
         self.target_name = None;
-        if matches!(
-            self.screen,
-            Some(Screen::Furnace(_) | Screen::Chest(_) | Screen::Crafting(_))
-        ) {
+        self.cable_from = None;
+        if self.screen.and_then(Screen::cell).is_some() {
             self.screen = None;
         }
     }
@@ -911,20 +1074,32 @@ impl Survival {
         self.effects.push(effects::block_break(block, center, up));
         if let Some(object) = self.objects.remove(&cell) {
             self.garbage.extend(object.mesh);
-            if matches!(object.block, Block::Torch | Block::Furnace) {
+            self.garbage
+                .extend(object.motion.parts.iter().map(|p| p.mesh));
+            if gives_light(object.block) {
                 world.streamer.set_light(cell, 0);
             }
         }
-        if matches!(self.screen, Some(Screen::Crafting(c) | Screen::Furnace(c) | Screen::Chest(c)) if c == cell)
-        {
+        if self.screen.and_then(Screen::cell) == Some(cell) {
             self.screen = None;
+        }
+        if self.cable_from == Some(cell) {
+            self.cable_from = None;
         }
         let mut loot: Vec<ItemStack> = Vec::new();
         if let Some(furnace) = self.furnaces.remove(&cell) {
             loot.extend(furnace.contents());
+            self.factory.touch();
         }
         if let Some(chest) = self.chests.remove(&cell) {
             loot.extend(chest.into_iter().flatten());
+            self.factory.touch();
+        }
+        if let Some(removed) = self.factory.remove(cell) {
+            loot.extend(removed.contents);
+            if removed.cables > 0 && !creative {
+                loot.push(ItemStack::new(Item::Cable, removed.cables.min(64) as u8));
+            }
         }
         if !creative {
             let roll = self.random() as f32;
@@ -958,9 +1133,32 @@ impl Survival {
             return false; // they go on vehicles: `Game::craft_clicks`
         }
         let planet = world.planet;
+        // A miner's rig stands five blocks tall: it needs the cells over it open, and nothing
+        // goes inside it.
+        let column = |dk: i32| planet.cell(cell.face, cell.u, cell.v, cell.k + dk);
+        if block == Block::Miner
+            && (1..models::MINER_HEIGHT).any(|dk| {
+                column(dk).is_none_or(|c| world.streamer.block(c).is_some_and(|b| b.is_solid()))
+            })
+        {
+            return false;
+        }
+        if (1..models::MINER_HEIGHT).any(|dk| {
+            column(-dk)
+                .and_then(|c| self.objects.get(&c))
+                .is_some_and(|o| o.block == Block::Miner)
+        }) {
+            return false;
+        }
         let center = interact::cell_center(planet, cell);
+        // Fronts face whoever placed them; a conveyor runs the way they look.
+        let towards = if block == Block::Conveyor {
+            pose.look
+        } else {
+            pose.feet - center
+        };
         let mut state = ModelState {
-            facing: models::facing_towards(planet, cell, pose.feet - center),
+            facing: models::facing_towards(planet, cell, towards),
             ..Default::default()
         };
         if block == Block::Torch {
@@ -977,42 +1175,73 @@ impl Survival {
                 state.wall = true;
             }
         }
-        world.streamer.set_block(cell, block);
-        self.tell(WorldEvent::Placed {
-            cell,
-            block,
-            state,
-            support: (block == Block::Torch).then_some(support),
-        });
+        let support = (block == Block::Torch).then_some(support);
+        self.put(world, cell, block, state, support);
         self.sound(Sound::Place(block.material()), center);
         if !block.is_model() {
             let up = center.normalize_or(DVec3::Y);
             self.effects.push(effects::block_place(block, center, up));
         }
+        true
+    }
+
+    /// Puts a block or model into `cell` as it is (`state`: the model's), and tells the others.
+    pub fn put(
+        &mut self,
+        world: &mut World,
+        cell: BlockCell,
+        block: Block,
+        state: ModelState,
+        support: Option<BlockCell>,
+    ) {
+        let planet = world.planet;
+        world.streamer.set_block(cell, block);
+        self.tell(WorldEvent::Placed {
+            cell,
+            block,
+            state,
+            support,
+        });
         if block.is_model() {
             self.objects.insert(
                 cell,
                 Object {
                     block,
                     state,
-                    support: (block == Block::Torch).then_some(support),
+                    support,
                     mesh: None,
                     built: None,
                     sky: None,
+                    center: None,
+                    radius: 1.6,
+                    motion: Motion::default(),
                 },
             );
             match block {
                 Block::Furnace => {
                     self.furnaces.insert(cell, Furnace::default());
+                    self.factory.touch();
                 }
                 Block::Chest => {
                     self.chests.insert(cell, [None; CHEST_SLOTS]);
+                    self.factory.touch();
                 }
                 Block::Torch => world.streamer.set_light(cell, TORCH_LIGHT),
+                b if b.is_factory() => {
+                    self.factory.add(planet, cell, b, state.facing);
+                    if matches!(b, Block::Miner | Block::OilPump) {
+                        // What it brings up depends on what is under it (the others may not
+                        // have it loaded: they are told).
+                        let resource = resource_under(world, cell, b);
+                        self.factory.set_resource(cell, resource);
+                        if let Some(machine) = self.factory.machine(cell).copied() {
+                            self.tell(WorldEvent::Machine { cell, machine });
+                        }
+                    }
+                }
                 _ => {}
             }
         }
-        true
     }
 
     /// The nearest animal on the line of sight within `reach`, if it's closer than the
@@ -1045,7 +1274,11 @@ impl Survival {
         self.target_name = match (person, mob, target) {
             (Some(p), _, _) => Some(p.name.clone()),
             (None, Some(i), _) => Some(self.mobs[i].kind.name().to_string()),
-            (None, None, Some(hit)) => Some(hit.block.name()),
+            // A factory part says what it is doing.
+            (None, None, Some(hit)) => Some(match self.factory.describe(hit.cell) {
+                Some(doing) if hit.block.is_factory() => format!("{}  {doing}", hit.block.name()),
+                _ => hit.block.name(),
+            }),
             _ => None,
         };
         person.map(|_| Aimed::Person).or(mob.map(Aimed::Mob))
@@ -1178,25 +1411,42 @@ impl Survival {
             self.uses += 1;
             return message;
         }
+        // Cables run from pole to pole (and machines), one click at each end.
+        let cable = held.is_some_and(|s| s.item == Item::Cable);
+        if !cable {
+            self.cable_from = None;
+        }
+        if cable
+            && input.button_pressed(MouseButton::Right)
+            && let Some(hit) = target.filter(|h| h.block.is_electric())
+        {
+            self.uses += 1;
+            return Some(self.run_cable(world, hit.cell, creative));
+        }
         if right && let Some(hit) = target {
             let sneaking = input.held(KeyCode::ShiftLeft);
             let usable = matches!(
                 hit.block,
-                Block::CraftingTable | Block::Furnace | Block::Chest
-            );
+                Block::CraftingTable | Block::Furnace | Block::Chest | Block::PowerPole
+            ) || hit.block.is_machine();
             if usable && !sneaking {
                 if input.button_pressed(MouseButton::Right) {
                     let screen = match hit.block {
                         Block::Furnace => Screen::Furnace(hit.cell),
                         Block::Chest => Screen::Chest(hit.cell),
-                        _ => Screen::Crafting(hit.cell),
+                        // Poles and accumulators show the network they are on.
+                        Block::PowerPole | Block::Accumulator => Screen::Power(hit.cell),
+                        b => match factory::MachineKind::of(b) {
+                            Some(kind) => Screen::Machine(hit.cell, kind),
+                            None => Screen::Crafting(hit.cell),
+                        },
                     };
                     self.open(screen);
                     self.uses += 1;
                 }
             } else if let (Some(cell), Some(stack)) = (hit.before, held)
                 && let Some(block) = stack.item.block()
-                && (block == Block::Torch || !overlaps_player(world.planet, cell, pose.feet))
+                && (!block.collides() || !overlaps_player(world.planet, cell, pose.feet))
             {
                 if self.place(world, cell, block, hit.cell, pose) {
                     self.uses += 1;
@@ -1215,6 +1465,84 @@ impl Survival {
             self.pick_block(Item::Block(hit.block), creative);
         }
         message
+    }
+
+    /// A click with a cable on a pole or machine: starts a cable there, runs one to it from
+    /// where the last started (and carries on from it), or takes one down that was already
+    /// there. Says what happened.
+    fn run_cable(&mut self, world: &World, cell: BlockCell, creative: bool) -> String {
+        let Some(from) = self.cable_from.take() else {
+            self.cable_from = Some(cell);
+            return "Cable from here: right click another pole or machine".to_string();
+        };
+        if from == cell {
+            return "Cable put away".to_string();
+        }
+        let center = interact::cell_center(world.planet, cell);
+        if self.factory.connected(from, cell) {
+            self.factory.disconnect(from, cell);
+            self.tell(WorldEvent::Cable {
+                a: from,
+                b: cell,
+                on: false,
+            });
+            if !creative && let Some(rest) = self.inventory.add(ItemStack::one(Item::Cable)) {
+                self.spawn(rest, center, DVec3::ZERO, 0.5);
+            }
+            return "Cable taken down".to_string();
+        }
+        let length = (self.factory.attach_point(world.planet, from)
+            - self.factory.attach_point(world.planet, cell))
+        .length();
+        if length > factory::CABLE_REACH {
+            self.cable_from = Some(from);
+            return format!(
+                "Too far for one cable: {length:.0} m (at most {:.0})",
+                factory::CABLE_REACH
+            );
+        }
+        if !self.factory.connect(from, cell) {
+            return "A cable can't go there".to_string();
+        }
+        self.tell(WorldEvent::Cable {
+            a: from,
+            b: cell,
+            on: true,
+        });
+        self.sound(Sound::Place(Block::Wheel.material()), center);
+        if !creative {
+            self.inventory.take_one(self.selected);
+        }
+        // On from here, the way a line of poles is wired.
+        self.cable_from = Some(cell);
+        format!("Connected ({length:.0} m): carry on, or right click this one again to stop")
+    }
+
+    /// Runs a cable between two poles or machines (and tells the others).
+    pub fn wire(&mut self, a: BlockCell, b: BlockCell) -> bool {
+        let done = self.factory.connect(a, b);
+        if done {
+            self.tell(WorldEvent::Cable { a, b, on: true });
+        }
+        done
+    }
+
+    /// Turns a conveyor a quarter (R). False if `cell` isn't one.
+    pub fn turn_conveyor(&mut self, world: &mut World, cell: BlockCell) -> bool {
+        let Some(object) = self.objects.get_mut(&cell) else {
+            return false;
+        };
+        if object.block != Block::Conveyor {
+            return false;
+        }
+        let facing = (object.state.facing + 1) % 4;
+        object.state.facing = facing;
+        self.factory.turn(world.planet, cell, facing);
+        self.tell(WorldEvent::Turned { cell, facing });
+        let center = interact::cell_center(world.planet, cell);
+        self.sound(Sound::Place(Block::Conveyor.material()), center);
+        self.uses += 1;
+        true
     }
 
     fn eat(&mut self, stack: ItemStack, pose: &Pose, dt: f32) {
@@ -1349,6 +1677,35 @@ impl Survival {
         }
     }
 
+    /// Conveyors and machines run for `dt` game seconds (also what a jump in time skips over).
+    pub fn run_factory(&mut self, planet: &Planet, dt: f64) {
+        self.factory.authority = self.net != NetSide::Client;
+        self.factory.locate(planet);
+        let mut stores = Stores {
+            chests: &mut self.chests,
+            furnaces: &mut self.furnaces,
+        };
+        self.factory.run(dt, &mut stores);
+        for (cell, lit) in std::mem::take(&mut self.factory.lit_changed) {
+            if let Some(object) = self.objects.get_mut(&cell) {
+                object.state.lit = lit;
+                if gives_light(object.block) {
+                    self.lights.push((cell, machine_light(object.block, lit)));
+                }
+            }
+        }
+        bend_conveyors(&mut self.factory, &mut self.objects);
+        if self.net == NetSide::Offline {
+            self.factory.changed.clear();
+        }
+    }
+
+    /// (The host.) The containers conveyors have changed since last asked, as news for the
+    /// others.
+    pub fn factory_news(&mut self) -> Vec<WorldEvent> {
+        news(&mut self.factory, &self.chests, &self.furnaces)
+    }
+
     /// Drops fall and get picked up, animals roam, furnaces burn, hunger and health tick.
     /// `dt` is game time.
     pub fn update(
@@ -1435,6 +1792,7 @@ impl Survival {
         }
 
         self.run_furnaces(dt);
+        self.run_factory(planet, dt);
         if self.net != NetSide::Offline {
             self.watch_container();
         }
@@ -1445,8 +1803,7 @@ impl Survival {
         }
 
         // Walked away from an open crafting table / furnace / chest.
-        if let Some(Screen::Crafting(cell) | Screen::Furnace(cell) | Screen::Chest(cell)) =
-            self.screen
+        if let Some(cell) = self.screen.and_then(Screen::cell)
             && (interact::cell_center(planet, cell) - pose.feet).length() > SCREEN_REACH
         {
             self.close(pose);
@@ -1606,7 +1963,8 @@ impl Survival {
     // ---- Meshes ------------------------------------------------------------------------
 
     /// Uploads meshes for new or changed models, drops and (every frame, they animate) mobs,
-    /// frees removed ones, and lists what to draw.
+    /// frees removed ones, and lists what to draw. Machines' moving parts move on by `dt` (real
+    /// seconds; 0 while the game is paused).
     pub fn draw_items(
         &mut self,
         planet: &Planet,
@@ -1614,10 +1972,12 @@ impl Survival {
         streamer: &WorldStreamer,
         renderer: &mut Renderer,
         camera: DVec3,
+        dt: f32,
     ) -> Result<Vec<DrawItem>> {
         for mesh in self.garbage.drain(..) {
             renderer.destroy_mesh(mesh);
         }
+        self.clock += dt as f64;
         let near = |p: DVec3| (planet.center + p - camera).length() < DRAW_DISTANCE;
         let light_at_block = |p: DVec3| Light {
             sky: 0,
@@ -1633,26 +1993,68 @@ impl Survival {
             _ => None,
         };
         for (&cell, object) in &mut self.objects {
-            let center = interact::cell_center(planet, cell);
+            let center = *object
+                .center
+                .get_or_insert_with(|| interact::cell_center(planet, cell));
             if !near(center) {
                 continue;
             }
             object.state.open = open_chest == Some(cell);
+            let machine = self.factory.machine(cell);
+            if object.block == Block::Accumulator
+                && let Some(m) = machine
+            {
+                let full = m.energy / m.energy_total.max(1.0);
+                object.state.level = (full * models::LEVELS as f32).round() as u8;
+            }
             // Block light can change any time (torches nearby); the sky estimate is fixed.
-            let block = planet.cell_at(center).map_or(0, |c| streamer.light(c)) as u32;
+            let block = streamer.light(cell) as u32;
             let built = (object.state, block);
             if object.built != Some(built) {
                 let sky = *object
                     .sky
-                    .get_or_insert_with(|| sky_light(planet, terrain, planet.cell_at(center)));
+                    .get_or_insert_with(|| sky_light(planet, terrain, Some(cell)));
                 let light = Light { sky, block };
-                let (mesh, _, _) =
+                let (mesh, _, radius) =
                     models::block_model(planet, cell, object.block, object.state, light);
-                if let Some(handle) = renderer.create_mesh(&mesh)? {
+                // The moving parts first: all of it, or (out of uploads) all again next frame.
+                let mut parts = Vec::new();
+                let mut complete = true;
+                for part in models::moving_parts(object.block) {
+                    let made = models::part_model(planet, cell, object.state.facing, &part, light);
+                    match renderer.create_mesh(&made.mesh)? {
+                        Some(mesh) => parts.push(Part {
+                            mesh,
+                            pivot: made.pivot,
+                            axis: made.axis,
+                            up: made.up,
+                            radius: made.radius,
+                            motion: part.motion,
+                        }),
+                        None => {
+                            complete = false;
+                            break;
+                        }
+                    }
+                }
+                let handle = if complete {
+                    renderer.create_mesh(&mesh)?
+                } else {
+                    None
+                };
+                if let Some(handle) = handle {
                     if let Some(old) = object.mesh.replace(handle) {
                         renderer.destroy_mesh(old);
                     }
+                    for old in std::mem::replace(&mut object.motion.parts, parts) {
+                        renderer.destroy_mesh(old.mesh);
+                    }
+                    object.radius = radius;
                     object.built = Some(built);
+                } else {
+                    for part in parts {
+                        renderer.destroy_mesh(part.mesh);
+                    }
                 }
             }
             if let Some(mesh) = object.mesh {
@@ -1660,11 +2062,26 @@ impl Survival {
                     rotation: glam::Quat::IDENTITY,
                     mesh,
                     origin: planet.center + center,
-                    radius: 1.6,
+                    radius: object.radius,
                     fade: Fade::Visible,
                 });
             }
+            if object.block.is_machine() {
+                let working = machine.is_some_and(|m| m.lit());
+                animate(
+                    planet,
+                    cell,
+                    object,
+                    working,
+                    dt,
+                    self.clock,
+                    &mut draws,
+                    &mut self.effects,
+                );
+            }
         }
+        self.factory
+            .draw_items(planet, terrain, streamer, renderer, camera, &mut draws)?;
         for drop in &mut self.drops {
             if !near(drop.position) {
                 continue;
@@ -1746,7 +2163,22 @@ impl Survival {
     }
 
     fn layout(&self, screen: Screen, ui: (f32, f32, f32)) -> Layout {
-        Layout::new(screen, ui.0, ui.1, ui.2, self.catalog.len())
+        let catalog = Catalog {
+            tab: self.catalog_tab,
+            len: self.catalog.len(),
+            scroll: self.catalog_scroll,
+        };
+        let recipe = self.open_machine().and_then(|m| m.recipe);
+        Layout::new(screen, ui.0, ui.1, ui.2, catalog, recipe)
+    }
+
+    /// Opens a tab of the creative catalog, scrolled to the top.
+    pub fn show_category(&mut self, tab: Category) {
+        if tab != self.catalog_tab {
+            self.catalog_tab = tab;
+            self.catalog = tab.items();
+            self.catalog_scroll = 0;
+        }
     }
 
     /// The contents of a slot of the open screen.
@@ -1771,17 +2203,27 @@ impl Survival {
                 crafting::craft(&items, width)
             }
             SlotId::FurnaceIn | SlotId::FurnaceFuel | SlotId::FurnaceOut => {
-                let furnace = self.open_furnace()?;
+                let (input, fuel, output) = match (self.open_furnace(), self.open_machine()) {
+                    (Some(f), _) => (f.input, f.fuel, f.output),
+                    (None, Some(m)) => (m.input, m.fuel, m.output),
+                    _ => return None,
+                };
                 match id {
-                    SlotId::FurnaceIn => furnace.input,
-                    SlotId::FurnaceFuel => furnace.fuel,
-                    _ => furnace.output,
+                    SlotId::FurnaceIn => input,
+                    SlotId::FurnaceFuel => fuel,
+                    _ => output,
                 }
             }
             SlotId::Catalog(i) => self
                 .catalog
                 .get(i)
                 .map(|&item| ItemStack::new(item, item.max_stack())),
+            SlotId::MachineIn(i) => self.open_machine()?.inputs().get(i).copied().flatten(),
+            SlotId::Recipe(i) => {
+                let kind = self.open_machine()?.kind;
+                let r = factory::recipes::for_machine(kind).nth(i)?;
+                Some(ItemStack::new(r.output, r.count))
+            }
         }
     }
 
@@ -1790,6 +2232,46 @@ impl Survival {
             Screen::Furnace(cell) => self.furnaces.get(&cell),
             _ => None,
         }
+    }
+
+    /// The machine whose screen is open.
+    fn open_machine(&self) -> Option<&factory::Machine> {
+        match self.screen? {
+            Screen::Machine(cell, _) => self.factory.machine(cell),
+            _ => None,
+        }
+    }
+
+    /// The power network of the open power screen.
+    fn open_power(&self) -> Option<factory::PowerView> {
+        match self.screen? {
+            Screen::Power(cell) => self.factory.power_view(cell),
+            _ => None,
+        }
+    }
+
+    /// Clicked one of what the open recipe machine can make: it makes that now. What was in
+    /// its input slots for the old recipe comes back to the player.
+    fn pick_recipe(&mut self, i: usize, pose: &Pose) {
+        let Some(Screen::Machine(cell, kind)) = self.screen else {
+            return;
+        };
+        let Some(r) = factory::recipes::for_machine(kind).nth(i) else {
+            return;
+        };
+        let Some(m) = self.factory.machine_mut(cell) else {
+            return;
+        };
+        if m.recipe == Some(r.output) {
+            return;
+        }
+        let back = m.set_recipe(Some(r.output));
+        for stack in back {
+            if let Some(rest) = self.inventory.add(stack) {
+                self.throw(rest, pose);
+            }
+        }
+        self.sound(Sound::Equip, pose.eye);
     }
 
     /// The storage behind a slot (not the crafting result or catalog, which are computed).
@@ -1804,22 +2286,36 @@ impl Survival {
                 _ => None,
             },
             SlotId::FurnaceIn | SlotId::FurnaceFuel | SlotId::FurnaceOut => {
-                let Screen::Furnace(cell) = screen else {
-                    return None;
+                let (input, fuel, output) = match screen {
+                    Screen::Furnace(cell) => {
+                        let f = self.furnaces.get_mut(&cell)?;
+                        (&mut f.input, &mut f.fuel, &mut f.output)
+                    }
+                    Screen::Machine(cell, _) => {
+                        let m = self.factory.machine_mut(cell)?;
+                        (&mut m.input, &mut m.fuel, &mut m.output)
+                    }
+                    _ => return None,
                 };
-                let furnace = self.furnaces.get_mut(&cell)?;
                 Some(match id {
-                    SlotId::FurnaceIn => &mut furnace.input,
-                    SlotId::FurnaceFuel => &mut furnace.fuel,
-                    _ => &mut furnace.output,
+                    SlotId::FurnaceIn => input,
+                    SlotId::FurnaceFuel => fuel,
+                    _ => output,
                 })
             }
-            SlotId::Output | SlotId::Catalog(_) => None,
+            SlotId::MachineIn(i) => match screen {
+                Screen::Machine(cell, _) => {
+                    let m = self.factory.machine_mut(cell)?;
+                    m.inputs_mut().into_iter().nth(i)
+                }
+                _ => None,
+            },
+            SlotId::Output | SlotId::Catalog(_) | SlotId::Recipe(_) => None,
         }
     }
 
     /// Whether `stack` may go into slot `id` (fuel slots take fuel, armor slots their piece,
-    /// results take nothing).
+    /// a machine's ingredient slots what its recipe takes there, results take nothing).
     fn accepts(&self, id: SlotId, stack: &ItemStack) -> bool {
         match id {
             SlotId::FurnaceFuel => stack.item.fuel().is_some(),
@@ -1827,7 +2323,10 @@ impl Survival {
                 .item
                 .armor()
                 .is_some_and(|(p, _)| p == ArmorPiece::ALL[i]),
-            SlotId::Output | SlotId::FurnaceOut | SlotId::Catalog(_) => false,
+            SlotId::MachineIn(i) => self
+                .open_machine()
+                .is_some_and(|m| m.input_takes(i, stack.item)),
+            SlotId::Output | SlotId::FurnaceOut | SlotId::Catalog(_) | SlotId::Recipe(_) => false,
             _ => true,
         }
     }
@@ -1851,6 +2350,16 @@ impl Survival {
         let layout = self.layout(screen, ui);
         let hovered = layout.slot_at(mouse.0, mouse.1);
         let shift = input.held(KeyCode::ShiftLeft) || input.held(KeyCode::ShiftRight);
+        // (Whatever changes in the open container now is the player's doing.)
+        if [MouseButton::Left, MouseButton::Right, MouseButton::Middle]
+            .iter()
+            .any(|&b| input.button_pressed(b))
+            || self.drag.is_some()
+            || input.pressed(KeyCode::KeyQ)
+            || DIGITS.iter().any(|&k| input.pressed(k))
+        {
+            self.clicked = true;
+        }
 
         // A drag in progress: spread over the slots it crosses, finish when released.
         if let Some(drag) = &self.drag {
@@ -1878,11 +2387,32 @@ impl Survival {
             return false;
         }
 
+        // The catalog's tabs (a click on one keeps the held stack), and the wheel scrolls it.
+        if screen == Screen::Creative {
+            if input.button_pressed(MouseButton::Left)
+                && let Some(tab) = layout.tab_at(mouse.0, mouse.1)
+            {
+                self.show_category(tab);
+                return false;
+            }
+            if input.scroll != 0.0 {
+                let most = screen::catalog_scroll_limit(self.catalog.len());
+                let by = -(input.scroll.signum() as isize);
+                self.catalog_scroll = self.catalog_scroll.saturating_add_signed(by).min(most);
+            }
+        }
+
         for (button, right) in [(MouseButton::Left, false), (MouseButton::Right, true)] {
             if !input.button_pressed(button) {
                 continue;
             }
             match hovered {
+                // A recipe machine's list: pick what it makes (the held stack stays held).
+                Some(SlotId::Recipe(i)) => {
+                    if !right {
+                        self.pick_recipe(i, pose);
+                    }
+                }
                 Some(id) => {
                     // Double click: gather that item onto the cursor.
                     let double = !right
@@ -2082,14 +2612,12 @@ impl Survival {
                     None => self.move_within_inventory(i, stack),
                 }
             }
-            (SlotId::Inv(i), Some(Screen::Furnace(_)))
-                if stack.item.smelted().is_some() || stack.item.fuel().is_some() =>
+            (SlotId::Inv(i), Some(screen @ (Screen::Furnace(_) | Screen::Machine(..))))
+                if self.quick_target(screen, stack.item).is_some() =>
             {
-                let target = if stack.item.smelted().is_some() {
-                    SlotId::FurnaceIn
-                } else {
-                    SlotId::FurnaceFuel
-                };
+                let target = self
+                    .quick_target(screen, stack.item)
+                    .expect("checked just above");
                 let rest = match self.slot_mut(target) {
                     Some(slot) => inventory::insert(std::slice::from_mut(slot), stack, &[0]),
                     None => Some(stack),
@@ -2117,6 +2645,28 @@ impl Survival {
             && let Some(slot) = self.slot_mut(id)
         {
             *slot = Some(rest);
+        }
+    }
+
+    /// Where a shift-click sends `item` on a furnace's or machine's screen, if anywhere.
+    fn quick_target(&self, screen: Screen, item: Item) -> Option<SlotId> {
+        use factory::MachineKind;
+        match screen {
+            Screen::Furnace(_) if item.smelted().is_some() => Some(SlotId::FurnaceIn),
+            Screen::Furnace(_) if item.fuel().is_some() => Some(SlotId::FurnaceFuel),
+            Screen::Machine(_, MachineKind::Generator) if item.fuel().is_some() => {
+                Some(SlotId::FurnaceFuel)
+            }
+            Screen::Machine(_, MachineKind::ElectricFurnace) if item.smelted().is_some() => {
+                Some(SlotId::FurnaceIn)
+            }
+            Screen::Machine(..) => {
+                let m = self.open_machine()?;
+                (0..4)
+                    .find(|&i| m.input_takes(i, item))
+                    .map(SlotId::MachineIn)
+            }
+            _ => None,
         }
     }
 
@@ -2208,11 +2758,14 @@ impl Survival {
         };
         let layout = self.layout(screen, (ui.width, ui.height, ui.scale));
         let slot = |id: SlotId| self.slot(id);
+        let power = self.open_power();
         let view = View {
             slot: &slot,
             cursor: self.cursor,
             mouse,
             furnace: self.open_furnace(),
+            machine: self.open_machine(),
+            power: power.as_ref(),
             catalog: &self.catalog,
         };
         screen::draw(ui, screen, &layout, &view, anim, dt);
@@ -2221,6 +2774,173 @@ impl Survival {
 
 fn furnace_slots(furnace: &Furnace) -> Vec<Slot> {
     vec![furnace.input, furnace.fuel, furnace.output]
+}
+
+/// Conveyors' models take the bends the factory has worked out for them (rebuilt when they
+/// change).
+fn bend_conveyors(factory: &mut Factory, objects: &mut FastMap<BlockCell, Object>) {
+    for (cell, bend) in std::mem::take(&mut factory.bends_changed) {
+        if let Some(object) = objects.get_mut(&cell)
+            && object.block == Block::Conveyor
+        {
+            object.state.bend = bend;
+        }
+    }
+}
+
+/// A machine's moving parts go on (faster while it works, easing to a stop when it doesn't)
+/// and are listed to draw; a burning generator puffs smoke from its chimney, a drilling miner
+/// throws up dust where its drill goes into the ground.
+#[allow(clippy::too_many_arguments)]
+fn animate(
+    planet: &Planet,
+    cell: BlockCell,
+    object: &mut Object,
+    working: bool,
+    dt: f32,
+    clock: f64,
+    draws: &mut Vec<DrawItem>,
+    effects: &mut effects::Effects,
+) {
+    let m = &mut object.motion;
+    let target = if working { 1.0 } else { 0.0 };
+    m.speed += (target - m.speed) * (1.0 - (-2.5 * dt).exp());
+    m.work += (m.speed * dt) as f64;
+    let seed = (cell.u as u64).wrapping_mul(73_856_093)
+        ^ (cell.v as u64).wrapping_mul(19_349_663)
+        ^ (cell.k as u64).wrapping_mul(83_492_791);
+    for part in &m.parts {
+        let pose = part.motion.pose(m.work, m.speed, clock, seed);
+        if !pose.shown {
+            continue;
+        }
+        draws.push(DrawItem {
+            mesh: part.mesh,
+            origin: planet.center + part.pivot + part.up * pose.lift as f64,
+            rotation: glam::Quat::from_axis_angle(part.axis.as_vec3(), pose.angle),
+            radius: part.radius,
+            fade: Fade::Visible,
+        });
+    }
+    let facing = object.state.facing;
+    let (rate, at) = match object.block {
+        Block::CoalGenerator if m.speed > 0.5 => (7.0, [12.25, 12.25, 16.5]),
+        Block::Miner if m.speed > 0.5 => {
+            let pose = models::Motion::Drill.pose(m.work, m.speed, clock, seed);
+            // (Only while the bit is in the ground.)
+            (if pose.lift < -8.0 { 5.0 } else { 0.0 }, [8.0, 8.0, 3.2])
+        }
+        _ => (0.0, [0.0; 3]),
+    };
+    m.puffs += rate * dt;
+    while m.puffs >= 1.0 {
+        m.puffs -= 1.0;
+        let p = models::model_point(planet, cell, facing, at);
+        let up = p.normalize_or(DVec3::Y);
+        effects.push(if object.block == Block::Miner {
+            effects::drill_dust(p, up)
+        } else {
+            effects::chimney_smoke(p, up)
+        });
+    }
+}
+
+/// What the player can change on a machine's screen: its slots, and (as one more) its recipe.
+fn machine_slots(machine: &factory::Machine) -> Vec<Slot> {
+    let mut slots: Vec<Slot> = machine.inputs().to_vec();
+    slots.extend([machine.fuel, machine.output]);
+    slots.push(machine.recipe.map(ItemStack::one));
+    slots
+}
+
+/// What a miner or oil pump in `cell` brings up. A pump: crude oil, if there is oil shale in the
+/// columns under and around it (`PUMP_DEPTH` down). A miner: the best ore in the ground it
+/// reaches (`MINER_DEPTH` down, a column round it), else what the block under it is made of.
+fn resource_under(world: &World, cell: BlockCell, block: Block) -> Option<Item> {
+    let planet = world.planet;
+    let (depth, reach) = if block == Block::OilPump {
+        (factory::PUMP_DEPTH, factory::MINE_REACH)
+    } else {
+        (factory::MINER_DEPTH, factory::MINE_REACH)
+    };
+    let mut found: Vec<Block> = Vec::new();
+    for dk in 1..=depth {
+        for du in -reach..=reach {
+            for dv in -reach..=reach {
+                if let Some(c) = planet.cell(cell.face, cell.u + du, cell.v + dv, cell.k - dk)
+                    && let Some(b) = world.streamer.block(c)
+                {
+                    found.push(b);
+                }
+            }
+        }
+    }
+    if block == Block::OilPump {
+        return found.contains(&Block::OilShale).then_some(Item::CrudeOil);
+    }
+    if let Some(&ore) = found
+        .iter()
+        .filter(|&&b| factory::ore_rank(b) > 0)
+        .max_by_key(|&&b| factory::ore_rank(b))
+    {
+        return factory::mined_from(ore);
+    }
+    let below = planet.cell(cell.face, cell.u, cell.v, cell.k - 1)?;
+    factory::mined_from(world.streamer.block(below)?)
+}
+
+/// Models that light up their surroundings (and must be put out when taken away).
+fn gives_light(block: Block) -> bool {
+    matches!(
+        block,
+        Block::Torch
+            | Block::Furnace
+            | Block::CoalGenerator
+            | Block::ElectricFurnace
+            | Block::ArcFurnace
+    )
+}
+
+/// The light a machine gives off, lit or not.
+fn machine_light(block: Block, lit: bool) -> u8 {
+    match (block, lit) {
+        (_, false) => 0,
+        (Block::ElectricFurnace | Block::ArcFurnace, true) => MACHINE_LIGHT,
+        (Block::Furnace | Block::CoalGenerator, true) => FURNACE_LIGHT,
+        _ => 0,
+    }
+}
+
+/// What the conveyors of `factory` have changed, as world events (and forgets it).
+fn news(
+    factory: &mut Factory,
+    chests: &FastMap<BlockCell, [Slot; CHEST_SLOTS]>,
+    furnaces: &FastMap<BlockCell, Furnace>,
+) -> Vec<WorldEvent> {
+    let mut seen = crate::util::FastSet::default();
+    let mut events = Vec::new();
+    for cell in std::mem::take(&mut factory.changed) {
+        if !seen.insert(cell) {
+            continue;
+        }
+        if let Some(chest) = chests.get(&cell) {
+            events.push(WorldEvent::Chest {
+                cell,
+                slots: chest.to_vec(),
+            });
+        } else if let Some(furnace) = furnaces.get(&cell) {
+            events.push(WorldEvent::Furnace {
+                cell,
+                furnace: *furnace,
+            });
+        } else if let Some(machine) = factory.machine(cell) {
+            events.push(WorldEvent::Machine {
+                cell,
+                machine: *machine,
+            });
+        }
+    }
+    events
 }
 
 const DIGITS: [KeyCode; 9] = [

@@ -15,12 +15,12 @@
 use glam::{DMat3, DQuat, DVec3};
 
 use super::{
-    craft::{At, Craft, Massing, SPRING_REST, Stats, WHEEL_RADIUS},
+    craft::{At, Craft, Massing, SPRING_REST, Stats, WHEEL_RADIUS, center},
     vessel::{
         CRASH_SPEED, Controls, Env, Ground, HEAT_REFERENCE_MASS, Landed, REFUEL_TIME, Vessel,
     },
 };
-use crate::world::noise::smoothstep;
+use crate::world::{block::Block, noise::smoothstep};
 
 /// Biggest angular speed (rad/s).
 const MAX_SPIN: f64 = 12.0;
@@ -87,6 +87,13 @@ const BOUNCE: f64 = 0.05;
 const WRECK_SPEED: f64 = 45.0;
 /// Hitting the ground on its wheels can be this much harder than `CRASH_SPEED`.
 const WHEEL_TOUGHNESS: f64 = 1.6;
+/// Knocking down a tree the world grew costs the speed hitting this much would (kg per block).
+const TRUNK_MASS: f64 = 120.0;
+const LEAVES_MASS: f64 = 8.0;
+/// Two vehicles: closing faster than this (m/s) wakes a parked one, and overlapping more than
+/// this (m) pushes them apart.
+const KNOCK_SPEED: f64 = 0.05;
+const OVERLAP: f64 = 0.03;
 /// Stillness that counts as parked (m/s, rad/s), and for how long (s).
 const STILL_SPEED: f64 = 0.25;
 const STILL_SPIN: f64 = 0.08;
@@ -227,8 +234,12 @@ impl Vessel {
             self.throttle = 0.0;
         }
         let throttle = self.throttle.clamp(0.0, 1.0);
+        // (For the eye: the front wheels turn with the stick even standing still, or in the
+        // air; on the ground `meet_the_ground` says by how much at this speed.)
+        self.steer = (controls.yaw * STEER_ANGLE) as f32;
 
         if self.landed.is_some() {
+            self.flaps.clear();
             let wakes = (throttle > 0.0 && !stats.engines.is_empty()) || controls.drive != 0.0;
             if !wakes {
                 if self.body == crate::space::bodies::Body::Planet {
@@ -281,6 +292,15 @@ impl Vessel {
         // Who is asking for what turn: the pilot, else SAS.
         let (asked, flaps) = self.steering(craft, &m, spin, air, controls, target);
         let plan = FlapPlan::new(stats, m.com, flaps);
+        self.flaps.clear();
+        self.flaps.extend(stats.surfaces.iter().map(|s| {
+            let d = plan.deflection((s.position - m.com).cross(s.normal));
+            if s.moves {
+                d.clamp(-1.0, 1.0) as f32
+            } else {
+                0.0
+            }
+        }));
         // Air on the surfaces.
         if rho > 0.0 {
             for s in &stats.surfaces {
@@ -468,10 +488,12 @@ impl Vessel {
         let inverse = m.inverse;
         // In inertial axes: what a push at arm `r` does to the spin.
         let turn = |torque: DVec3| attitude * (inverse * (attitude.inverse() * torque));
+        // (Trees the world grew don't count: it goes through them, knocking them down.)
         let solid = |p: DVec3| {
-            planet
-                .cell_at(p)
-                .is_some_and(|c| ground.world.block(c.face, c.u, c.v, c.k).collides())
+            planet.cell_at(p).is_some_and(|c| {
+                let block = ground.world.block(c.face, c.u, c.v, c.k);
+                block.collides() && !(block.is_plant() && ground.world.grown(c.face, c.u, c.v, c.k))
+            })
         };
 
         // ---- Wheels.
@@ -553,6 +575,7 @@ impl Vessel {
                 let ground_speed = (v - normal * closing).length();
                 let angle = controls.yaw * STEER_ANGLE / (1.0 + ground_speed / STEER_SPEED);
                 roll = DQuat::from_axis_angle(normal, -angle) * roll;
+                self.steer = angle as f32;
             }
             let roll = (roll - normal * roll.dot(normal)).normalize_or(attitude * ahead);
             let side = normal.cross(roll);
@@ -579,6 +602,18 @@ impl Vessel {
             self.spin += turn(arm.cross(force)) * dt;
         }
 
+        // ---- Trees in the way of any part (the corners below only find the outside ones).
+        if (self.velocity - omega.cross(self.position)).length() > 0.3 {
+            for part in craft.parts() {
+                let origin = self.position + attitude * (center(part.at) - m.com);
+                let Some(cell) = planet.cell_at(frame.to_body(origin)) else {
+                    continue;
+                };
+                let block = ground.world.block(cell.face, cell.u, cell.v, cell.k);
+                self.knocks_down(cell, block, ground, omega, m.mass);
+            }
+        }
+
         // ---- Hull.
         let up_here = self.position.normalize_or(DVec3::Y);
         let (mut deepest, mut out) = (0.0f64, DVec3::ZERO);
@@ -588,11 +623,8 @@ impl Vessel {
             let Some(cell) = planet.cell_at(body) else {
                 continue;
             };
-            if !ground
-                .world
-                .block(cell.face, cell.u, cell.v, cell.k)
-                .collides()
-            {
+            let block = ground.world.block(cell.face, cell.u, cell.v, cell.k);
+            if !block.collides() || self.knocks_down(cell, block, ground, omega, m.mass) {
                 continue;
             }
             let on_wheels = !stats.wheels.is_empty();
@@ -655,6 +687,32 @@ impl Vessel {
         }
     }
 
+    /// A block of a tree the world grew, in the way: noted for the game to knock down (the
+    /// whole tree), and it takes a little of the speed, as a light thing hit would. Returns
+    /// whether it was one (and so isn't ground).
+    fn knocks_down(
+        &mut self,
+        cell: crate::world::chunk::BlockCell,
+        block: Block,
+        ground: Ground,
+        omega: DVec3,
+        mass: f64,
+    ) -> bool {
+        if !block.is_plant() || !ground.world.grown(cell.face, cell.u, cell.v, cell.k) {
+            return false;
+        }
+        if !self.felled.contains(&cell) {
+            self.felled.push(cell);
+            let weight = match block {
+                Block::OakLeaves | Block::SpruceLeaves | Block::JungleLeaves => LEAVES_MASS,
+                _ => TRUNK_MASS,
+            };
+            let over_ground = self.velocity - omega.cross(self.position);
+            self.velocity -= over_ground * (weight / (mass + weight));
+        }
+        true
+    }
+
     /// Sat still on the ground long enough: parked.
     fn settle_craft(
         &mut self,
@@ -688,13 +746,182 @@ impl Vessel {
     }
 }
 
+/// One vehicle's corner inside another's part.
+struct Touch {
+    /// Where (relative to the body, inertial axes).
+    at: DVec3,
+    /// Pushes `a` away from `b` (inertial).
+    normal: DVec3,
+    depth: f64,
+    /// The part of each that touches.
+    parts: [Option<At>; 2],
+}
+
+/// Two vehicles on the same body, at the same time, against each other: hull corners of each
+/// inside a part of the other are pushed apart with impulses, as the hull is from the ground.
+/// `moves`: which of the two this machine simulates. The other's own machine works out the
+/// same touch and moves it, so each only changes its own, by its share. Hitting harder than
+/// `CRASH_SPEED` breaks the parts that touch. Returns whether they touched.
+pub fn meet_each_other(a: &mut Vessel, b: &mut Vessel, moves: [bool; 2]) -> bool {
+    if a.body != b.body || !(moves[0] || moves[1]) {
+        return false;
+    }
+    let (Some(ca), Some(cb)) = (a.craft.as_deref(), b.craft.as_deref()) else {
+        return false;
+    };
+    let reach = ca.stats.radius + cb.stats.radius + 2.0;
+    if (a.position - b.position).length() > reach {
+        return false;
+    }
+    let (ma, mb) = (ca.massing(a.fuel), cb.massing(b.fuel));
+    let mut touches = Vec::new();
+    corners_inside(a, ca, &ma, b, cb, &mb, false, &mut touches);
+    corners_inside(b, cb, &mb, a, ca, &ma, true, &mut touches);
+    if touches.is_empty() {
+        return false;
+    }
+
+    let turn = |attitude: DQuat, m: &Massing, torque: DVec3| {
+        attitude * (m.inverse * (attitude.inverse() * torque))
+    };
+    let share = mb.mass / (ma.mass + mb.mass);
+    // Worked out on copies: one that isn't simulated here only stands in for its own
+    // machine's share. (What each touch does changes what the next one sees.)
+    let mut motion = [(a.velocity, a.spin), (b.velocity, b.spin)];
+    let (mut deepest, mut out) = (0.0f64, DVec3::ZERO);
+    let mut broken: [Vec<At>; 2] = [Vec::new(), Vec::new()];
+    let (mut knocked, mut wrecked) = (false, false);
+    for touch in &touches {
+        let n = touch.normal;
+        let (ra, rb) = (touch.at - a.position, touch.at - b.position);
+        let [(va, wa), (vb, wb)] = motion;
+        let relative = (va + wa.cross(ra)) - (vb + wb.cross(rb));
+        let closing = relative.dot(n);
+        if touch.depth > deepest {
+            deepest = touch.depth;
+            out = n;
+        }
+        if closing >= 0.0 {
+            continue;
+        }
+        knocked |= closing < -KNOCK_SPEED;
+        if closing < -CRASH_SPEED {
+            for (list, part) in broken.iter_mut().zip(touch.parts) {
+                list.extend(part);
+            }
+        }
+        wrecked |= closing < -WRECK_SPEED;
+        let leverage = |d: DVec3| {
+            1.0 / ma.mass
+                + 1.0 / mb.mass
+                + d.dot(turn(a.attitude, &ma, ra.cross(d)).cross(ra))
+                + d.dot(turn(b.attitude, &mb, rb.cross(d)).cross(rb))
+        };
+        let j = -(1.0 + BOUNCE) * closing / leverage(n);
+        let mut impulse = n * j;
+        let tangent = relative - n * closing;
+        if let Some(dir) = tangent.try_normalize() {
+            impulse -= dir * (tangent.length() / leverage(dir)).min(HULL_FRICTION * j);
+        }
+        motion[0].0 += impulse / ma.mass;
+        motion[0].1 += turn(a.attitude, &ma, ra.cross(impulse));
+        motion[1].0 -= impulse / mb.mass;
+        motion[1].1 -= turn(b.attitude, &mb, rb.cross(impulse));
+    }
+    // Out of each other gently, each by its share. (Barely touching, nothing: two parked
+    // side by side stay parked.)
+    let overlapping = deepest > OVERLAP;
+    let push = (deepest * 0.3).min(0.08);
+    let pushes = [out * push * share, -out * push * (1.0 - share)];
+
+    for (i, v) in [&mut *a, &mut *b].into_iter().enumerate() {
+        if !moves[i] {
+            continue;
+        }
+        if knocked || overlapping {
+            // Knocked: it is moving again (and simulated from here on).
+            v.landed = None;
+            v.still = 0.0;
+        }
+        if v.landed.is_some() {
+            continue;
+        }
+        (v.velocity, v.spin) = motion[i];
+        if overlapping {
+            v.position += pushes[i];
+        }
+        if wrecked {
+            v.destroyed = Some("crashed");
+        }
+        for &at in &broken[i] {
+            v.break_part(at);
+        }
+    }
+    true
+}
+
+/// Each hull corner of `of` inside a part of `into`, with the shortest way out of that part
+/// to where `into` has no part. `swap`: `of` is the second of the pair (the normal is turned
+/// round so it always pushes the first away from the second).
+#[allow(clippy::too_many_arguments)]
+fn corners_inside(
+    of: &Vessel,
+    of_craft: &Craft,
+    of_mass: &Massing,
+    into: &Vessel,
+    into_craft: &Craft,
+    into_mass: &Massing,
+    swap: bool,
+    touches: &mut Vec<Touch>,
+) {
+    let back = into.attitude.inverse();
+    for &corner in &of_craft.stats.corners {
+        let at = of.position + of.attitude * (corner - of_mass.com);
+        let local = back * (at - into.position) + into_mass.com;
+        let cell = cell_of(local);
+        if into_craft.get(cell).is_none() {
+            continue;
+        }
+        let inside = local - center(cell);
+        let mut best: Option<(DVec3, f64)> = None;
+        for axis in 0..3 {
+            for sign in [-1i16, 1] {
+                let mut next = cell;
+                next[axis] += sign;
+                if into_craft.get(next).is_some() {
+                    continue;
+                }
+                let mut dir = DVec3::ZERO;
+                dir[axis] = sign as f64;
+                let depth = 0.5 - inside.dot(dir);
+                if best.is_none_or(|(_, d)| depth < d) {
+                    best = Some((dir, depth));
+                }
+            }
+        }
+        let Some((dir, depth)) = best else { continue };
+        let normal = into.attitude * dir;
+        let (normal, parts) = if swap {
+            (-normal, [Some(cell), of_craft.part_at_corner(corner)])
+        } else {
+            (normal, [of_craft.part_at_corner(corner), Some(cell)])
+        };
+        touches.push(Touch {
+            at,
+            normal,
+            depth: depth.max(0.0),
+            parts,
+        });
+    }
+}
+
 /// The grid cell around a point (a wheel's centre).
 fn cell_of(p: DVec3) -> At {
     [p.x.round() as i16, p.y.round() as i16, p.z.round() as i16]
 }
 
 /// The quickest way out of the solid block at `body` (body frame): the direction, and how
-/// far. Up unless a side is much nearer and open.
+/// far. Up unless a side (or below) is much nearer and open.
 fn exit_from_block(
     planet: &crate::world::planet::Planet,
     ground: Ground,
@@ -706,10 +933,9 @@ fn exit_from_block(
     let n = planet.res_at(cell.k);
     let up = body.normalize_or(DVec3::Y);
     let free = |du: i32, dv: i32, dk: i32| {
-        !ground
-            .world
-            .block(cell.face, cell.u + du, cell.v + dv, cell.k + dk)
-            .collides()
+        let (u, v, k) = (cell.u + du, cell.v + dv, cell.k + dk);
+        let block = ground.world.block(cell.face, u, v, k);
+        !block.collides() || (block.is_plant() && ground.world.grown(cell.face, u, v, k))
     };
     let (fu, fv, fk) = (u - u.floor(), v - v.floor(), k - k.floor());
     // On wheels a single block isn't a wall: over it. (A taller one is.)
@@ -729,7 +955,9 @@ fn exit_from_block(
             - planet.dir(face, u - du * 0.5, v - dv * 0.5, n))
         .normalize_or(DVec3::X)
     };
+    // (Down too: a corner pushed up into a ceiling goes back down, not up through the rock.)
     for (open, distance, dir) in [
+        (free(0, 0, -1), fk, -up),
         (free(1, 0, 0), 1.0 - fu, along(1.0, 0.0)),
         (free(-1, 0, 0), fu, -along(1.0, 0.0)),
         (free(0, 1, 0), 1.0 - fv, along(0.0, 1.0)),
@@ -875,6 +1103,56 @@ mod tests {
         c
     }
 
+    /// Rock everywhere but a tunnel two blocks high from layer `.0` up.
+    struct Tunnel(i32);
+
+    impl Voxels for Tunnel {
+        fn block(&self, _: Face, _: i32, _: i32, k: i32) -> Block {
+            if (self.0..self.0 + 2).contains(&k) {
+                Block::Air
+            } else {
+                Block::Stone
+            }
+        }
+    }
+
+    #[test]
+    fn a_vehicle_in_a_tunnel_stays_in_it() {
+        // A core and a seat, built underground. Holding W (pitch) turns it on the core's
+        // reaction wheel against the roof: that used to push it up into the rock, metre after
+        // metre, until it came out in a cave.
+        let (planet, bodies) = setup();
+        let floor = planet.sea_layer - 40;
+        let world = Tunnel(floor);
+        let env = Env {
+            bodies: &bodies,
+            ground: Some(Ground {
+                body: Body::Planet,
+                planet: &planet,
+                world: &world,
+            }),
+            drag: true,
+        };
+        let mut c = Craft::new(4);
+        assert!(c.place(part([0, 1, 0], Block::Seat, DVec3::Z)));
+        let mut v = parked(&bodies, &planet, c, floor, 0.5);
+        let mut t = 0.0;
+        let w = Controls {
+            pitch: 1.0,
+            drive: 1.0,
+            ..Default::default()
+        };
+        for controls in [w, Controls { pitch: -1.0, ..w }, w] {
+            step(&mut v, &env, &mut t, 20.0 / 3.0, &controls);
+            assert!(v.destroyed.is_none(), "{:?}", v.destroyed);
+            let core = v.position.length() - planet.layer_radius(floor as f64);
+            assert!(
+                (-0.2..2.2).contains(&core),
+                "{core} m above the tunnel floor"
+            );
+        }
+    }
+
     #[test]
     fn a_rover_settles_on_its_wheels_and_drives() {
         let (planet, bodies) = setup();
@@ -983,6 +1261,161 @@ mod tests {
         assert!(one > 0.8, "got {one} m up a one-block step");
         let three = climbs(3);
         assert!(three < 0.8, "got {three} m up a wall");
+    }
+
+    /// Flat ground with a row of tree trunks (five logs high) across the way, grown by the
+    /// world or placed by someone.
+    struct Trunks {
+        ground: i32,
+        along: (Face, i32, i32, i32, i32),
+        grown: bool,
+    }
+
+    impl Trunks {
+        fn log(&self, face: Face, u: i32, v: i32, k: i32) -> bool {
+            let (f, u0, v0, du, dv) = self.along;
+            face == f
+                && (u - u0) * du + (v - v0) * dv == 0
+                && (self.ground..self.ground + 5).contains(&k)
+        }
+    }
+
+    impl Voxels for Trunks {
+        fn block(&self, face: Face, u: i32, v: i32, k: i32) -> Block {
+            if self.log(face, u, v, k) {
+                Block::OakLog
+            } else if k < self.ground {
+                Block::Stone
+            } else {
+                Block::Air
+            }
+        }
+
+        fn grown(&self, face: Face, u: i32, v: i32, k: i32) -> bool {
+            self.grown && self.log(face, u, v, k)
+        }
+    }
+
+    /// Drives a rover at a row of trunks 14 m ahead: how far it got (m), whether it lost any
+    /// parts, and how many log blocks it noted for knocking down.
+    fn drive_at_trunks(grown: bool) -> (f64, bool, usize) {
+        let (planet, bodies) = setup();
+        let ground = planet.sea_layer + 5;
+        let mut v = parked(&bodies, &planet, rover(), ground, 1.0);
+        let frame = bodies.frame(Body::Planet, 0.0);
+        let at = frame.to_body(v.position);
+        let ahead = frame.to_body(v.nose());
+        let start = planet.cell_at(at).unwrap();
+        let row = planet.cell_at(at + ahead * 14.0).unwrap();
+        let (du, dv) = (row.u - start.u, row.v - start.v);
+        let (du, dv) = if du.abs() > dv.abs() {
+            (du.signum(), 0)
+        } else {
+            (0, dv.signum())
+        };
+        let world = Trunks {
+            ground,
+            along: (start.face, row.u, row.v, du, dv),
+            grown,
+        };
+        let env = Env {
+            bodies: &bodies,
+            ground: Some(Ground {
+                body: Body::Planet,
+                planet: &planet,
+                world: &world,
+            }),
+            drag: true,
+        };
+        v.landed = None;
+        let parts = v.craft.as_ref().unwrap().parts().len();
+        let mut t = 0.0;
+        step(&mut v, &env, &mut t, 2.0, &Controls::default());
+        let go = Controls {
+            drive: 1.0,
+            ..Default::default()
+        };
+        let mut felled = 0;
+        for _ in 0..12 {
+            step(&mut v, &env, &mut t, 1.0, &go);
+            felled += std::mem::take(&mut v.felled).len();
+        }
+        assert!(v.destroyed.is_none(), "{:?}", v.destroyed);
+        let gone = v.craft.as_ref().unwrap().parts().len() < parts;
+        // (The planet turns: measured in its own frame at the time.)
+        let now = bodies.frame(Body::Planet, t);
+        let travelled = (now.to_body(v.position) - at).dot(ahead);
+        (travelled, gone, felled)
+    }
+
+    #[test]
+    fn grown_trees_go_down_and_placed_logs_stop_it() {
+        let (travelled, gone, felled) = drive_at_trunks(true);
+        assert!(travelled > 30.0, "only {travelled} m through grown trees");
+        assert!(!gone, "lost parts to grown trees");
+        assert!(felled > 0, "noted no trees to knock down");
+
+        let (travelled, _, felled) = drive_at_trunks(false);
+        assert!(travelled < 14.5, "went {travelled} m through placed logs");
+        assert_eq!(felled, 0);
+    }
+
+    /// Two vehicles: `a` driving into `b`, which is parked `gap` m ahead (core to core).
+    fn rear_end(drive_for: f64) -> (Vessel, Vessel, f64) {
+        let (planet, bodies) = setup();
+        let ground = planet.sea_layer + 5;
+        let world = Floor(ground);
+        let env = Env {
+            bodies: &bodies,
+            ground: Some(Ground {
+                body: Body::Planet,
+                planet: &planet,
+                world: &world,
+            }),
+            drag: true,
+        };
+        let mut a = parked(&bodies, &planet, rover(), ground, 1.0);
+        let mut b = parked(&bodies, &planet, rover(), ground, 1.0);
+        let ahead = b.nose();
+        let start = b.position;
+        // (Rovers reach 2 m ahead of their core: 4 m of road between them.)
+        b.position += ahead * 6.0;
+        b.landed = None;
+        a.landed = None;
+        let mut t = 0.0;
+        let dt = 1.0 / 60.0;
+        let go = Controls {
+            drive: 1.0,
+            ..Default::default()
+        };
+        for n in 0..((2.0 + drive_for) / dt) as usize {
+            let controls = if n as f64 * dt > 2.0 {
+                go
+            } else {
+                Controls::default()
+            };
+            a.update(&env, &controls, (t, t + dt), None);
+            b.update(&env, &Controls::default(), (t, t + dt), None);
+            t += dt;
+            meet_each_other(&mut a, &mut b, [true, true]);
+        }
+        let (now, then) = (
+            bodies.frame(Body::Planet, t),
+            bodies.frame(Body::Planet, 0.0),
+        );
+        let pushed =
+            (now.to_body(b.position) - then.to_body(start + ahead * 6.0)).dot(then.to_body(ahead));
+        (a, b, pushed)
+    }
+
+    #[test]
+    fn a_vehicle_pushes_another_and_doesnt_go_through_it() {
+        let (a, b, pushed) = rear_end(5.0);
+        assert!(a.destroyed.is_none() && b.destroyed.is_none());
+        assert!(pushed > 1.0, "the one in front moved {pushed} m");
+        // Never one inside the other: cores stay about a rover's length apart.
+        let apart = (a.position - b.position).length();
+        assert!(apart > 2.6, "cores {apart} m apart");
     }
 
     /// Ground of one-block steps both ways, as most of the terrain is.

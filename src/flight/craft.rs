@@ -434,8 +434,10 @@ impl Craft {
             return Removed::default();
         }
         if self.get(at).is_some_and(|p| p.block == Block::VehicleCore) {
+            let parts = std::mem::take(&mut self.parts);
+            self.rebuild();
             return Removed {
-                parts: std::mem::take(&mut self.parts),
+                parts,
                 core_gone: true,
             };
         }
@@ -872,6 +874,10 @@ mod tests {
         let gone = c.remove([0, 0, 0]);
         assert!(gone.core_gone);
         assert_eq!(gone.parts.len(), 4);
+        // The same crash breaking more parts after the core (it used to panic).
+        let more = c.remove([0, 0, 2]);
+        assert!(more.parts.is_empty() && !more.core_gone);
+        assert!(c.parts().is_empty() && c.get([0, 0, 1]).is_none());
     }
 
     #[test]

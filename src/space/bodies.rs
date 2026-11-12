@@ -50,6 +50,9 @@ impl Body {
 pub const MOON_GRAVITY: f64 = 1.63;
 /// The moon's orbit radius around the planet: 20 planet radii, like the Mun's.
 pub const MOON_DISTANCE: f64 = 880_000.0;
+/// A craft closer to the star than this many of its radii burns up (its sunlit side passes
+/// the hull's limit, as in a reentry). The light grows as 1 / distance^2.
+pub const SUN_BURN_RADII: f64 = 3.5;
 
 pub struct Moon {
     pub radius: f64,
@@ -121,6 +124,27 @@ impl Bodies {
     /// Top of the atmosphere (radius), if the body has one.
     pub fn atmosphere_top(&self, body: Body) -> Option<f64> {
         (body == Body::Planet).then(|| self.gravity.atmosphere_top())
+    }
+
+    /// Near the star its light alone burns a craft up (`SUN_BURN_RADII`); None elsewhere.
+    pub fn hot_zone(&self, body: Body) -> Option<f64> {
+        (body == Body::Star).then_some(self.system.star.radius * SUN_BURN_RADII)
+    }
+
+    /// How hot sunlight alone makes a craft at `distance` from the star (K): it reaches
+    /// `max_temperature` at the edge of the hot zone (and, as T^4 goes with the light, as
+    /// 1 / sqrt(distance)): about 220 K out here.
+    pub fn sunlit_temperature(&self, distance: f64, max_temperature: f64) -> f64 {
+        let edge = self.system.star.radius * SUN_BURN_RADII;
+        max_temperature * (edge / distance.max(1.0)).sqrt()
+    }
+
+    /// Rails (time warp beyond physics) stop at this radius: the top of the air, the star's
+    /// hot zone, or `clearance` above an airless surface.
+    pub fn rails_floor(&self, body: Body, clearance: f64) -> f64 {
+        self.atmosphere_top(body)
+            .or(self.hot_zone(body))
+            .unwrap_or(self.radius(body) + clearance)
     }
 
     /// The planet's equatorial frame -> inertial axes.

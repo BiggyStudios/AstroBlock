@@ -755,6 +755,11 @@ impl WorldStreamer {
         Some(self.chunks.get(&key)?.blocks.get(u, v, k))
     }
 
+    /// A tree or cactus block the world grew, that nobody has touched since (loaded only).
+    pub fn grown(&self, cell: BlockCell) -> bool {
+        self.block(cell).is_some_and(Block::is_plant) && !self.edits.edited(&self.planet, cell)
+    }
+
     /// Changes a block. Collision sees it at once; the chunk (and every neighbour whose
     /// padding includes the cell) is remeshed ahead of all other work, and the edit is kept
     /// so it survives the chunk being unloaded and generated again.

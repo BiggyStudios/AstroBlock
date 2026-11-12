@@ -54,7 +54,10 @@ follows their warp, or joins their team (a team warps as one).
   - Torches go on top of blocks or on their sides, and fall off when that block breaks.
   - Middle click picks the targeted block. 1-9 or the scroll wheel choose the hotbar slot.
   - Q drops one of the held item, Ctrl+Q the whole stack.
-  - E opens the inventory (the creative catalog in creative mode); E or Esc closes it.
+  - E opens the inventory (the creative catalog in creative mode); E or Esc closes it. The
+    catalog has tabs down its left side (`items::Category`, from `Item::category`: new blocks go
+    under terrain unless they are factory or vehicle parts or listed under building); the wheel
+    scrolls a tab longer than six rows.
 - **In inventory screens:**
   - Left click picks up, puts down, merges or swaps a stack. Right click picks up half or puts
     down one.
@@ -73,6 +76,22 @@ follows their warp, or joins their team (a team warps as one).
   the first one in flies it, and F stands up. Walk around on it like anywhere else.
   Flying: as for rockets, plus W/S drive wheels, A/D steer them, Space brakes while held (the HUD's
   brake button stays on until clicked again), V sees from the seat. `vehicle <plane|rover|rocket>` in the console makes a ready-made one.
+  Nothing can be placed in a cell a vehicle has a part in (`vehicle_in_cell`; a second core neither).
+  `fuel infinite [on|off]` keeps the tank of whatever you fly full (`Vessel::fill_up`; not saved).
+- **Console teleports and time:** `tp <lat> <lon> [alt]`, or `tp <player>` in a shared game (beside
+  them, on their world). `time <hours|sunrise|day|noon|sunset|night|midnight>` goes on to that local
+  time through `clock_jump`, which carries you over the same ground (setting the clock alone left you
+  where you were in space while the planet turned under you).
+- **Factories** (see "Factories" below; `factory demo` builds a small one ahead, `factory
+  industry` a bigger one):
+  - A conveyor runs the way you look when you place it (its arrows); R on one turns it. It takes
+    from what is behind it and puts into what is in front: a chest, a furnace, a machine or the
+    next conveyor. You walk over conveyors. Fed only from one side, it bends round from there.
+  - Right click a machine for its screen (a recipe machine: click what it should make), a pole
+    or accumulator for the power screen. Holding cable, right click
+    a pole or machine, then another (up to 24 m) to run a cable; it carries on from there, so a
+    line of poles is a click each. Right click the last one again to stop, or a connected
+    pair to take that cable down.
 - **Rockets** (test rocket: `give rocket`, or `rocket` in the console):
   - Right click with it on top of a block stands it there; right click a rocket to get in,
     left click a landed one to pick it up.
@@ -99,7 +118,7 @@ follows their warp, or joins their team (a team warps as one).
 | `ASTRO_WARP=<factor>` | Initial time warp. |
 | `ASTRO_FACE_SUN=1` | Turn the camera towards the sun's compass direction (sunset shots). |
 | `ASTRO_MODE=<mode>` | Starting game mode: survival (default), creative or spectator. **Use `spectator` for camera captures**: in survival you fall. |
-| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). For survival tests: `aim <pitch> [yaw]`, `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `brake [on|off]` (the HUD's brake button), `vehicle <plane|rover|rocket> [m]`, `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net punch` (strike the player in the crosshair, full strength), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
+| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). `time <hours|noon|night|...>`. For survival tests: `aim <pitch> [yaw]`, `turn <deg>` (the view, to the right), `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative [tab]`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `fuel infinite [on|off]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `brake [on|off]` (the HUD's brake button), `vehicle <plane|rover|rocket> [m]`, `vehicle take <x> <y> <z>` (breaks that part off the nearest vehicle, as a click would), `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Factory tests: `factory` (counts, networks, what the containers on conveyors hold), `factory demo` (a ready-made factory ahead), `factory stress [lines] [length]` (that many conveyors from full chests), `factory turn` (= R on a conveyor), `factory industry` (oil, a miner, silicon, wire and power ahead), `factory open <machine|power>` (that screen, within reach), `factory recipe <item>` (the nearest machine that can make it does). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net vessels` (each vessel: who flies it, parked or moving, height over the terrain), `tp <who>` (go to that player), `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net punch` (strike the player in the crosshair, full strength), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
 | `ASTRO_MENU=1` | Start on the main menu even in a capture (otherwise captures and runs with `ASTRO_SPAWN`, `ASTRO_MODE`, `ASTRO_TIME` or `ASTRO_COMMANDS` go straight into an unsaved world). Menu tests: `menu <main\|worlds\|create\|settings\|pause>`, `world create <name> [seed] [mode]`, `world load <name>`, `world leave`, `save`, `settings [vsync on\|off] [fps <n>] [volume <0-100>] [sensitivity <25-400>] [smoothing on\|off]`. |
 | `ASTRO_SAVE_DIR=<folder>` | Where worlds and settings are kept. **Automated tests must set this**: a capture without it can't save at all, so it can't touch the owner's worlds. |
 | `ASTRO_STEAM=1` | Use Steam even in a capture. Off by default there: a test run would show the owner as playing on their account. |
@@ -134,6 +153,13 @@ src/
     timeline.rs     each player's own clock and warp: sync, follow, teams, riding along, whose weather you watch, rockets at another time
     vehicles.rs     vehicles in the game: starting and building them, walking aboard, seats, passengers
     death.rs        dying: the death screen, watching the wreck, respawning
+    factories.rs    the factory side of the game: turning conveyors, `factory` console commands, the demos
+  factory/
+    mod.rs          Factory: conveyors (and their bends), machines (generators, accumulators, furnaces, miners,
+                    pumps, recipe machines), poles, cables, power networks and their history; links, stepping,
+                    saving, what other players are sent
+    recipes.rs      what the refinery, arc furnace, assembler and chip fab make, and from what
+    draw.rs         items riding on conveyors (round bends), cables
   player/
     mod.rs          Player: inertial-frame physics, voxel collision, modes, rails warp, fall height
     interact.rs     ray cast to the targeted block, its outline matrix
@@ -154,7 +180,7 @@ src/
     vessel.rs       Vessel: the test rocket's physics (thrust, reaction wheels, SAS, drag, fins, reentry heat, landing, crashing, SOI changes, rails)
     craft.rs        Craft: a vehicle's grid of parts, and what follows from them (mass, centre of mass, inertia, engines, wings, wheels)
     craft_physics.rs  a vehicle as one rigid body: engines and wings where they sit, wheels on springs, the hull against the ground
-    craft_model.rs  a vehicle's mesh (rebuilt when its parts change, drawn turned into place)
+    craft_model.rs  a vehicle's mesh (rebuilt when its parts change, drawn turned into place); its moving pieces (`Pivot`, `Looks`)
     rocket_model.rs the rocket's box model (glows when hot)
     hud.rs          flight HUD: attitude ball with direction markers, throttle and heat gauges, SAS buttons, telemetry; `Pointer` + `button` widgets
     map_view.rs     map overlay: patched-conic trajectories, markers, the maneuver planner (`Planner`) and its node panel
@@ -184,7 +210,7 @@ src/
   render/
     mod.rs          Renderer: frames in flight, uploads, culling, scene passes, atmosphere pass, overlay, screenshots
     camera.rs       f64 position + planet-relative "up" frame (handles flips at the centre), reverse-Z projection (+ the view model's squeezed-depth variant)
-    models.rs       box models (crafting table, furnace, chest, torch, dropped items, the first-person arm and held item) -> ChunkMesh
+    models.rs       box models (crafting table, furnace, chest, torch, machines and their moving parts, dropped items, the first-person arm and held item) -> ChunkMesh
     atmosphere.rs   Atmosphere model + CPU-precomputed LUTs (transmittance, multiple scattering, sky irradiance)
     starfield.rs    Milky Way map (precomputed equirectangular texture)
     font.rs         Astro Block's own pixel font: condensed, square-cornered, 4x8 glyphs in 5x9 cells
@@ -208,7 +234,9 @@ src/
     lod.rs          LOD terrain quadtree: tile selection, horizon culling, voxel-style tile meshes
     noise.rs        f64 3D simplex (hash-based, never tiles), fbm, ridged
     block.rs        Block enum, textures per face, tint kind, opaque / solid / model, icon faces, names
-    textures.rs     procedurally generated 16x16 textures: blocks, then item / tool / interface sprites (Tex enum = array layer)
+    textures.rs     procedurally generated 16x16 textures: blocks, then item / tool / interface sprites (Tex enum = array layer);
+                    textures/industry.rs: oil shale, the machines' fronts, what factories make (every new Tex needs its own arm:
+                    an armor fallback catches the rest)
 shaders/
   block.vert/.frag  blocks and models (variants WATER, FAR; FAR also does cutout sprites); HDR lighting from the atmosphere LUTs; target outline
   atmosphere.glsl   shared: frame uniforms, LUT access, medium (#include'd; build.rs resolves includes)
@@ -241,7 +269,10 @@ shaders/
      resolution depends on depth (`Planet::shells`). The surface shell has
      `face_blocks = chunks_per_face * 32` columns per face edge. Each deeper shell halves the
      resolution (2x2 columns become 1) where blocks have shrunk to about 0.5 m, so widths stay
-     about 0.5-1 m down to the small innermost shell, which tapers to the centre.
+     about 0.5-1 m. Near the centre, from 128 columns down, the grid halves every chunk of layers
+     instead (128 columns from 64 m, 64 from 32 m, 32 in the middle): one shell of 128 used to
+     go from 96 m to the centre, its blocks thin slivers. Blocks there are 0.8-1.6 m wide down to
+     16 m from the centre; only the middle 32 still tapers.
    - **Shell boundaries** are multiples of 32 layers, so a chunk belongs to exactly one shell.
      Always get the resolution from `res_at(k)`, and pass `n` explicitly to `dir`,
      `corner_dir` and `wrap_column`. `column_dir` means
@@ -379,6 +410,8 @@ shaders/
   - bauxite in tropical soil
   - iron everywhere, plus large "iron provinces"
   - ilmenite (titanium) placer sand on some beaches
+  - oil shale 6-90 m down under deserts, badlands, plains, savanna and tundra, rolled only in what
+    the other ores leave of the roll (`choose_ore`), so no existing vein moved
 - Caves exist at every depth, down to the centre. There are two kinds: spaghetti tunnels (two
   noise fields both near zero) and "cheese" caverns.
   - `cave_noise(face, u, v, k, n)` uses parameters that change smoothly with radius, so there
@@ -523,6 +556,10 @@ shaders/
 ### Block light (world/light.rs)
 - Sources: torches (14), lit furnaces (13). The molten core blocks glow on their own faces
   (`Block::glow`) without spreading light.
+- Models drawn in the world (vehicles, rockets, figures, particles) take the light where they
+  are (`Game::light_at`): the mesher's sky estimate, block light, and the glow of molten rock or
+  lava right next to them. With full sky light they were sunlit or black underground by time of
+  day, and black against the white-hot core.
 - Each source keeps its own breadth-first flood fill (one level less per step, through
   non-opaque cells, across face edges and shell boundaries). `LightMap` holds the brightest
   level per lit cell and is shared (`Arc`) with the streaming workers.
@@ -628,8 +665,9 @@ shaders/
     block behind them for targeting.
 - **Death** (`app/death.rs`): `Game::die` drops the items (survival only) and the world carries
   on until the death screen's button (or `respawn` in the console) calls `Game::respawn`. In a
-  crash the camera circles the wreck; otherwise the view sinks to the ground. A crash stops at the
-  screen in creative too. While dead, `Survival::dead` keeps the player from being hurt or picking
+  crash the camera circles the wreck (kept out of the ground, `camera_clear_of_blocks`); otherwise
+  the view sinks to the ground. In creative a crash doesn't kill: you are thrown clear, flying
+  over the wreck (in space, floating on where it was going). While dead, `Survival::dead` keeps the player from being hurt or picking
   up what they dropped, and others see nobody. Dead worlds aren't autosaved, and leaving respawns first.
 - **Hunger** (Minecraft's rules): food 0-20 plus hidden saturation. Exhaustion costs a point
   of saturation, then food, per 4. It comes from sprinting 0.1/m, jumping 0.05 (sprint-jump
@@ -771,6 +809,12 @@ shaders/
   home's equatorial plane, tidally locked (its +X faces home). SOIs by Laplace's formula:
   moon about 150 km, home about 17,000 km. Low home orbit is about 520 m/s, and the moon
   transfer from 30 km is about 180 m/s.
+- **The sun** is a body you can fly to: its disc grows as you near it, and its light grows as
+  1 / distance^2 (exactly 1 at home; exposure adapts partly). Within `SUN_BURN_RADII` (3.5) of
+  its radius a craft burns up (`Bodies::hot_zone`, `Vessel::feel_the_sun`): sunlight alone
+  heats the hull to `MAX_TEMPERATURE` there, falling off as 1 / sqrt(distance) (about 220 K at
+  home's distance). Rails stop at the hot zone as at an atmosphere (`Bodies::rails_floor`), and
+  a floating player dies there (in creative passes on through).
 - **Patched conics:** a craft's state is relative to its reference body (`Vessel::body`) in
   shared inertial axes; only that body pulls. Crossing an SOI boundary re-expresses it
   (`Vessel::change_soi`, `trajectory::transfer`).
@@ -821,7 +865,10 @@ shaders/
     jump off the moon) you start floating. Telemetry is then relative to the body you float around.
   - Empty rockets landed ride the turning ground; others coast on rails, with physics
     only in the air (they can crash unattended).
-  - Chase camera drags: right moves the view right (orbits like the map).
+  - Chase camera drags: right moves the view right (orbits like the map). It stops in front of
+    the first solid block between it and the craft (`camera_clear_of_blocks`), and stays above
+    the terrain where chunks aren't loaded: from inside the ground every block shows its
+    insides. Flying a vehicle seen from outside, you sit in the seat (`own_figure_draw_item`).
   - Effects: exhaust flame (glowing) and smoke in air, reentry plasma, explosions (fire,
     smoke, hull debris); an engine rumble replayed while burning.
 - **HUD** (`flight/hud.rs`): an attitude ball (sky / ground, horizon, pitch rings, compass
@@ -857,9 +904,26 @@ shaders/
   vehicle with wheels skids (`SKID_FRICTION`): without these it hangs on a step, the hull taking the
   weight (a rover was stuck 58% of the time on real terrain). Tipped far over, a vehicle on driven
   wheels rolls back onto them (`RIGHT_*`). The hull meets the ground at its outer
-  corners with impulses. Hitting faster than `CRASH_SPEED` breaks that part off (and whatever it
+  corners with impulses. A corner inside a block is pushed out the nearest open way, down included
+  (`exit_from_block`): with only up and sideways, a vehicle in a tunnel turned into the roof on
+  its reaction wheel and climbed up through the rock. Hitting faster than `CRASH_SPEED` breaks that part off (and whatever it
   held on: anything no longer joined to the core comes off), `WRECK_SPEED` or losing the core
-  destroys it. Still for `STILL_TIME`, it becomes `landed` as a rocket does.
+  destroys it. Still for `STILL_TIME`, it becomes `landed` as a rocket does. A vessel nobody flies
+  that is slow and near the ground where no chunks are loaded (or on the other world) is parked
+  where it is (`ground_unknown`): the terrain-height guess knows nothing built or dug, and pushed a
+  vehicle in a pit up and away.
+- **Trees:** log, leaf and cactus blocks the world grew and nobody has edited (`Voxels::grown`,
+  `WorldEdits::edited`) aren't ground to a vehicle: it goes through them, losing the speed hitting
+  `TRUNK_MASS` / `LEAVES_MASS` per block would cost, and notes them (`Vessel::felled`, every part's
+  cell checked, not only the corners). The game knocks the whole tree down (`fell_tree`: the tree
+  `TerrainGenerator::tree_at` finds within 3 columns, its trunk and the crown leaves no other trunk is
+  nearer to). Placed logs and leaves are as solid as stone.
+- **Vehicles against each other** (`meet_each_other`, every frame after all have moved): hull corners
+  of each inside a part of the other are pushed out the nearest open face with impulses, worked out
+  for both on copies. Each machine keeps only what happens to the vehicles it simulates (the one it
+  flies; the host also those nobody flies), so in a shared game both sides push their own share.
+  Knocked (`KNOCK_SPEED`) or overlapping (`OVERLAP`), a parked one wakes up; `CRASH_SPEED` breaks
+  the parts that touch, `WRECK_SPEED` wrecks.
 - **Aboard** (`Flight::aboard`): the player is held in grid coordinates and moves there, down
   is always the deck's -Y whatever the vehicle does, and the view turns with it. On foot, vehicles
   are solid (`meet_vehicles`, a sweep in grid coordinates); landing on one puts you aboard, and
@@ -869,9 +933,119 @@ shaders/
   For the same reason walking off only takes effect at the end of `place_aboard`. Taking off in
   creative leaves the vehicle (`toggle_flight`), and a flying player never lands on one: to land,
   stop flying.
+- **Moving parts** (`craft_model`): propeller blades, wheels and the back half of each flap are
+  meshes of their own around their axle or hinge (`Pivot`, built with the vehicle mesh), drawn
+  turned each frame by `Looks` (eased): propellers spool with the throttle, wheels roll with the
+  speed over the ground while touching it and run down in the air, front wheels steer, flaps swing
+  by the deflection the physics used (`Vessel::flaps`, `steer`; SAS moves them too). Fixed wings
+  have nothing to move. `VesselState` carries these (and `touching`) so others see the same.
 - **Seats:** the first to sit flies it (`boarded`, as a rocket); anyone else aboard rides along
   and their clock is attached to the pilot's (`keep_ride`). Leaving the seat leaves the throttle
   where it is: an engine left on keeps running with nobody aboard (`Vessel::engines_on`).
+
+### Factories (factory/, app/factories.rs)
+- **Parts** (model blocks; what they hold lives in `Factory`, one per world, kept with the chests
+  and furnaces in `Survival` / `WorldState` and saved with them):
+  - `Conveyor`: carries up to `BELT_ITEMS` (4) items at `BELT_SPEED` (1.6 conveyor lengths a
+    second), about 6 items a second. It takes from what is behind it (a chest from its last slot, a
+    furnace's or a machine's output) and hands to what is in front (the next conveyor, straight on
+    at its start or from the side onto its middle; a chest; a furnace, smeltables into the input
+    and fuel into the fuel slot; a machine). A line only takes what its end can use (`Want`), so a
+    mixed chest feeds a generator just the fuel; for a machine it counts what is already on its
+    way down the line (`Machine::wants_more`), or a line feeding an arc furnace fills up with coal
+    and the sand never gets through. Two conveyors facing each other pass nothing. A low model you
+    walk over (`Block::collides` is false).
+  - **Bends:** a conveyor fed only from one side (nothing behind it: no conveyor running into
+    it, no container) comes round from that side (`Conveyor::bend`, worked out in `relink`).
+    Items come on at its start (`entry`) and follow a curve (`Place::at`, a quadratic Bezier
+    near a quarter circle); its model is a curved belt with rails (`models::conveyor_bend`,
+    `ModelState::bend`, which `bend_conveyors` keeps in step with the factory). Every player
+    works bends out for themselves. Placing an L of conveyors bends the corner.
+  - `PowerPole`: two blocks tall (the model; it occupies one cell). Cables (`Item::Cable`) join
+    poles and machines, up to `CABLE_REACH` (24 m); they hang from the top insulator
+    (`MachineKind::cable_height` for the taller machines).
+- **Machines** (`MachineKind`, one `Machine` struct: `input` + `more` ingredient slots, `fuel`,
+  `output`, `recipe`, `resource`; numbers in `MachineKind::power` and the constants at the top
+  of `factory/mod.rs`):
+  - `CoalGenerator`: `GENERATOR_POWER` (180 kW) whenever it has fuel, **whether anything uses it
+    or not** (the owner's rule: what nothing takes goes into accumulators, else to waste). Fuel
+    holds `FUEL_ENERGY` (90 kJ) per second it burns in a furnace (coal 7.2 MJ: 40 s).
+  - `Accumulator`: holds `ACCUMULATOR_ENERGY` (5 MJ, `Machine::energy`), takes or gives up to
+    `ACCUMULATOR_POWER` (300 kW).
+  - `ElectricFurnace` (90 kW): smelts, 5 s an item.
+  - `Miner` (60 kW): brings up what is under it for ever, `MINE_TIME` (2.5 s) an item: the best
+    ore within `MINER_DEPTH` (8) layers below and a column round it (`ore_rank`), else what the
+    block under it drops (`mined_from`). Decided when it is placed (`resource_under`, from loaded
+    chunks; the placer sends it as a `WorldEvent::Machine`). The ground isn't dug away. Its model
+    is a drilling rig `MINER_HEIGHT` (5) blocks tall: placing one needs the cells over it open, and
+    nothing can be placed inside it (`Survival::place`); only its bottom cell is solid.
+  - `OilPump` (50 kW): crude oil, `PUMP_TIME` (3 s) a barrel, if there is `OilShale` within
+    `PUMP_DEPTH` (24) layers below.
+  - Recipe machines (`factory/recipes.rs`, picked on their screen; each ingredient has its own
+    slot, and a line feeds a slot up to four batches' worth): `Refinery` (120 kW: fuel, plastic,
+    rubber from crude oil), `ArcFurnace` (150 kW: steel, silicon), `Assembler` (60 kW: wire,
+    insulated wire, cable, boards, batteries, screens, motherboards, power supplies, cases,
+    computers, conveyors), `ChipFab` (200 kW: wafers, LEDs, memory, CPUs, AI chips).
+    The chains are at the top of `recipes.rs`; `every_ingredient_can_be_made` checks they close.
+  - Crafted at the workbench (`crafting::factory_recipes`): the miner (with an iron pickaxe), pump,
+    refinery, arc furnace and assembler from metal, glass and furnaces; the chip fab needs circuit
+    boards and an assembler, the accumulator batteries.
+- **Power:** cables make networks (union-find in `relink`). Each tick a network's generators make
+  their full power, its machines with something to do ask for theirs and get it first (all slowed
+  alike when there isn't enough: `Machine::supply`), the rest charges accumulators (shared by how
+  much room each has), and when generators fall short the accumulators give what they can. Each
+  network keeps a minute of (made, used) per second (`History`, by its least member's cell so it
+  survives relinks) for the **power screen**: right click a pole or an accumulator
+  (`Screen::Power`, `Factory::power_view`): made, used, short or wasted, accumulators, a graph.
+- **Screens:** every machine opens `Screen::Machine(cell, kind)`. A recipe machine's lists what it
+  can make (`SlotId::Recipe`; click to pick, the card shows the ingredients); picking hands back
+  what was in the input slots (`Machine::set_recipe`). Its ingredient slots (`SlotId::MachineIn`)
+  take only their ingredient, and show it faintly while empty. The recipe travels with the
+  machine's slots (`machine_slots`), so a change is sent like any other.
+- **Scale** (the owner wants factories big): flat arrays, nothing per chunk, so factories run
+  anywhere, loaded or not, and on the other world too (`WorldState::run`, which also runs its
+  furnaces now). Links, bends, the stepping order (downstream first, so items move on without
+  waiting a tick per conveyor), what lines want, the network groups and the power networks are
+  worked out only when something is built, broken or turned (`relink`); chests and furnaces
+  coming and going call `Factory::touch`. Ticks are 1/20 s; under warp up to 0.1 s, within 2.5 ms
+  a frame, falling behind past that (at most 60 s). `a_big_factory_is_cheap`: 20,000 loaded
+  conveyors take about 0.12 ms a tick. In the game 12,000 conveyors carrying 14,000 items cost
+  about 2.3 ms a frame, mostly drawing. Models now keep their cell's centre (`Object::center`):
+  working it out for every model every frame was most of a big factory's cost.
+- **Drawing** (`factory/draw.rs`): an item on a conveyor is one cached mesh per (item, light),
+  drawn turned along the belt (round its bend), within 48 m; between ticks items are carried on by
+  the time since the last one, so they glide. Each cable is one mesh, built once.
+- **How machines look** (`render/models.rs`): what lights up while a machine works (windows,
+  flames, screens: where its lit front texture is brighter than the unlit one, `glow_face`; status
+  lamps; an accumulator's three charge tubes, filled to `ModelState::level` of `LEVELS`) is built
+  lit by itself (block light 15), so it glows at night. Moving parts (`moving_parts`, each a
+  `MovingPart` with a `Motion`) are meshes of their own (`part_model`), drawn every frame moved and
+  turned about their pivot (`survival::animate`, by real time; the work they do eases in and out
+  with the machine): the miner's drill string turning down into the ground and back, its top drive
+  and blinking beacon; the oil pump's rocking beam, rod and cranks; the generator's flywheel and
+  flickering fire (with smoke from its chimney); the refinery's and arc furnace's flicker; the chip
+  fab's fan. A drilling miner throws up dust. A held machine shows its parts at rest, a rig shrunk
+  to fit (`held_model`). The electronics' sprites (`textures/industry.rs`) are the game's own
+  parts, not pictures of real ones (a screen is just a glowing panel, a computer a server with its
+  lights, memory a glowing crystal); `cargo test --release write_industry_sprites -- --ignored`
+  writes them all, enlarged, to `target/industry_sprites.bmp`.
+- **Multiplayer:** only the host (and offline play) moves items in and out of containers
+  (`Factory::authority`); clients' conveyors only carry. Every 0.2 s the host sends each player
+  what rides the conveyors within 56 m (`Msg::Belts`, groups of 4 x 4 x 2 cells, whole groups so
+  empty conveyors clear: `NetBelts`), and every 0.5 s the containers conveyors changed
+  (`Survival::factory_news`). Machines run everywhere, like furnaces; `WorldEvent::Machine` is
+  the host's word. Cables and turned conveyors are world events. A screen only reports what the
+  player did in it (`Survival::clicked`), not what furnaces or conveyors changed.
+- **Trying it:** `factory industry` builds a row ahead (oil pump over oil shale into a refinery,
+  a miner on a bent belt, sand and coal through an arc furnace into a chip fab, copper into an
+  assembler; four generators, an accumulator, one pole). `factory open <machine|power>`,
+  `factory recipe <item>`, `factory status` (each machine's state).
+- Tests: `factory::tests` (items into a furnace, belt speed, what a line takes, power over a cable
+  and shared, generators always running, accumulators, an assembler fed by a line, one line
+  bringing two ingredients, a miner, bends, every ingredient can be made, side joins, without
+  authority, saving and what clients are sent, a big factory); `models::tests`
+  (`machines_move_while_they_work`, every model and moving part fits).
+
 
 ### Two worlds: home and the moon (app/worlds.rs)
 - **The moon is a block world** like home: its own `Planet` grid (512 chunks per face edge,
@@ -887,7 +1061,8 @@ shaders/
   camera (converted into its frame), drawn turned into the active frame
   (`DrawItem::rotation`, carried through the far pass): home with its atmosphere in the
   moon's sky, the moon (a bright disc) in home's. Its survival state (models, chests,
-  furnaces, drops, animals) waits in `OtherWorld::state` (`Survival::swap_world`).
+  furnaces, factories, drops, animals) waits in `OtherWorld::state` (`Survival::swap_world`);
+  its furnaces and factories keep running (`WorldState::run`).
 - **Switching** follows the player's craft (`follow_craft_world`): when the rocket or the
   floating player changes sphere of influence, the worlds swap, the player's state is
   rebased (`Bodies::rebase`) and the view turned (`Camera::rotate_frame`). Dying respawns at
@@ -896,7 +1071,10 @@ shaders/
   the active frame. The sky and lighting stay home's: `FrameParams::camera_planet` is the
   camera relative to *home*, the sun direction and star rotation are the active frame's, and
   particles fall towards `gravity_center` (the active world's centre). Moon surfaces are
-  lit by the sun (with home's shadow as an eclipse), without sky light.
+  lit by the sun (with home's shadow as an eclipse), without sky light. Above the air the
+  transmittance lookup (`transmittance_lut` in atmosphere.glsl, `entering_air` on the CPU) starts
+  where a ray enters the air, or is 1 if it misses it: clamping the radius to the top made every
+  ray sideways of home a grazing one, and the sun and moon went red for part of every month.
 - **Lunar terrain** (`TerrainGenerator::lunar_column`): dark maria (low basalt plains) and
   pale highlands, craters at four scales (cells of 3.2 km, 1.1 km, 360 m, 110 m: basins down
   to dimples) - bowl, rim and ejecta, hashed per cell of a 3D grid and kept within the
@@ -1010,9 +1188,17 @@ shaders/
   placed models, drops, animals on both worlds, rockets, maneuver nodes, molten lava) and
   `home.edits` / `moon.edits` (`WorldEdits::to_bytes`). Terrain isn't stored. To add saved
   data: a field on `SavedGame` or its parts; `#[serde(default)]` it so older saves still load.
-  - Saving: autosave every 3 minutes (written on another thread), on leaving, on closing
-    the window. Files appear whole (written to `.tmp`, then renamed). `read_world` checks
-    all of a save before the current world is touched.
+  - Saving: autosave every 2 minutes (`AUTOSAVE`; written on another thread), on leaving, on
+    closing the window, and 30 s after a moment worth keeping (`save_soon`: another world
+    reached, the window left). Files appear whole (written to `.tmp`, then renamed).
+    `read_world` checks all of a save before the current world is touched.
+  - Backups (`save::write_backup`, `<world>/backups/<unix time>[-crash]/`): a copy of the save
+    every 10 minutes played, the newest 6 kept, plus the 2 newest crash saves. A panic
+    mid-frame is caught (`App::window_event`) and the world saved into a crash backup
+    (`save_on_crash`; not over the save, as it may be mid-change); an error that stops the game
+    (the graphics failing) saves normally first. Opening a world (`read_newest`) starts from a
+    crash save newer than the save, and from the newest readable backup if the save is damaged,
+    and says so. Not while dead. `crash` in the console tests it.
   - Light sources aren't stored: they are lit again once the chunks around them have loaded
     (`apply_pending_lights`).
   - Not saved: the weather (it starts fresh from the seed), rivers of lava in mid-flow (what
@@ -1038,6 +1224,21 @@ shaders/
   it for that player, and the client holds it (`early`) until its world is built. Then it
   says `Ready` and gets the live, unreliable traffic.
 - **Things have ids** (`Survival::new_id`: player number << 24 | counter), not indices.
+- **Vessels:** the pilot sends theirs 20 times a second; ones nobody flies are the host's, sent
+  every 0.1 s while physics moves them, every 0.5 s on rails, and once (reliably) when they come
+  to rest (`Multiplayer::parked`): without that, the others carried a parked vehicle on in a
+  straight line, off into the sky. News is carried on to the receiver's time (`vessel_at`) and
+  then eased into (`Vessel::shown_offset`, `shown_turn`, `ease_news`): what is drawn (`grid_pose`,
+  `world_position`) glides over in about 0.15 s instead of jumping with every message.
+  Someone sitting in a seat is drawn sitting, facing the way the seat does (`aboard_world`).
+  News of a parked vessel is placed where it rests at the receiver's time (`vessel_at`): placed at
+  the sender's, every message moved it by the planet's turn between the clocks (metres, 20 times a
+  second from a pilot sitting still). News of a parked vessel nobody flies moving with its engines
+  off is late (unreliable overtaking the reliable "parked") and is dropped.
+  A seat broken while sat in stands its pilot or passenger up (`lose_missing_seats`).
+  A part knocked off in a crash goes out as `CraftChange::Crash` (the first; the rest as `Take`),
+  so the others see the bang too (`crash_bang`). Trees a vehicle knocks down go out as broken
+  blocks.
 - **Hitting each other:** left click on another player's figure, aimed at where it is drawn here
   (`person_in_sights`; not someone at another time). It costs and wears like hitting an animal, and
   sends `Msg::PlayerHit`. The one hit decides what it does (`player_hit_here`): armor counts, half a
@@ -1127,7 +1328,7 @@ shaders/
 - Deep underground (2.5-38 km), about 1.6-3.6k chunks are loaded, at 550-720 FPS, using
   roughly 60-200 MB of mesh VRAM (LOD is not drawn underground). A 5 km/s
   autofly straight through the core works, but streaming falls behind at that speed.
-- The planet has 44,960 layers and 10 shells (surface radius 43.9 km).
+- The planet has 44,960 layers and 12 shells (surface radius 43.9 km).
 
 ## Known limitations / likely next steps
 - Particles: no GPU-side spawning yet (rain splashes, sparks that make sparks), no
@@ -1148,8 +1349,22 @@ shaders/
   - lava
   - a player model in the inventory screen
   - armor drawn on the player
+- Deep blocks are up to 2:1 tall: every shell runs from about 1.05 m wide at its top to 0.53 m at its
+  bottom (the grid can only halve), while layers stay 1 m. The fix would be deep layers as thick as
+  their blocks are wide (below the surface's first km), which moves deep edits in old saves.
 - Water doesn't flow. Edited cells don't update the fake sky light, and LOD tiles don't show
   edits. Worlds all have the same size; the seed is the only thing that differs.
+- Factories: conveyors only run level (no going up or down), and there are no splitters,
+  filters or inserters apart from a conveyor's own pull. Every placed model and every item on a
+  conveyor is its own draw: per-chunk batched model meshes (or instancing) are the next step for
+  huge factories in view. A client's container changes race with the host's conveyors (the last
+  whole-container message wins). Lights of the world you aren't on wait until you are back.
+  Miners and pumps never run out and don't dig the ground away. A recipe machine with more
+  outputs than one (a refinery making fuel and plastic together) isn't possible: each recipe has
+  one product. Computers and AI chips are only items so far (nothing uses them; AI servers were
+  taken out, and saves that had them load them as computers). A miner's rig is solid only in its
+  bottom cell: you can walk through the tower from a block beside it. Fuel burns in
+  generators and furnaces but doesn't fill a vehicle's tanks.
 - Vehicles: no docking or staging, no parachutes, no water (they sink through it). Blocks with
   their own contents (chests, furnaces, torches, crafting tables) can't go on one. Walking aboard
   has no ladders: build steps of blocks. Deck gravity always points at the deck, even upside down.
@@ -1159,8 +1374,8 @@ shaders/
     solid for it.
   - Only the boarded rocket gets full physics; empty ones coast on rails (physics only in
     the air). Floating outside you can't move (no jetpack).
-  - Only one block world is loaded at a time: the other keeps far terrain only and its
-    furnaces pause.
+  - Only one block world is loaded at a time: the other keeps far terrain only (its
+    furnaces and factories still run: `WorldState::run`).
   - Patched conics only (as KSP): no n-body effects. Map paths around the moon are drawn
     around where the moon is at the encounter.
   - No parachutes or landing legs; the heat model is gameplay-tuned.

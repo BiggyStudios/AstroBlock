@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod effects;
+mod factory;
 mod flight;
 mod mobs;
 mod net;

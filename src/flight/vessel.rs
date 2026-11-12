@@ -31,7 +31,10 @@
 
 use glam::{DMat3, DQuat, DVec3};
 
-use super::craft::{At, Craft, Part};
+use super::{
+    craft::{At, Craft, Part},
+    craft_model::{Looks, Pivot},
+};
 use crate::{
     player::{self, Voxels},
     render::MeshHandle,
@@ -41,12 +44,14 @@ use crate::{
         conic::Conic,
         trajectory,
     },
-    world::{noise::smoothstep, planet::Planet},
+    world::{chunk::BlockCell, noise::smoothstep, planet::Planet},
 };
 
 /// Mass without fuel, and of a full tank (kg).
 pub const DRY_MASS: f64 = 2_200.0;
 pub const FUEL_CAPACITY: f64 = 800.0;
+/// What `Vessel::fill_up` gives a vehicle without tanks (kg): more than any frame burns.
+const TANKLESS_FUEL: f64 = 50.0;
 /// Engine thrust (N): barely more than the weight of a full rocket at the surface (1.26
 /// times), so lift-off is slow and how you spend the fuel matters.
 pub const THRUST: f64 = 37_000.0;
@@ -96,6 +101,10 @@ pub const MAX_TEMPERATURE: f64 = 1_700.0;
 const STEFAN_BOLTZMANN: f64 = 5.670_374e-8;
 /// Rails warp stops this far (m) above an airless surface.
 pub const RAILS_CLEARANCE: f64 = 3_000.0;
+/// How fast a vessel drawn from someone else's news catches up with the latest (s), and how
+/// far off it may be before it simply jumps there (m).
+const NEWS_EASE: f64 = 0.15;
+const NEWS_SNAP: f64 = 40.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SasMode {
@@ -180,12 +189,7 @@ pub struct Env<'a> {
 
 /// Engine off and clear of air and ground: this thing simply follows its conic.
 pub fn coasting(bodies: &Bodies, body: Body, position: DVec3, throttle: f64) -> bool {
-    let r = position.length();
-    let clear = match bodies.atmosphere_top(body) {
-        Some(top) => r > top,
-        None => r > bodies.radius(body) + RAILS_CLEARANCE,
-    };
-    throttle == 0.0 && clear
+    throttle == 0.0 && position.length() > bodies.rails_floor(body, RAILS_CLEARANCE)
 }
 
 fn full_tank() -> f64 {
@@ -239,6 +243,9 @@ pub struct Vessel {
     /// The `Craft::version` the mesh was built from.
     #[serde(skip)]
     pub mesh_version: u32,
+    /// The light the mesh was built with (sky << 4 | block).
+    #[serde(skip)]
+    pub mesh_light: u32,
     /// How long it has sat still on the ground (s).
     #[serde(skip)]
     pub(super) still: f64,
@@ -251,9 +258,41 @@ pub struct Vessel {
     /// What has come off since the game last looked.
     #[serde(skip)]
     pub broke_off: Vec<Part>,
+    /// Grown trees it has run into since the game last looked (the game knocks them down).
+    #[serde(skip)]
+    pub felled: Vec<BlockCell>,
+    /// Someone else's, seen here: how far the drawn vessel still is from where the latest
+    /// news puts it (inertial), and how it is still turned from there. Both ease away
+    /// (`ease_news`), so news doesn't make it jump.
+    #[serde(skip)]
+    pub shown_offset: DVec3,
+    #[serde(skip)]
+    pub shown_turn: DQuat,
+    /// What the physics last did with the moving parts (and others are told): each surface's
+    /// flap deflection (-1..1, by `Stats::surfaces`; 0 for wings), and the front wheels' angle
+    /// (rad).
+    #[serde(skip)]
+    pub flaps: Vec<f32>,
+    #[serde(skip)]
+    pub steer: f32,
+    /// The moving pieces' meshes (built with `mesh`), and what they are doing as drawn.
+    #[serde(skip)]
+    pub moving: Vec<(Pivot, MeshHandle)>,
+    #[serde(skip)]
+    pub looks: Looks,
 }
 
 impl Vessel {
+    /// Takes every mesh it has (to free them).
+    pub fn take_meshes(&mut self) -> Vec<MeshHandle> {
+        let moving = std::mem::take(&mut self.moving);
+        self.mesh
+            .take()
+            .into_iter()
+            .chain(moving.into_iter().map(|(_, m)| m))
+            .collect()
+    }
+
     /// A vessel standing upright on `body` with its engine at `base` (that body's frame).
     pub fn on_pad(bodies: &Bodies, body: Body, base: DVec3, t: f64) -> Self {
         let up = base.normalize_or(DVec3::Y);
@@ -288,10 +327,18 @@ impl Vessel {
             mesh: None,
             craft: None,
             mesh_version: 0,
+            mesh_light: 0,
             still: 0.0,
             touching: false,
             breaking: Vec::new(),
             broke_off: Vec::new(),
+            felled: Vec::new(),
+            shown_offset: DVec3::ZERO,
+            shown_turn: DQuat::IDENTITY,
+            flaps: Vec::new(),
+            steer: 0.0,
+            moving: Vec::new(),
+            looks: Looks::default(),
         };
         vessel.sync_landed(bodies, t);
         vessel
@@ -361,13 +408,32 @@ impl Vessel {
     }
 
     /// Knocks a part off in a collision (with whatever only it held on).
-    pub(super) fn break_part(&mut self, at: At) {
+    pub fn break_part(&mut self, at: At) {
         let mut removed = crate::flight::craft::Removed::default();
         self.rebuild_craft(|c| removed = c.remove(at));
         if removed.core_gone {
             self.destroyed = Some("crashed");
         }
         self.broke_off.extend(removed.parts);
+    }
+
+    /// A full tank at once (`fuel infinite`). A vehicle without tanks gets enough for its
+    /// engines to run (it weighs nothing: there is nowhere to put it). The parts stay where
+    /// they are as the centre of mass moves.
+    pub fn fill_up(&mut self) {
+        let full = match &self.craft {
+            Some(c) if c.stats.capacity > 0.0 => c.stats.capacity,
+            Some(_) => TANKLESS_FUEL,
+            None => FUEL_CAPACITY,
+        };
+        if self.fuel >= full {
+            return;
+        }
+        if let Some(c) = &self.craft {
+            let shift = c.massing(full).com - c.massing(self.fuel).com;
+            self.position += self.attitude * shift;
+        }
+        self.fuel = full;
     }
 
     /// The throttle is up and there is an engine with something to burn. (Not for use inside a
@@ -448,7 +514,36 @@ impl Vessel {
 
     /// Where the centre of mass is in the frame the game draws in (the `active` body's).
     pub fn world_position(&self, bodies: &Bodies, active: Body, t: f64) -> DVec3 {
-        bodies.view(active, self.body, self.position, t)
+        bodies.view(active, self.body, self.position + self.shown_offset, t)
+    }
+
+    /// The attitude it is drawn with (see `shown_turn`).
+    pub fn shown_attitude(&self) -> DQuat {
+        (self.shown_turn * self.attitude).normalize()
+    }
+
+    /// News of someone else's vessel has just moved it from where it was drawn (`before`:
+    /// position and attitude): it is drawn there still, and eases over (`ease_news`).
+    pub fn news_moved(&mut self, body_before: Body, before: (DVec3, DQuat)) {
+        let offset = before.0 - self.position;
+        let turn = (before.1 * self.attitude.inverse()).normalize();
+        if body_before == self.body && offset.length() < NEWS_SNAP && turn.w.abs() > 0.7 {
+            self.shown_offset = offset;
+            self.shown_turn = turn;
+        } else {
+            self.shown_offset = DVec3::ZERO;
+            self.shown_turn = DQuat::IDENTITY;
+        }
+    }
+
+    /// What is drawn catches up with the news (`dt` in real seconds).
+    pub fn ease_news(&mut self, dt: f64) {
+        let keep = (-dt / NEWS_EASE).exp();
+        self.shown_offset *= keep;
+        self.shown_turn = DQuat::IDENTITY.slerp(self.shown_turn, keep).normalize();
+        if self.shown_offset.length_squared() < 1e-8 {
+            self.shown_offset = DVec3::ZERO;
+        }
     }
 
     /// The air around it: density (kg/m^3) and the velocity relative to that air (inertial).
@@ -540,7 +635,22 @@ impl Vessel {
         self.position = r;
         self.velocity = v;
         self.spin = DVec3::ZERO;
+        self.feel_the_sun(bodies);
         (t, stopped)
+    }
+
+    /// Near the star: its light heats the hull (at least to what sunlight alone makes it), and
+    /// inside its hot zone it burns up.
+    fn feel_the_sun(&mut self, bodies: &Bodies) {
+        let Some(hot) = bodies.hot_zone(self.body) else {
+            return;
+        };
+        let distance = self.position.length();
+        let sunlit = bodies.sunlit_temperature(distance, MAX_TEMPERATURE);
+        self.temperature = self.temperature.max(sunlit.min(MAX_TEMPERATURE));
+        if distance <= hot + 1.0 {
+            self.destroyed = Some("burned up near the sun");
+        }
     }
 
     /// Physics from `t0` to `t1`. `target` is SAS's direction (from `sas_direction`).
@@ -567,6 +677,7 @@ impl Vessel {
             } else {
                 self.step(env, controls, t0 + dt * i as f64, dt, target);
             }
+            self.feel_the_sun(env.bodies);
         }
     }
 
@@ -1036,6 +1147,34 @@ mod tests {
         println!("left the home planet's influence after {hours:.1} h");
         assert_eq!(body, Body::Star, "it does escape");
         assert!(hours > 2.0, "out after {hours} h");
+    }
+
+    /// Falling towards the sun the hull heats up on the way, and it burns up before it gets
+    /// there: on rails (time warp) too, which used to carry it to 3 km over the surface.
+    #[test]
+    fn a_craft_falling_into_the_sun_burns_up_on_the_way() {
+        let (_, bodies) = setup();
+        let star = bodies.radius(Body::Star);
+        let mut v = in_orbit(&bodies, 30_000.0);
+        v.body = Body::Star;
+        v.position = DVec3::X * star * 20.0;
+        // Mostly falling, a little sideways: periapsis inside the star.
+        v.velocity = DVec3::new(-200_000.0, 0.0, 20_000.0);
+        let mut t = 0.0;
+        let mut hottest = 0.0f64;
+        while v.destroyed.is_none() && t < 1.0e6 {
+            let (reached, _) = v.rails(&bodies, (t, t + 600.0));
+            assert!(reached > t || v.destroyed.is_some(), "stuck at {t}");
+            t = reached;
+            hottest = hottest.max(v.temperature);
+        }
+        assert_eq!(v.destroyed, Some("burned up near the sun"));
+        let r = v.position.length() / star;
+        assert!((3.4..3.6).contains(&r), "burned up {r} star radii out");
+        assert!(hottest > 1_600.0, "{hottest} K");
+        // Far out, sunlight hardly warms it.
+        let far = bodies.sunlit_temperature(bodies.system.planet.orbit.semi_major_axis, 1_700.0);
+        assert!((200.0..240.0).contains(&far), "{far} K at home's distance");
     }
 
     #[test]

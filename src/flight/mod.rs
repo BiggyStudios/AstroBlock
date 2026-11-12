@@ -4,6 +4,7 @@
 pub mod craft;
 pub mod craft_model;
 mod craft_physics;
+pub use craft_physics::meet_each_other;
 pub mod hud;
 pub mod map_view;
 pub mod rocket_model;

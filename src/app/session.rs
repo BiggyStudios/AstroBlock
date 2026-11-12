@@ -39,8 +39,13 @@ use crate::{
     world::{chunk::BlockCell, edits::WorldEdits},
 };
 
-/// Seconds between automatic saves.
-const AUTOSAVE: f64 = 180.0;
+/// Seconds between automatic saves; a save asked for by a moment worth keeping (`save_soon`)
+/// waits until this long after the last one. (A save takes a few milliseconds on this thread;
+/// the writing happens on another.)
+const AUTOSAVE: f64 = 120.0;
+const SOON_GAP: f64 = 30.0;
+/// Seconds played between backups (`save::write_backup`).
+const BACKUP_EVERY: f64 = 600.0;
 /// Game seconds per real second behind the main menu.
 const BACKDROP_TIME: f64 = 4.0;
 /// The menu camera's height above home's sea level (m).
@@ -58,6 +63,12 @@ pub(super) struct Session {
     pub dir: PathBuf,
     pub meta: WorldMeta,
     last_save: Instant,
+    /// Something worth keeping happened: save as soon as `SOON_GAP` allows.
+    soon: bool,
+    /// Seconds played at the last backup.
+    backed_up: f64,
+    /// Said once the world is on screen (it came from a backup).
+    note: Option<String>,
     /// What the players who joined this world had, by who they are.
     players: BTreeMap<String, String>,
 }
@@ -71,8 +82,11 @@ impl Session {
             .unwrap_or_default();
         Self {
             dir,
+            backed_up: meta.played,
             meta,
             last_save: Instant::now(),
+            soon: false,
+            note: None,
             players,
         }
     }
@@ -323,12 +337,14 @@ impl Game {
         let Some(entry) = self.worlds.get(index).cloned() else {
             return;
         };
-        match read_world(&entry.dir) {
-            Ok((saved, home, moon)) => {
+        match read_newest(&entry.dir) {
+            Ok(((saved, home, moon), note)) => {
                 let name = entry.meta.name.clone();
+                let mut session = Session::new(entry.dir, entry.meta);
+                session.note = note;
                 self.begin_opening(
                     Opening::Load {
-                        session: Box::new(Session::new(entry.dir, entry.meta)),
+                        session: Box::new(session),
                         saved: Box::new(saved),
                         home,
                         moon,
@@ -398,6 +414,9 @@ impl Game {
             let next = self.backdrop.then_some(Page::Main);
             if let Some(menu) = &mut self.menu {
                 menu.finish_loading(next);
+            }
+            if let Some(note) = self.session.as_mut().and_then(|s| s.note.take()) {
+                self.message = Some((note, Instant::now()));
             }
         }
         Ok(())
@@ -556,8 +575,65 @@ impl Game {
     /// is on disk; otherwise the writing happens on another thread.
     pub(super) fn save_world(&mut self, wait: bool) -> Result<()> {
         self.finish_saving()?;
-        if self.session.is_none() {
+        let Some((dir, files)) = self.save_files()? else {
             return Ok(());
+        };
+        let session = self.session.as_mut().expect("the files came from it");
+        session.last_save = Instant::now();
+        session.soon = false;
+        // Every so often a copy goes into the backups as well.
+        let backup = session.meta.played - session.backed_up >= BACKUP_EVERY;
+        if backup {
+            session.backed_up = session.meta.played;
+        }
+        let write = move || -> Result<()> {
+            let copy = backup.then(|| files.clone());
+            save::write_files(&dir, files)?;
+            if let Some(copy) = copy {
+                save::write_backup(&dir, copy, false)?;
+            }
+            Ok(())
+        };
+        if wait {
+            return write();
+        }
+        self.save_thread = Some(std::thread::spawn(write));
+        Ok(())
+    }
+
+    /// The game is going down (a panic): what it has goes into a crash backup rather than over
+    /// the save, since it may have been caught halfway through a change. Opening the world
+    /// next time starts from it (`read_newest`).
+    pub(super) fn save_on_crash(&mut self) {
+        if self.death.is_some() {
+            return; // (The last save has them alive.)
+        }
+        if let Err(e) = self.finish_saving() {
+            log::error!("{e:#}");
+        }
+        match self.save_files() {
+            Ok(Some((dir, files))) => match save::write_backup(&dir, files, true) {
+                Ok(()) => log::info!("saved the world as it was when the game crashed"),
+                Err(e) => log::error!("could not save after the crash: {e:#}"),
+            },
+            Ok(None) => {}
+            Err(e) => log::error!("could not save after the crash: {e:#}"),
+        }
+    }
+
+    /// Something worth keeping happened (another world reached, the window left): save as
+    /// soon as `SOON_GAP` allows.
+    pub(super) fn save_soon(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.soon = true;
+        }
+    }
+
+    /// The files a save is made of, and the world's folder (none: it isn't a saved world).
+    #[allow(clippy::type_complexity)]
+    fn save_files(&mut self) -> Result<Option<(PathBuf, Vec<(String, Vec<u8>)>)>> {
+        if self.session.is_none() {
+            return Ok(None);
         }
         let state = serde_json::to_vec(&self.saved_game())?;
         let (home, moon) = if self.active == Body::Planet {
@@ -571,7 +647,6 @@ impl Game {
         let session = self.session.as_mut().expect("checked above");
         session.meta.mode = mode;
         session.meta.last_played = save::unix_now();
-        session.last_save = Instant::now();
         let files = vec![
             (
                 "world.json".to_string(),
@@ -582,12 +657,7 @@ impl Game {
             ("home.edits".to_string(), home),
             ("moon.edits".to_string(), moon),
         ];
-        let dir = session.dir.clone();
-        if wait {
-            return save::write_files(&dir, files);
-        }
-        self.save_thread = Some(std::thread::spawn(move || save::write_files(&dir, files)));
-        Ok(())
+        Ok(Some((session.dir.clone(), files)))
     }
 
     /// Waits for a save still being written.
@@ -605,8 +675,10 @@ impl Game {
             return;
         };
         session.meta.played += dt;
+        let since = session.last_save.elapsed().as_secs_f64();
+        let due = since >= AUTOSAVE || (session.soon && since >= SOON_GAP);
         // (Not while dead: the save would come back alive in the wreck.)
-        if session.last_save.elapsed().as_secs_f64() < AUTOSAVE || self.death.is_some() {
+        if !due || self.death.is_some() {
             return;
         }
         if let Err(e) = self.save_world(false) {
@@ -615,7 +687,8 @@ impl Game {
         }
     }
 
-    /// The window is closing.
+    /// The window is closing, or the game stops on an error that left the world itself whole
+    /// (the graphics failing, say).
     pub(super) fn save_on_exit(&mut self) {
         self.respawn();
         self.store_settings();
@@ -841,8 +914,42 @@ impl Game {
     }
 }
 
+/// A saved world as read from disk: its state, and the blocks changed at home and on the moon.
+type WorldFiles = (SavedGame, Vec<u8>, Vec<u8>);
+
+/// What opening a world starts from: its save, unless the game crashed after that save (a
+/// crash backup newer than it has more), or the save can't be read (then the newest backup
+/// that can). Says which, if not the save.
+fn read_newest(dir: &std::path::Path) -> Result<(WorldFiles, Option<String>)> {
+    let saved_at = save::written_at(&dir.join("state.json"));
+    let backups = save::backups(dir);
+    let now = save::unix_now();
+    if let Some(crash) = backups.iter().find(|b| b.crash && b.time > saved_at) {
+        match read_world(&crash.dir) {
+            Ok(world) => {
+                let note = "carried on from when the game crashed".to_string();
+                return Ok((world, Some(note)));
+            }
+            Err(e) => log::error!("the crash save {}: {e:#}", crash.dir.display()),
+        }
+    }
+    let error = match read_world(dir) {
+        Ok(world) => return Ok((world, None)),
+        Err(e) => e,
+    };
+    log::error!("the save of {}: {error:#}", dir.display());
+    for backup in &backups {
+        if let Ok(world) = read_world(&backup.dir) {
+            let when = save::format_ago(backup.time, now);
+            let note = format!("the save was damaged: loaded the backup from {when}");
+            return Ok((world, Some(note)));
+        }
+    }
+    Err(error)
+}
+
 /// A saved world's files. Nothing is changed unless all of them read correctly.
-fn read_world(dir: &std::path::Path) -> Result<(SavedGame, Vec<u8>, Vec<u8>)> {
+fn read_world(dir: &std::path::Path) -> Result<WorldFiles> {
     let state = std::fs::read(dir.join("state.json")).context("reading its save")?;
     let saved: SavedGame = serde_json::from_slice(&state).context("reading its save")?;
     if saved.version > SAVE_VERSION {

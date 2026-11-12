@@ -25,10 +25,13 @@ use crate::{
         vessel::Vessel,
     },
     net::protocol::{AboardPose, CraftChange, Msg},
-    player::{GameMode, HALF_WIDTH, HEIGHT, PlayerInput},
+    player::{GameMode, HALF_WIDTH, HEIGHT, PlayerInput, interact},
     render::{DrawItem, Fade, ParticleEmitter, models::Light},
     survival::items::{self, Item, ItemStack},
-    world::block::{Block, Material},
+    world::{
+        block::{Block, Material},
+        chunk::BlockCell,
+    },
 };
 
 /// Walking aboard: speeds (m/s), accelerations (m/s^2), a jump, and the deck's pull, which is
@@ -173,7 +176,7 @@ impl Game {
     /// taking grid axes into it.
     pub(super) fn grid_pose(&self, v: &Vessel) -> (DVec3, DQuat) {
         let frame = self.active_frame(self.time);
-        let to_world = (frame.rotation.inverse() * v.attitude).normalize();
+        let to_world = (frame.rotation.inverse() * v.shown_attitude()).normalize();
         let com = v.world_position(&self.bodies, self.active, self.time);
         (com - to_world * v.com(), to_world)
     }
@@ -219,6 +222,10 @@ impl Game {
             self.say("Start a vehicle on top of a block");
             return true;
         }
+        if above.is_some_and(|c| self.vehicle_in_cell(c)) {
+            self.say("There is a vehicle there");
+            return true;
+        }
         let n = self.planet.res_at(cell.k);
         let up = self
             .planet
@@ -237,6 +244,39 @@ impl Game {
             .push((Sound::Place(Material::Stone), core));
         self.say("A new vehicle: build onto the core. R turns engines and wings");
         true
+    }
+
+    /// Some vehicle has a part in (or reaching well into) this block cell: nothing can be
+    /// placed there.
+    pub(super) fn vehicle_in_cell(&self, cell: BlockCell) -> bool {
+        let center = interact::cell_center(&self.planet, cell);
+        self.flight.vessels.iter().any(|v| {
+            let Some(craft) = &v.craft else {
+                return false;
+            };
+            let (grid, to_world) = self.grid_pose(v);
+            if (center - grid).length() > craft.stats.radius + 2.0 {
+                return false;
+            }
+            let local = to_world.inverse() * (center - grid);
+            // The middle of the cell and its corners drawn in a little (cells are about a
+            // meter, and the grids are turned against each other).
+            let inset = 0.38;
+            std::iter::once(DVec3::ZERO)
+                .chain((0..8).map(|i| {
+                    DVec3::new(
+                        if i & 1 == 0 { -inset } else { inset },
+                        if i & 2 == 0 { -inset } else { inset },
+                        if i & 4 == 0 { -inset } else { inset },
+                    )
+                }))
+                .any(|d| {
+                    let p = local + d;
+                    craft
+                        .get([p.x.round() as i16, p.y.round() as i16, p.z.round() as i16])
+                        .is_some()
+                })
+        })
     }
 
     fn say(&mut self, text: &str) {
@@ -331,7 +371,7 @@ impl Game {
         self.place_vehicle_part(hit);
     }
 
-    fn break_vehicle_part(&mut self, hit: CraftHit) {
+    pub(super) fn break_vehicle_part(&mut self, hit: CraftHit) {
         let v = &mut self.flight.vessels[hit.vessel];
         if v.pilot.is_some() && hit.at == [0, 0, 0] {
             self.say("Someone is flying it");
@@ -430,19 +470,31 @@ impl Game {
 
     /// News of someone changing a vehicle.
     pub(super) fn apply_craft_change(&mut self, vessel: u32, change: CraftChange) {
-        let Some(v) = self.flight.vessels.iter_mut().find(|v| v.id == vessel) else {
+        let Some(i) = self.flight.vessels.iter().position(|v| v.id == vessel) else {
             return;
         };
+        if let CraftChange::Crash(at) = change
+            && self.flight.vessels[i]
+                .craft
+                .as_ref()
+                .is_some_and(|c| c.get(at).is_some())
+        {
+            // The bang the one who saw it break made.
+            log::debug!("vehicle {vessel} lost a part in a crash");
+            let (grid, to_world) = self.grid_pose(&self.flight.vessels[i]);
+            self.crash_bang(grid + to_world * craft::center(at));
+        }
+        let v = &mut self.flight.vessels[i];
         match change {
             CraftChange::Put(part) => {
                 v.rebuild_craft(|c| {
                     c.place(part);
                 });
             }
-            CraftChange::Take(at) => {
-                let mut gone = false;
-                v.rebuild_craft(|c| gone = c.remove(at).core_gone);
-                let _ = gone;
+            CraftChange::Take(at) | CraftChange::Crash(at) => {
+                v.rebuild_craft(|c| {
+                    c.remove(at);
+                });
             }
         }
     }
@@ -450,8 +502,16 @@ impl Game {
     /// The console's `place` and `break`, on a vehicle (a test without a mouse). Returns
     /// whether there was one to act on.
     pub(super) fn console_vehicle_click(&mut self, place: bool) -> bool {
+        let count = self.flight.vessels.len();
         if place && self.place_core(true) {
-            self.console.print("Started a vehicle");
+            let text = if self.flight.vessels.len() > count {
+                "Started a vehicle".to_string()
+            } else {
+                self.message
+                    .as_ref()
+                    .map_or_else(String::new, |(m, _)| m.clone())
+            };
+            self.console.print(text);
             return true;
         }
         let Some(hit) = self.craft_target(8.0) else {
@@ -540,6 +600,37 @@ impl Game {
             seat: Some(seat),
         });
         self.say("Along for the ride: f to stand up");
+    }
+
+    /// A seat broken (by someone else, or knocked off) while sat in: whoever was in it stands
+    /// up where it was, still aboard (the pilot gives up the controls).
+    pub(super) fn lose_missing_seats(&mut self) {
+        let is_seat = |v: &crate::flight::vessel::Vessel, at: At| {
+            v.craft
+                .as_ref()
+                .and_then(|c| c.get(at))
+                .is_some_and(|p| p.block == Block::Seat)
+        };
+        if let Some(i) = self.flight.boarded
+            && self.flight.vessels[i].craft.is_some()
+        {
+            let v = &self.flight.vessels[i];
+            let gone = match self.flight.seat {
+                Some(seat) => !is_seat(v, seat),
+                None => v.craft.as_ref().is_some_and(|c| c.stats.seats.is_empty()),
+            };
+            if gone {
+                self.exit_vessel();
+                self.say("Your seat is gone");
+            }
+        }
+        if let Some(a) = &mut self.flight.aboard
+            && let Some(seat) = a.seat
+            && !is_seat(&self.flight.vessels[a.vessel], seat)
+        {
+            a.seat = None;
+            self.say("Your seat is gone");
+        }
     }
 
     /// Gets up from flying: stands by the seat, still aboard.
@@ -765,19 +856,86 @@ impl Game {
         })
     }
 
-    /// Where someone aboard (by what they last said) is in the world.
-    pub(super) fn aboard_world(&self, pose: &AboardPose) -> Option<(DVec3, DVec3)> {
+    /// Where someone aboard (by what they last said) is in the world: their feet, the deck's
+    /// up, and, in a seat, the way it faces.
+    pub(super) fn aboard_world(&self, pose: &AboardPose) -> Option<(DVec3, DVec3, Option<DVec3>)> {
         let v = self.flight.vessels.iter().find(|v| v.id == pose.vessel)?;
         let (grid, to_world) = self.grid_pose(v);
-        Some((grid + to_world * pose.feet.as_dvec3(), to_world * DVec3::Y))
+        let feet = pose.feet.as_dvec3();
+        let facing = pose
+            .seat
+            .then(|| {
+                let at = feet + DVec3::Y * 0.3;
+                let at = [
+                    at.x.round() as i16,
+                    at.y.round() as i16,
+                    at.z.round() as i16,
+                ];
+                v.craft.as_ref()?.get(at).filter(|p| p.block == Block::Seat)
+            })
+            .flatten()
+            .map(|p| {
+                let d = craft::direction(p.facing);
+                to_world * if d.y.abs() > 0.5 { DVec3::Z } else { d }
+            });
+        Some((grid + to_world * feet, to_world * DVec3::Y, facing))
     }
 
-    /// One vehicle's mesh (rebuilt when its parts change), and the outline on the part
-    /// the crosshair is on.
+    /// Flying a vehicle seen from outside: yourself, sitting in the seat.
+    pub(super) fn own_figure_draw_item(
+        &mut self,
+        objects: &mut Vec<DrawItem>,
+    ) -> anyhow::Result<()> {
+        let seated = if self.flight.cockpit || self.flight.map || self.death.is_some() {
+            None
+        } else {
+            self.flight
+                .boarded
+                .filter(|&i| self.flight.vessels[i].craft.is_some())
+                .and_then(|_| self.aboard_pose())
+                .and_then(|pose| self.aboard_world(&pose))
+        };
+        let Some((feet, up, facing)) = seated else {
+            if let Some(old) = self.flight.figure.take() {
+                self.renderer.destroy_mesh(old);
+            }
+            return Ok(());
+        };
+        let up = up.normalize_or(DVec3::Y);
+        let forward = facing.unwrap_or(up.any_orthonormal_vector());
+        let light = self.light_at(feet + up);
+        let mesh = crate::player::avatar::avatar_model(
+            &crate::player::avatar::AvatarPose {
+                sitting: facing.is_some(),
+                ..Default::default()
+            },
+            (forward, up),
+            light,
+        );
+        if let Some(handle) = self.renderer.create_mesh(&mesh)?
+            && let Some(old) = self.flight.figure.replace(handle)
+        {
+            self.renderer.destroy_mesh(old);
+        }
+        if let Some(mesh) = self.flight.figure {
+            objects.push(DrawItem {
+                mesh,
+                origin: self.planet.center + feet,
+                rotation: glam::Quat::IDENTITY,
+                radius: 2.0,
+                fade: Fade::Visible,
+            });
+        }
+        Ok(())
+    }
+
+    /// One vehicle's mesh (rebuilt when its parts change) and its moving pieces (propellers,
+    /// wheels, flaps), turned by what they are doing (`dt`: this frame, 0 when paused).
     pub(super) fn vehicle_draw_item(
         &mut self,
         i: usize,
         objects: &mut Vec<DrawItem>,
+        dt: f32,
     ) -> anyhow::Result<()> {
         let v = &self.flight.vessels[i];
         let Some(craft) = &v.craft else {
@@ -785,23 +943,85 @@ impl Game {
         };
         let (grid, to_world) = self.grid_pose(v);
         let radius = craft.stats.radius as f32 + 2.0;
-        if v.mesh_version != craft.version || v.mesh.is_none() {
+        // Lit as where it is (underground, in the core), rebuilt when that changes.
+        let light = self.light_at(grid + to_world * v.com());
+        let packed = light.sky << 4 | light.block;
+        if v.mesh_version != craft.version || v.mesh_light != packed || v.mesh.is_none() {
             let version = craft.version;
-            let mesh = craft_model::craft_model(craft, Light { sky: 15, block: 0 });
+            let (mesh, moving) = craft_model::craft_model(craft, light);
             if let Some(handle) = self.renderer.create_mesh(&mesh)? {
-                let v = &mut self.flight.vessels[i];
-                if let Some(old) = v.mesh.replace(handle) {
-                    self.renderer.destroy_mesh(old);
+                let mut handles = Vec::with_capacity(moving.len());
+                for (pivot, mesh) in &moving {
+                    if let Some(h) = self.renderer.create_mesh(mesh)? {
+                        handles.push((*pivot, h));
+                    }
                 }
-                v.mesh_version = version;
+                if handles.len() < moving.len() {
+                    // Out of upload room this frame: all of it again next frame (the old
+                    // meshes are drawn meanwhile).
+                    self.renderer.destroy_mesh(handle);
+                    for (_, h) in handles {
+                        self.renderer.destroy_mesh(h);
+                    }
+                } else {
+                    let v = &mut self.flight.vessels[i];
+                    for old in v.take_meshes() {
+                        self.renderer.destroy_mesh(old);
+                    }
+                    v.mesh = Some(handle);
+                    v.moving = handles;
+                    v.mesh_version = version;
+                    v.mesh_light = packed;
+                }
             }
         }
-        if let Some(mesh) = self.flight.vessels[i].mesh {
+
+        // What it is doing: the engines, the ground going by, the stick.
+        let v = &self.flight.vessels[i];
+        let ground_speed = match v.landed {
+            Some(_) => 0.0,
+            None => {
+                let frame = self.bodies.frame(v.body, self.time);
+                let omega = frame.rotation * frame.omega;
+                let over_ground = v.velocity - omega.cross(v.position);
+                let ahead = v.attitude * v.craft.as_ref().map_or(DVec3::Z, |c| c.stats.forward);
+                over_ground.dot(ahead) as f32
+            }
+        };
+        let flaps = std::mem::take(&mut self.flight.vessels[i].flaps);
+        let v = &mut self.flight.vessels[i];
+        let doing = craft_model::Doing {
+            power: if v.engines_on() {
+                v.throttle as f32
+            } else {
+                0.0
+            },
+            touching: v.touching || v.landed.is_some(),
+            ground_speed,
+            steer: v.steer,
+            flaps: &flaps,
+        };
+        v.looks.advance(&doing, dt);
+        v.flaps = flaps;
+
+        let v = &self.flight.vessels[i];
+        let up = v.craft.as_ref().map_or(DVec3::Y, |c| c.stats.up);
+        if let Some(mesh) = v.mesh {
             objects.push(DrawItem {
                 mesh,
                 origin: self.planet.center + grid,
                 rotation: to_world.as_quat(),
                 radius,
+                fade: Fade::Visible,
+            });
+        }
+        for (pivot, mesh) in &v.moving {
+            let turn = (to_world * v.looks.turn(pivot, up)).normalize();
+            objects.push(DrawItem {
+                mesh: *mesh,
+                origin: self.planet.center + grid + to_world * pivot.at,
+                rotation: turn.as_quat(),
+                radius: 1.6,
                 fade: Fade::Visible,
             });
         }

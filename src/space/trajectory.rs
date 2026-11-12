@@ -295,9 +295,7 @@ pub fn advance(
         if t >= t1 {
             break;
         }
-        let low = bodies
-            .atmosphere_top(body)
-            .unwrap_or(bodies.radius(body) + clearance);
+        let low = bodies.rails_floor(body, clearance);
         let (t_end, end) = next_event(bodies, body, r, v, t, t1, low);
         let (r1, v1) = propagate(bodies.mu(body), r, v, t_end - t);
         match end {

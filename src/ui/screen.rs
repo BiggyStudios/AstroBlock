@@ -11,11 +11,12 @@
 //! slots pop when items land in them, and a ready result glows softly.
 
 use crate::{
+    factory::{self, Machine, MachineKind, PowerView, recipes},
     render::UiVertex,
     survival::{
         furnace::Furnace,
         inventory::{HOTBAR, SLOTS, Slot},
-        items::{Item, ItemStack, ToolKind},
+        items::{Category, Item, ItemStack, ToolKind},
     },
     ui::{
         Ui,
@@ -33,12 +34,29 @@ pub enum Screen {
     Crafting(BlockCell),
     Furnace(BlockCell),
     Chest(BlockCell),
+    /// A factory machine: a generator's fuel, what a furnace smelts, what a recipe machine
+    /// makes (picked here), what a miner digs up.
+    Machine(BlockCell, MachineKind),
+    /// The power network a pole or accumulator is on.
+    Power(BlockCell),
 }
 
 /// Slots in a chest (three rows).
 pub const CHEST_SLOTS: usize = 27;
 
 impl Screen {
+    /// The block it belongs to (closed when that goes, or when you walk away).
+    pub fn cell(self) -> Option<BlockCell> {
+        match self {
+            Screen::Crafting(c)
+            | Screen::Furnace(c)
+            | Screen::Chest(c)
+            | Screen::Machine(c, _)
+            | Screen::Power(c) => Some(c),
+            Screen::Inventory | Screen::Creative => None,
+        }
+    }
+
     /// Crafting grid width (0: none).
     pub fn grid_width(self) -> usize {
         match self {
@@ -66,12 +84,36 @@ pub enum SlotId {
     Armor(usize),
     /// A slot of the open chest.
     Chest(usize),
+    /// A recipe machine's ingredient slot (in recipe order).
+    MachineIn(usize),
+    /// One of what a recipe machine can make (click to pick it).
+    Recipe(usize),
 }
 
 /// Cell pitch and content width, in GUI pixels.
 const CELL: f32 = 20.0;
 const WIDTH: f32 = 9.0 * CELL;
 const COLUMNS: usize = 9;
+
+/// Rows of the catalog shown at once (the wheel scrolls the rest).
+const CATALOG_ROWS: usize = 6;
+/// The catalog's tabs, down its left side (GUI pixels, x relative to the grid).
+const TAB_X: f32 = -74.0;
+const TAB_W: f32 = 64.0;
+const TAB_H: f32 = 14.0;
+
+/// What the creative catalog shows: its tab, how many items that has, the rows scrolled past.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Catalog {
+    pub tab: Category,
+    pub len: usize,
+    pub scroll: usize,
+}
+
+/// How many rows a catalog of `len` items can be scrolled down.
+pub fn catalog_scroll_limit(len: usize) -> usize {
+    len.div_ceil(COLUMNS).saturating_sub(CATALOG_ROWS)
+}
 
 pub struct Layout {
     /// Content box in screen pixels (clicks outside it drop the held stack), and screen
@@ -85,12 +127,30 @@ pub struct Layout {
     pub slots: Vec<(SlotId, f32, f32)>,
     /// Section labels (GUI pixels).
     labels: Vec<(f32, f32, &'static str)>,
+    /// The catalog's tabs (top-left in GUI pixels; none on other screens).
+    tabs: Vec<(Category, f32, f32)>,
+    catalog: Catalog,
+    /// A machine screen's working row (ingredients, progress, output), GUI pixels down.
+    work_y: f32,
 }
 
+/// Recipes in a row of a machine's screen.
+const RECIPE_COLUMNS: usize = 9;
+
 impl Layout {
-    pub fn new(screen: Screen, width: f32, height: f32, s: f32, catalog: usize) -> Self {
+    /// `recipe`: what the open recipe machine is set to make.
+    pub fn new(
+        screen: Screen,
+        width: f32,
+        height: f32,
+        s: f32,
+        catalog: Catalog,
+        recipe: Option<Item>,
+    ) -> Self {
+        let mut work_y = 30.0;
         let mut slots = Vec::new();
         let mut labels = Vec::new();
+        let mut tabs = Vec::new();
         let row = |slots: &mut Vec<_>, ids: &mut dyn Iterator<Item = SlotId>, y: f32| {
             for (i, id) in ids.enumerate() {
                 slots.push((
@@ -132,43 +192,104 @@ impl Layout {
                 slots.push((SlotId::FurnaceOut, 120.0, 30.0));
                 72.0
             }
+            Screen::Machine(_, kind) if kind.has_recipes() => {
+                // What it can make (pick one), then its ingredients, progress and output.
+                labels.push((0.0, 0.0, kind.name()));
+                let list: Vec<_> = recipes::for_machine(kind).collect();
+                for i in 0..list.len() {
+                    let (c, r) = (i % RECIPE_COLUMNS, i / RECIPE_COLUMNS);
+                    slots.push((SlotId::Recipe(i), c as f32 * CELL, 10.0 + r as f32 * CELL));
+                }
+                let rows = list.len().div_ceil(RECIPE_COLUMNS) as f32;
+                work_y = 10.0 + rows * CELL + 14.0;
+                labels.push((0.0, work_y - 10.0, "needs"));
+                let needs = recipe
+                    .and_then(|r| recipes::find(kind, r))
+                    .map_or(0, |r| r.inputs.len());
+                for i in 0..needs {
+                    slots.push((SlotId::MachineIn(i), i as f32 * CELL, work_y));
+                }
+                slots.push((SlotId::FurnaceOut, 140.0, work_y));
+                work_y + CELL + 16.0
+            }
+            Screen::Machine(_, kind) => {
+                labels.push((40.0, 0.0, kind.name()));
+                match kind {
+                    MachineKind::Generator => slots.push((SlotId::FurnaceFuel, 40.0, 30.0)),
+                    MachineKind::ElectricFurnace => {
+                        slots.push((SlotId::FurnaceIn, 40.0, 30.0));
+                        slots.push((SlotId::FurnaceOut, 120.0, 30.0));
+                    }
+                    _ => slots.push((SlotId::FurnaceOut, 120.0, 30.0)),
+                }
+                72.0
+            }
+            Screen::Power(_) => {
+                labels.push((0.0, 0.0, "power"));
+                POWER_HEIGHT
+            }
             Screen::Chest(_) => {
                 labels.push((0.0, 0.0, "storage"));
                 row(&mut slots, &mut (0..CHEST_SLOTS).map(SlotId::Chest), 10.0);
                 72.0
             }
             Screen::Creative => {
-                labels.push((0.0, 0.0, "catalog"));
-                row(&mut slots, &mut (0..catalog).map(SlotId::Catalog), 10.0);
-                10.0 + catalog.div_ceil(COLUMNS) as f32 * CELL + 2.0
+                // Always as tall as `CATALOG_ROWS`, so the screen doesn't jump between tabs.
+                labels.push((0.0, 0.0, catalog.tab.name()));
+                let first = catalog.scroll * COLUMNS;
+                let last = (first + CATALOG_ROWS * COLUMNS).min(catalog.len);
+                row(&mut slots, &mut (first..last).map(SlotId::Catalog), 10.0);
+                for (i, &tab) in Category::ALL.iter().enumerate() {
+                    tabs.push((tab, TAB_X, 10.0 + i as f32 * TAB_H));
+                }
+                10.0 + CATALOG_ROWS as f32 * CELL + 2.0
             }
         };
 
-        // The player's own items below: the backpack, then the hotbar a little apart.
-        let hotbar_y = if screen == Screen::Creative {
-            top + 6.0
+        // The player's own items below: the backpack, then the hotbar a little apart. (The
+        // power screen is only something to read.)
+        let content_h = if matches!(screen, Screen::Power(_)) {
+            top
         } else {
-            labels.push((0.0, top + 4.0, "backpack"));
-            row(
-                &mut slots,
-                &mut (HOTBAR..SLOTS).map(SlotId::Inv),
-                top + 14.0,
-            );
-            top + 14.0 + 3.0 * CELL + 6.0
+            let hotbar_y = if screen == Screen::Creative {
+                top + 6.0
+            } else {
+                labels.push((0.0, top + 4.0, "backpack"));
+                row(
+                    &mut slots,
+                    &mut (HOTBAR..SLOTS).map(SlotId::Inv),
+                    top + 14.0,
+                );
+                top + 14.0 + 3.0 * CELL + 6.0
+            };
+            row(&mut slots, &mut (0..HOTBAR).map(SlotId::Inv), hotbar_y);
+            hotbar_y + CELL
         };
-        row(&mut slots, &mut (0..HOTBAR).map(SlotId::Inv), hotbar_y);
-        let content_h = hotbar_y + CELL;
 
+        // Centred with the tabs, if any, as part of it.
         let (w, h) = (WIDTH * s, content_h * s);
+        let left = if tabs.is_empty() { 0.0 } else { -TAB_X * s };
         Self {
-            x: ((width - w) / 2.0).round(),
+            x: ((width - w - left) / 2.0 + left).round(),
             y: ((height - h) / 2.0).round(),
             w,
             h,
             s,
             slots,
             labels,
+            tabs,
+            catalog,
+            work_y,
         }
+    }
+
+    /// The catalog tab under the mouse.
+    pub fn tab_at(&self, mx: f32, my: f32) -> Option<Category> {
+        self.tabs.iter().find_map(|&(tab, gx, gy)| {
+            let (x, y) = self.at(gx, gy);
+            (mx >= x && mx < x + TAB_W * self.s && my >= y && my < y + TAB_H * self.s)
+                .then_some(tab)
+        })
     }
 
     /// Screen position of a GUI-pixel position.
@@ -185,10 +306,18 @@ impl Layout {
         })
     }
 
-    /// Whether the mouse is over the screen's content (with a small margin).
+    /// Whether the mouse is over the screen's content, tabs included (with a small margin).
     pub fn contains(&self, mx: f32, my: f32) -> bool {
         let m = 8.0 * self.s;
-        mx >= self.x - m && mx < self.x + self.w + m && my >= self.y - m && my < self.y + self.h + m
+        let left = if self.tabs.is_empty() {
+            0.0
+        } else {
+            -TAB_X * self.s
+        };
+        mx >= self.x - left - m
+            && mx < self.x + self.w + m
+            && my >= self.y - m
+            && my < self.y + self.h + m
     }
 }
 
@@ -198,8 +327,15 @@ pub struct View<'a> {
     pub cursor: Slot,
     pub mouse: (f32, f32),
     pub furnace: Option<&'a Furnace>,
+    /// The machine of the open screen.
+    pub machine: Option<&'a Machine>,
+    /// The power screen's network.
+    pub power: Option<&'a PowerView>,
     pub catalog: &'a [Item],
 }
+
+/// How tall the power screen is (GUI pixels).
+const POWER_HEIGHT: f32 = 150.0;
 
 const LABEL: [u8; 4] = [190, 200, 210, 170];
 const OUTLINE: [u8; 4] = [255, 255, 255, 38];
@@ -229,6 +365,9 @@ pub struct ScreenAnim {
     card: (Option<SlotId>, f32),
     /// Last frame's screen (dim first, then content), replayed while it closes.
     closing: Vec<UiVertex>,
+    /// The catalog tabs' hover glow, and where the open tab's marker has slid to (GUI y).
+    tab_glow: [f32; Category::ALL.len()],
+    tab_marker: Option<f32>,
 }
 
 impl ScreenAnim {
@@ -313,7 +452,43 @@ pub fn draw(
             };
             line(ui, 42.0, 40.0, 16.0, burn);
         }
-        Screen::Creative | Screen::Chest(_) => {}
+        Screen::Machine(_, kind) => {
+            // The fuel burning (generator) or the work going on, and a word on how it goes.
+            let m = view.machine;
+            let fill = m.map_or(0.0, |m| {
+                if kind == MachineKind::Generator {
+                    if m.energy_total > 0.0 {
+                        m.energy / m.energy_total
+                    } else {
+                        0.0
+                    }
+                } else {
+                    m.progress_share()
+                }
+            });
+            let (lx, ly, text_y) = if kind.has_recipes() {
+                (84.0, layout.work_y + 10.0, layout.work_y + CELL + 4.0)
+            } else {
+                (64.0, 40.0, 46.0)
+            };
+            line(ui, lx, ly, 52.0, fill);
+            let mut words = m.map_or_else(String::new, Machine::status);
+            if let Some(resource) = m.and_then(|m| m.resource) {
+                words = format!("{}: {words}", resource.name().to_lowercase());
+            }
+            let (x, y) = layout.at(if kind.has_recipes() { 0.0 } else { 64.0 }, text_y);
+            ui.text_plain(x, y, &words, LABEL);
+            // What it is making, across from its name.
+            if let Some(r) = m.and_then(Machine::current_recipe) {
+                let (x, y) = layout.at(WIDTH - 2.0, 0.0);
+                let text = recipe_line(r);
+                let w = ui.text_width(&text);
+                ui.text_plain(x - w, y, &text, ACCENT);
+            }
+        }
+        Screen::Power(_) => draw_power(ui, layout, view.power),
+        Screen::Creative => draw_tabs(ui, layout, view.mouse, anim, dt),
+        Screen::Chest(_) => {}
     }
 
     // Hover glow: quick to light up, slower to fade, so it trails behind the mouse.
@@ -343,7 +518,12 @@ pub fn draw(
         };
         let glow = anim.hover.get(&id).copied().unwrap_or(0.0);
         let result = matches!(id, SlotId::Output | SlotId::FurnaceOut);
-        let outline = if result {
+        // The recipe it is set to stands out.
+        let picked = matches!(id, SlotId::Recipe(_))
+            && stack.is_some_and(|s| view.machine.and_then(|m| m.recipe) == Some(s.item));
+        let outline = if picked {
+            with_alpha(ACCENT, 230.0)
+        } else if result {
             // A ready result breathes softly.
             let ready = if stack.is_some() { 60.0 * pulse } else { 0.0 };
             with_alpha(ACCENT, ACCENT[3] as f32 + ready + 60.0 * glow)
@@ -374,6 +554,16 @@ pub fn draw(
             let icon = (16.0 * s * scale).round();
             let off = ((icon - 16.0 * s) / 2.0).round();
             ui.item(ix - off, iy - off, icon, &stack);
+        } else if let SlotId::MachineIn(i) = id
+            && let Some(&(item, n)) = view
+                .machine
+                .and_then(Machine::current_recipe)
+                .and_then(|r| r.inputs.get(i))
+        {
+            // An empty ingredient slot shows, faintly, what goes there.
+            let start = ui.vertices.len();
+            ui.item(ix, iy, (16.0 * s).round(), &ItemStack::new(item, n));
+            ui.fade_from(start, 0.3, 0.0, 0.0);
         } else if let SlotId::Armor(i) = id {
             // An empty suit slot says what goes there.
             let text = ["hd", "bd", "lg", "ft"][i];
@@ -405,7 +595,16 @@ pub fn draw(
             SlotId::Catalog(i) => view.catalog.get(i).map(|&item| ItemStack::one(item)),
             _ => (view.slot)(id),
         };
-        if let Some(stack) = stack {
+        let recipe = match (id, view.machine) {
+            (SlotId::Recipe(i), Some(m)) => recipes::for_machine(m.kind).nth(i),
+            _ => None,
+        };
+        if let Some(recipe) = recipe {
+            let card_start = ui.vertices.len();
+            recipe_card(ui, mx + 12.0 * s, my + 8.0 * s, recipe);
+            let a = ease_out(anim.card.1);
+            ui.fade_from(card_start, a, 0.0, (1.0 - a) * 3.0 * s);
+        } else if let Some(stack) = stack {
             let card_start = ui.vertices.len();
             tooltip(ui, mx + 12.0 * s, my + 8.0 * s, &stack);
             let a = ease_out(anim.card.1);
@@ -419,6 +618,69 @@ pub fn draw(
     let e = ease_out(anim.open);
     ui.fade_from(start, e, 0.0, 0.0);
     ui.fade_from(start + 4, 1.0, 0.0, (1.0 - e) * RISE * s);
+}
+
+/// The catalog's tabs down its left side (words, the open one bright with an amber mark that
+/// slides between them, a soft glow under the mouse) and, when its tab has more rows than fit,
+/// a thin scroll line down its right side.
+fn draw_tabs(ui: &mut Ui, layout: &Layout, mouse: (f32, f32), anim: &mut ScreenAnim, dt: f32) {
+    let s = layout.s;
+    let hovered = layout.tab_at(mouse.0, mouse.1);
+    let (_, ch) = ui.char_size();
+    for (i, &(tab, gx, gy)) in layout.tabs.iter().enumerate() {
+        let glow = &mut anim.tab_glow[i];
+        let on = hovered == Some(tab);
+        *glow = approach(
+            *glow,
+            if on { 1.0 } else { 0.0 },
+            if on { 30.0 } else { 9.0 },
+            dt,
+        );
+        let (x, y) = layout.at(gx, gy);
+        if *glow > 0.01 {
+            let a = HOVER[3] as f32 * *glow;
+            ui.rect(x, y, TAB_W * s, (TAB_H - 1.0) * s, with_alpha(HOVER, a));
+        }
+        let open = tab == layout.catalog.tab;
+        let color = if open {
+            LINE
+        } else {
+            with_alpha(LABEL, 120.0 + 80.0 * *glow)
+        };
+        let ty = y + ((TAB_H - 1.0) * s - ch) / 2.0 + s;
+        ui.text_plain(x + 6.0 * s, ty, tab.name(), color);
+        if open {
+            let marker = anim.tab_marker.get_or_insert(gy);
+            *marker = approach(*marker, gy, 25.0, dt);
+        }
+    }
+    if let Some(gy) = anim.tab_marker {
+        let (x, y) = layout.at(TAB_X, gy + 2.0);
+        ui.rect(
+            x,
+            y.round(),
+            s,
+            (TAB_H - 5.0) * s,
+            with_alpha(ACCENT, 255.0),
+        );
+    }
+
+    // The scroll line: how much of the tab is in view, and where.
+    let rows = layout.catalog.len.div_ceil(COLUMNS);
+    if rows > CATALOG_ROWS {
+        let full = CATALOG_ROWS as f32 * CELL - 2.0;
+        let (x, y) = layout.at(WIDTH + 3.0, 11.0);
+        ui.rect(x, y, s, full * s, FAINT);
+        let part = CATALOG_ROWS as f32 / rows as f32;
+        let from = layout.catalog.scroll as f32 / rows as f32;
+        ui.rect(
+            x,
+            y + (from * full * s).round(),
+            s,
+            (part * full * s).round(),
+            LINE,
+        );
+    }
 }
 
 /// A colour with a new alpha (clamped to 0..255).
@@ -470,4 +732,171 @@ pub fn tooltip(ui: &mut Ui, x: f32, y: f32, stack: &ItemStack) {
         ly += ch + 2.0 * s;
         ui.text_plain(x + 5.0 * s, ly, fact, LABEL);
     }
+}
+
+/// "making plastic x2" (short, across from a machine's name; the amounts it takes show in its
+/// slots and on the recipe's card).
+fn recipe_line(r: &recipes::Recipe) -> String {
+    let name = r.output.name().to_lowercase();
+    if r.count > 1 {
+        format!("making {name} x{}", r.count)
+    } else {
+        format!("making {name}")
+    }
+}
+
+/// What a recipe takes, makes and how long it takes, on a card like an item's.
+fn recipe_card(ui: &mut Ui, x: f32, y: f32, r: &recipes::Recipe) {
+    let s = ui.scale;
+    let name = if r.count > 1 {
+        format!("{} x{}", r.output.name().to_lowercase(), r.count)
+    } else {
+        r.output.name().to_lowercase()
+    };
+    let mut facts: Vec<String> = r
+        .inputs
+        .iter()
+        .map(|(item, n)| format!("{n} {}", item.name().to_lowercase()))
+        .collect();
+    facts.push(format!(
+        "{} s, {:.0} kw",
+        r.time,
+        r.machine.power() / 1000.0
+    ));
+    let (_, ch) = ui.char_size();
+    let width = std::iter::once(&name)
+        .chain(&facts)
+        .map(|l| ui.text_width(l))
+        .fold(0.0, f32::max)
+        + 10.0 * s;
+    let height = (1 + facts.len()) as f32 * (ch + 2.0 * s) + 8.0 * s;
+    let x = x.min(ui.width - width - 2.0 * s);
+    let y = y.max(2.0 * s).min(ui.height - height - 2.0 * s);
+    ui.rect(x, y, width, height, [8, 10, 14, 230]);
+    ui.rect(x, y, s, height, ACCENT);
+    let mut ly = y + 4.0 * s;
+    ui.text_plain(x + 5.0 * s, ly, &name, LINE);
+    for fact in &facts {
+        ly += ch + 2.0 * s;
+        ui.text_plain(x + 5.0 * s, ly, fact, LABEL);
+    }
+}
+
+/// "1 pole", "3 poles".
+fn count(n: u32, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
+/// The power screen: what the network makes and uses, what its accumulators hold, and the
+/// last minute as a graph (made faint behind, used bright in front).
+fn draw_power(ui: &mut Ui, layout: &Layout, power: Option<&PowerView>) {
+    let s = layout.s;
+    let Some(view) = power else {
+        let (x, y) = layout.at(0.0, 14.0);
+        ui.text_plain(x, y, "not on a network", LABEL);
+        return;
+    };
+    let net = &view.network;
+    let kw = |w: f32| {
+        if w >= 1.0e6 {
+            format!("{:.2} mw", w / 1.0e6)
+        } else {
+            format!("{:.0} kw", w / 1000.0)
+        }
+    };
+    let mut lines: Vec<(String, [u8; 4])> = vec![
+        (
+            format!(
+                "made {}   {} of {} generators burning",
+                kw(net.capacity),
+                net.generators.0,
+                net.generators.1
+            ),
+            LINE,
+        ),
+        (
+            format!(
+                "used {}   {} of {} machines working",
+                kw(net.used),
+                net.consumers.0,
+                net.consumers.1
+            ),
+            LINE,
+        ),
+    ];
+    if net.demand > net.used + 1.0 {
+        lines.push((
+            format!(
+                "short of power: machines at {:.0}%",
+                net.used / net.demand * 100.0
+            ),
+            [255, 120, 100, 230],
+        ));
+    } else if net.capacity > net.used + net.charging + 1.0 {
+        lines.push((
+            format!(
+                "{} going to waste",
+                kw(net.capacity - net.used - net.charging)
+            ),
+            LABEL,
+        ));
+    }
+    if net.accumulators > 0 {
+        let flow = if net.charging > 0.0 {
+            format!("charging {}", kw(net.charging))
+        } else if net.discharging > 0.0 {
+            format!("giving {}", kw(net.discharging))
+        } else {
+            "idle".to_string()
+        };
+        lines.push((
+            format!(
+                "{}: {:.1} of {:.0} mj, {flow}",
+                count(net.accumulators, "accumulator"),
+                net.stored / 1.0e6,
+                net.storage / 1.0e6
+            ),
+            LINE,
+        ));
+    }
+    lines.push((count(net.poles, "pole"), LABEL));
+    let (_, ch) = ui.char_size();
+    let mut gy = 14.0;
+    for (text, color) in &lines {
+        let (x, y) = layout.at(0.0, gy);
+        ui.text_plain(x, y, text, *color);
+        gy += (ch / s).ceil() + 3.0;
+    }
+    // The charge as a line.
+    if net.storage > 0.0 {
+        let (x, y) = layout.at(0.0, gy);
+        ui.rect(x, y, WIDTH * s, s, FAINT);
+        ui.rect(x, y, WIDTH * s * (net.stored / net.storage), s, ACCENT);
+        gy += 5.0;
+    }
+
+    // The last minute.
+    let (graph_h, top) = (POWER_HEIGHT - gy - 14.0, gy + 4.0);
+    let samples = &view.history.samples;
+    let most = samples
+        .iter()
+        .map(|&(made, used)| made.max(used))
+        .fold(1.0, f32::max);
+    let bar = WIDTH / factory::HISTORY as f32;
+    let (x0, y0) = layout.at(0.0, top + graph_h);
+    ui.rect(x0, y0, WIDTH * s, s, FAINT);
+    let first = factory::HISTORY - samples.len();
+    for (i, &(made, used)) in samples.iter().enumerate() {
+        let x = x0 + (first + i) as f32 * bar * s;
+        let w = (bar * s - s).max(s);
+        let h = |p: f32| (p / most * graph_h * s).round();
+        ui.rect(x, y0 - h(made), w, h(made), FAINT);
+        ui.rect(x, y0 - h(used), w, h(used), with_alpha(LINE, 200.0));
+    }
+    let (x, y) = layout.at(0.0, top + graph_h + 3.0);
+    ui.text_plain(x, y, "last minute: made, used", LABEL);
 }

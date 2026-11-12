@@ -131,6 +131,12 @@ pub trait Voxels {
     /// The block in cell (u, v, k): u and v in the grid of layer k's shell, possibly beyond
     /// the face's edge.
     fn block(&self, face: Face, u: i32, v: i32, k: i32) -> Block;
+
+    /// A tree (or cactus) block the world grew and nobody has touched: vehicles go through
+    /// these and knock them down. Placed logs and leaves are as solid as anything.
+    fn grown(&self, _face: Face, _u: i32, _v: i32, _k: i32) -> bool {
+        false
+    }
 }
 
 /// Everything physics needs besides the world.

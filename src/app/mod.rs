@@ -14,6 +14,7 @@ use winit::{
 };
 
 mod death;
+mod factories;
 mod flight;
 pub mod input;
 mod lava;
@@ -149,6 +150,8 @@ struct Game {
     debris: crate::effects::debris::Debris,
     /// Air drag on the player (console: `drag on|off`).
     drag: bool,
+    /// The tank of whatever you fly stays full (console: `fuel infinite`). Lasts the session.
+    infinite_fuel: bool,
     console: Console,
     /// Inventory, held item, screens, drops, placed models, furnaces, health.
     survival: Survival,
@@ -257,6 +260,8 @@ impl ApplicationHandler for App {
             WindowEvent::Focused(false) => {
                 game.set_mouse_grab(false);
                 game.input.clear();
+                // (Off to something else: a good moment to save.)
+                game.save_soon();
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 let PhysicalKey::Code(code) = event.physical_key else {
@@ -335,14 +340,30 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(p) => p.y as f32 / 60.0,
                 };
             }
-            WindowEvent::RedrawRequested => match game.frame() {
-                Ok(true) => event_loop.exit(),
-                Ok(false) => {}
-                Err(e) => {
-                    self.error = Some(e);
-                    event_loop.exit();
+            WindowEvent::RedrawRequested => {
+                // A crash mid-frame still keeps what the player has done (`save_on_crash`).
+                let frame = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| game.frame()));
+                match frame {
+                    Ok(Ok(true)) => event_loop.exit(),
+                    Ok(Ok(false)) => {}
+                    Ok(Err(e)) => {
+                        // (The world is whole: only the frame failed.)
+                        let save = std::panic::AssertUnwindSafe(|| game.save_on_exit());
+                        if std::panic::catch_unwind(save).is_err() {
+                            log::error!("saving after the error failed too");
+                        }
+                        self.error = Some(e);
+                        event_loop.exit();
+                    }
+                    Err(panic) => {
+                        let save = std::panic::AssertUnwindSafe(|| game.save_on_crash());
+                        if std::panic::catch_unwind(save).is_err() {
+                            log::error!("saving after the crash failed too");
+                        }
+                        std::panic::resume_unwind(panic);
+                    }
                 }
-            },
+            }
             _ => {}
         }
     }
@@ -395,6 +416,29 @@ impl Voxels for WorldVoxels<'_> {
             Block::Air
         }
     }
+
+    fn grown(&self, face: Face, u: i32, v: i32, k: i32) -> bool {
+        self.planet
+            .cell(face, u, v, k)
+            .is_some_and(|cell| self.streamer.grown(cell))
+    }
+}
+
+/// `time`'s argument: hours, or a time of day by name.
+fn hours_called(word: &str) -> Option<f64> {
+    let hours = match word {
+        "sunrise" | "dawn" => 6.0,
+        "morning" => 8.0,
+        "day" => 9.0,
+        "noon" | "midday" => 12.0,
+        "afternoon" => 15.0,
+        "sunset" | "dusk" => 18.0,
+        "evening" => 19.5,
+        "night" => 22.0,
+        "midnight" => 0.0,
+        _ => word.parse::<f64>().ok().filter(|h| h.is_finite())?,
+    };
+    Some(hours)
 }
 
 fn direction(lat: f64, lon: f64) -> DVec3 {
@@ -697,6 +741,7 @@ impl Game {
             gravity,
             player,
             drag: true,
+            infinite_fuel: false,
             console,
             survival: Survival::default(),
             audio,
@@ -847,9 +892,11 @@ impl Game {
             &self.streamer,
             &mut self.renderer,
             self.camera.position,
+            // (Machines move in real time, and stand still while the world is paused.)
+            if world_dt > 0.0 { dt as f32 } else { 0.0 },
         )?;
         self.send_particles(world_dt as f32);
-        self.flight_draw_items(&mut objects)?;
+        self.flight_draw_items(&mut objects, world_dt as f32)?;
         self.avatar_draw_items(&mut objects, dt as f32)?;
         self.debris_draw_items(&mut objects)?;
         let flight_effects = self.flight_effects(world_dt as f32);
@@ -1074,6 +1121,7 @@ impl Game {
             self.walk_physics(&input, dt);
         }
         self.update_vessels(start);
+        self.lose_missing_seats();
         self.follow_craft_world();
         if let Some(before) = on_foot {
             self.meet_vehicles(&before);
@@ -1131,6 +1179,9 @@ impl Game {
         );
         self.survival
             .spawn_mobs(&self.planet, &self.terrain, &world, &pose, warped);
+        // (The other world goes on too: its furnaces and factories.)
+        let net = self.survival.net;
+        self.other.state.run(&self.other.planet, warped, net);
         if let Some(message) = messages.into_iter().last() {
             self.message = Some((message, Instant::now()));
         }
@@ -1326,7 +1377,7 @@ impl Game {
             return;
         }
         let right_click = self.input.button_pressed(MouseButton::Right);
-        if self.input.pressed(KeyCode::KeyR) {
+        if self.input.pressed(KeyCode::KeyR) && !self.turn_conveyor() {
             self.turn_part();
         }
         if rocket.is_none() && vehicle.is_none() && person.is_none() {
@@ -1349,6 +1400,18 @@ impl Game {
                 return;
             }
         }
+        // Nothing goes into a cell a vehicle is in (its core, a seat, any part).
+        let in_vehicle = self.input.button_held(MouseButton::Right)
+            && (self.target.as_ref().and_then(|h| h.before))
+                .is_some_and(|cell| self.vehicle_in_cell(cell));
+        let walled = (self.target.as_ref())
+            .filter(|_| in_vehicle)
+            .map(|h| interact::Hit {
+                cell: h.cell,
+                block: h.block,
+                before: None,
+                distance: h.distance,
+            });
         let pose = self.pose();
         let mut world = survival::World {
             planet: &self.planet,
@@ -1356,6 +1419,8 @@ impl Game {
         };
         let target = if rocket.is_some() || vehicle.is_some() {
             None
+        } else if walled.is_some() {
+            walled.as_ref()
         } else {
             self.target.as_ref()
         };
@@ -1399,6 +1464,7 @@ impl Game {
         if self.session_command(command, &args)
             || self.net_command(command, &args)
             || self.flight_command(command, &args)
+            || self.factory_command(command, &args)
         {
             return;
         }
@@ -1433,6 +1499,7 @@ impl Game {
                     .console
                     .print("Usage: gamemode <survival|creative|spectator>"),
             },
+            "tp" if args.len() == 1 => self.teleport_to_player(args[0]),
             "tp" => match (number(0), number(1)) {
                 (Some(lat), Some(lon)) => {
                     let dir = direction(lat, lon);
@@ -1443,7 +1510,7 @@ impl Game {
                 }
                 _ => self
                     .console
-                    .print("Usage: tp <lat> <lon> [altitude above ground]"),
+                    .print("Usage: tp <lat> <lon> [altitude above ground], or tp <player>"),
             },
             "orbit" => {
                 let altitude = number(0).unwrap_or(20.0) * 1000.0;
@@ -1478,16 +1545,29 @@ impl Game {
                 }
                 None => self.console.print("Usage: launch <m/s>"),
             },
-            "time" => match number(0) {
-                Some(hours) => {
-                    self.stop_following();
-                    self.time = self
-                        .system
-                        .time_of_day(self.time, up, hours.rem_euclid(24.0));
-                    self.console.print(format!("Time set to {hours:.2} h"));
+            "time" => {
+                // (Also as `time set day`.)
+                let word = args.iter().copied().find(|a| *a != "set");
+                match word.and_then(hours_called) {
+                    Some(hours) => {
+                        // The clock goes on to then, carrying you over the same ground: set
+                        // straight, the planet would turn under you, and you'd be somewhere
+                        // else.
+                        let hours = hours.rem_euclid(24.0);
+                        let to = self.system.time_of_day(self.time, up, hours);
+                        match self.clock_jump(to) {
+                            Ok(()) => {
+                                self.stop_following();
+                                self.console.print(format!("Time set to {hours:.2} h"));
+                            }
+                            Err(why) => self.console.print(format!("Can't change the time: {why}")),
+                        }
+                    }
+                    None => self.console.print(
+                        "Usage: time <hours | sunrise | day | noon | sunset | night | midnight>",
+                    ),
                 }
-                None => self.console.print("Usage: time <hours>"),
-            },
+            }
             "warp" => match number(0) {
                 Some(_) if self.warp_is_someone_elses() => {}
                 Some(w) => {
@@ -1541,6 +1621,14 @@ impl Game {
                     self.console.print("Placed a rocket");
                     return;
                 }
+                let held_block = self.survival.held().and_then(|s| s.item.block());
+                if held_block.is_some()
+                    && (self.target.as_ref().and_then(|h| h.before))
+                        .is_some_and(|cell| self.vehicle_in_cell(cell))
+                {
+                    self.console.print("A vehicle is in the way");
+                    return;
+                }
                 let mut input = Input::default();
                 input.button_down(MouseButton::Right);
                 let pose = self.pose();
@@ -1548,7 +1636,7 @@ impl Game {
                     planet: &self.planet,
                     streamer: &mut self.streamer,
                 };
-                self.survival.interact(
+                let said = self.survival.interact(
                     &mut world,
                     &input,
                     self.player.mode,
@@ -1558,7 +1646,10 @@ impl Game {
                     SURVIVAL_REACH,
                     0.0,
                 );
-                self.console.print("Used / placed");
+                let at = self.target.as_ref().map(|h| h.block.name());
+                self.console.print(said.unwrap_or_else(|| {
+                    format!("Used / placed (at {})", at.as_deref().unwrap_or("nothing"))
+                }));
             }
             "give" => {
                 let count = number(1).map_or(1, |n| n.clamp(1.0, 64.0 * 36.0) as u32);
@@ -1602,6 +1693,14 @@ impl Game {
                 }
                 None => self.console.print("Usage: aim <pitch deg> [yaw deg]"),
             },
+            "turn" => match number(0) {
+                Some(degrees) => {
+                    let yaw = self.camera.yaw + (degrees as f32).to_radians();
+                    self.camera.yaw = yaw.rem_euclid(std::f32::consts::TAU);
+                    self.console.print(format!("Turned {degrees} deg"));
+                }
+                None => self.console.print("Usage: turn <deg> (to the right)"),
+            },
             "summon" => {
                 let kind = match args.first().copied() {
                     Some("cow") => Some(MobKind::Cow),
@@ -1641,6 +1740,8 @@ impl Game {
                 self.respawn();
                 self.console.print("Back at the spawn point");
             }
+            // Tests the crash save: the game goes down as it would on a bug.
+            "crash" => panic!("crashed on purpose from the console"),
             "fly" => {
                 self.toggle_flight();
                 self.console
@@ -1685,9 +1786,22 @@ impl Game {
                     Some("inventory") | None => Some(Screen::Inventory),
                     _ => None,
                 };
-                match screen {
-                    Some(screen) => self.survival.open(screen),
-                    None => self.console.print("Usage: open [inventory|creative]"),
+                // `open creative <tab>` opens the catalog on that tab.
+                let tab = args.get(1).map(|name| {
+                    crate::survival::items::Category::ALL
+                        .into_iter()
+                        .find(|c| c.name() == *name)
+                });
+                match (screen, tab) {
+                    (Some(_), Some(None)) | (None, _) => self
+                        .console
+                        .print("Usage: open [inventory|creative [terrain|building|factory|vehicles|materials|gear|food]]"),
+                    (Some(screen), tab) => {
+                        if let Some(Some(tab)) = tab {
+                            self.survival.show_category(tab);
+                        }
+                        self.survival.open(screen);
+                    }
                 }
             }
             "speed" => match number(0) {
@@ -1704,17 +1818,46 @@ impl Game {
         }
     }
 
+    /// The light for something drawn at `p` (planet-relative): the mesher's sky light estimate
+    /// and block light there, and the glow of molten rock or lava right next to it (which
+    /// lights nothing else: without it, things in the core were black against white-hot walls).
+    pub(super) fn light_at(&self, p: DVec3) -> Light {
+        let cell = self.planet.cell_at(p);
+        let sky = survival::sky_light(&self.planet, &self.terrain, cell);
+        let block = cell.map_or(0, |c| self.block_light_at(c));
+        Light { sky, block }
+    }
+
+    /// Block light in `cell`, or the glow of molten rock or lava next to it (see `light_at`).
+    fn block_light_at(&self, c: BlockCell) -> u32 {
+        let mut block = self.streamer.light(c) as u32;
+        for (du, dv, dk) in [
+            (0, 0, 0),
+            (1, 0, 0),
+            (-1, 0, 0),
+            (0, 1, 0),
+            (0, -1, 0),
+            (0, 0, 1),
+            (0, 0, -1),
+        ] {
+            if let Some(n) = self.planet.cell(c.face, c.u + du, c.v + dv, c.k + dk)
+                && let Some(b) = self.streamer.block(n)
+            {
+                block = block.max(b.glow());
+            }
+        }
+        block
+    }
+
     /// Sends this frame's particle effects to the renderer, each lit by the block and sky
     /// light at its spot.
     fn send_particles(&mut self, dt: f32) {
-        for e in &mut self.survival.effects.queue {
-            let cell = self.planet.cell_at(e.origin);
-            let block = cell.map_or(0, |c| self.streamer.light(c)) as u32;
-            e.light = (
-                block,
-                survival::sky_light(&self.planet, &self.terrain, cell),
-            );
+        let mut queue = std::mem::take(&mut self.survival.effects.queue);
+        for e in &mut queue {
+            let light = self.light_at(e.origin);
+            e.light = (light.block, light.sky);
         }
+        self.survival.effects.queue = queue;
         // The test rain is lit by the open sky (no terrain lookup every frame).
         if let Some((rate, carry)) = &mut self.rain {
             let drops = *rate * dt + *carry;
@@ -1759,7 +1902,7 @@ impl Game {
         };
         let light = Light {
             sky,
-            block: cell.map_or(0, |c| self.streamer.light(c)) as u32,
+            block: cell.map_or(0, |c| self.block_light_at(c)),
         };
         let visible =
             self.player.mode != GameMode::Spectator && self.first_person() && self.death.is_none();
@@ -1885,7 +2028,15 @@ impl Game {
                 .view(self.active, Body::Planet, DVec3::ZERO, self.time);
         let home_up = home_rel.try_normalize().unwrap_or(DVec3::Y);
         let sun_dir = sun.normalize();
-        let sun_angular_radius = (self.system.star.radius / sun.length()).asin() as f32;
+        // (Inside the star itself, it fills half the sky.)
+        let sun_angular_radius = (self.system.star.radius / sun.length()).min(1.0).asin() as f32;
+        // The light grows as 1 / distance^2 towards the star: exactly as at home near home.
+        let home = self
+            .bodies
+            .view(self.active, Body::Planet, DVec3::ZERO, self.time);
+        let brightness = ((self.star_view() - home).length() / sun.length().max(1.0))
+            .powi(2)
+            .clamp(0.01, 2_000.0) as f32;
 
         // Underground there is no sky: the background is dark and fog hides the edge of the
         // (smaller) loaded area. Inside solid rock it closes in further.
@@ -1916,7 +2067,8 @@ impl Game {
         let cover = self.weather_fx.local.cover * (1.0 - space);
         let scene = (0.25 * luminance(sun_t * incidence) * (1.0 - 0.8 * cover)
             + 0.75 * luminance(sky) * (1.0 - 0.45 * cover))
-            / PI;
+            / PI
+            * brightness;
         let noon = (0.25 * 0.95 + 0.75 * 0.06) / PI;
         // Torchlight around the camera counts too (eye adaptation): a torch-lit spot at night
         // or in a cave isn't blown out.
@@ -1957,7 +2109,7 @@ impl Game {
             gravity_center: self.planet.center,
             sun_dir: sun_dir.as_vec3(),
             sun_angular_radius,
-            sun_illuminance: Vec3::splat(SUN_ILLUMINANCE),
+            sun_illuminance: Vec3::splat(SUN_ILLUMINANCE * brightness),
             star_rotation: self.active_rotation(),
             exposure,
             // Stars stand out more above the atmosphere (artistic, KSP-like).

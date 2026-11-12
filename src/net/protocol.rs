@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     audio::Sound,
+    factory::{Machine, NetBelts},
     flight::{
         craft::{At, Part},
         vessel::{Landed, Vessel},
@@ -28,7 +29,7 @@ use crate::{
 };
 
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u32 = 6;
+pub const PROTOCOL: u32 = 11;
 /// The host is always player 0.
 pub const HOST: PlayerId = 0;
 /// Most people in one game, the host included.
@@ -84,6 +85,8 @@ pub struct AboardPose {
 pub enum CraftChange {
     Put(Part),
     Take(At),
+    /// Knocked off in a crash: taken off, with a bang where it was.
+    Crash(At),
 }
 
 /// A change to one world, passed on to everyone.
@@ -103,6 +106,22 @@ pub enum WorldEvent {
     Furnace {
         cell: BlockCell,
         furnace: Furnace,
+    },
+    /// A generator or electric furnace (its slots and how it is doing).
+    Machine {
+        cell: BlockCell,
+        machine: Machine,
+    },
+    /// A cable run (`on`) or taken down between two poles or machines.
+    Cable {
+        a: BlockCell,
+        b: BlockCell,
+        on: bool,
+    },
+    /// A conveyor turned to face another way.
+    Turned {
+        cell: BlockCell,
+        facing: u8,
     },
     DropNew(NetDrop),
     DropGone(u32),
@@ -145,6 +164,11 @@ pub struct VesselState {
     pub temperature: f32,
     pub heating: f32,
     pub landed: Option<Landed>,
+    /// For the eye: wheels on the ground, the front wheels' angle (rad), each surface's flap
+    /// deflection (x 127).
+    pub touching: bool,
+    pub steer: f32,
+    pub flaps: Vec<i8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -226,6 +250,8 @@ pub enum Msg {
     Pickup(Body, u32),
     /// You picked this up.
     Give(ItemStack),
+    /// (From the host.) What is on the conveyors near you, by group (see `factory::NetBelts`).
+    Belts(Body, Vec<NetBelts>),
 
     // ---- Animals -----------------------------------------------------------------------------
     /// The animals one player simulates.
@@ -402,6 +428,28 @@ mod tests {
         assert!(encode(&Msg::Pose(pose)).len() < 160);
         assert!(decode(&[0xff, 0xff, 0xff, 0xff, 1, 2, 3]).is_none());
         assert!(decode(&[]).is_none());
+    }
+
+    #[test]
+    fn a_full_group_of_conveyors_fits_in_one_datagram() {
+        use crate::{
+            factory::BELT_ITEMS,
+            survival::items::{Tier, ToolKind},
+        };
+        // 4 x 4 x 2 conveyors, each carrying the biggest items there are.
+        let item = Item::Tool(ToolKind::Pickaxe, Tier::Diamond);
+        let group = NetBelts {
+            key: (5, -40_000, 40_000, 44_000),
+            belts: (0..32)
+                .map(|i| (i, vec![(item, 255); BELT_ITEMS]))
+                .collect(),
+        };
+        let msg = Msg::Belts(Body::Planet, vec![group]);
+        assert!(
+            encode(&msg).len() <= MAX_UNRELIABLE,
+            "{}",
+            encode(&msg).len()
+        );
     }
 
     #[test]

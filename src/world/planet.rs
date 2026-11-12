@@ -163,15 +163,25 @@ impl Planet {
         // Halve the grid each time blocks shrink to half their surface width.
         let mut res = face_blocks;
         let mut boundary_radius = sea_radius / 2.0;
+        let mut above = i32::MAX;
         loop {
-            let bottom = (planet.layer_at_radius(boundary_radius) / CHUNK_SIZE as f64).round()
+            let mut bottom = (planet.layer_at_radius(boundary_radius) / CHUNK_SIZE as f64).round()
                 as i32
                 * CHUNK_SIZE;
-            if res / 2 < 2 * CHUNK_SIZE || bottom < 2 * CHUNK_SIZE {
+            if res <= 4 * CHUNK_SIZE {
+                // Near the centre whole chunks are too coarse a step for that rule (one shell of
+                // 128 columns went from 96 m all the way in, its blocks thin slivers): a chunk
+                // of layers per halving, 128 columns from 64 m, 64 from 32 m, 32 in the middle.
+                // Blocks stay 0.8-1.6 m wide down to 16 m from the centre.
+                bottom = res / CHUNK_SIZE / 2 * CHUNK_SIZE;
+            }
+            bottom = bottom.min(above - CHUNK_SIZE);
+            if res / 2 < CHUNK_SIZE || bottom < CHUNK_SIZE {
                 planet.shells.push(Shell { bottom: 0, res });
                 break;
             }
             planet.shells.push(Shell { bottom, res });
+            above = bottom;
             res /= 2;
             boundary_radius /= 2.0;
         }
@@ -731,13 +741,23 @@ mod tests {
                     p.shells[i - 1].bottom
                 };
                 let width = |k: i32| p.layer_radius(k as f64) * PI / 2.0 / s.res as f64;
-                assert!(width(top) < 1.25, "shell {i} top width {}", width(top));
+                // (Near the centre, where a shell is one chunk of layers, a bit wider.)
+                let widest = if top - s.bottom <= CHUNK_SIZE {
+                    1.6
+                } else {
+                    1.25
+                };
+                assert!(width(top) < widest, "shell {i} top width {}", width(top));
                 assert!(
                     width(s.bottom) > 0.4,
                     "shell {i} bottom width {}",
                     width(s.bottom)
                 );
             }
+            // The middle: 32 columns, nothing thinner than half a metre beyond 10 m out.
+            let middle = p.shells.last().unwrap();
+            assert_eq!(middle.res, CHUNK_SIZE);
+            assert!(p.layer_radius(10.0) * PI / 2.0 / middle.res as f64 > 0.45);
         }
     }
 

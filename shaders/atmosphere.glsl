@@ -84,7 +84,19 @@ vec2 lut_uv(vec2 x, vec2 size) {
 vec3 transmittance_lut(float r, float mu) {
     float bottom = frame.radii.x;
     float top = frame.radii.y;
-    r = clamp(r, bottom, top);
+    if (r > top) {
+        // Out above the air (in orbit, on the moon): a ray that misses it keeps all its
+        // light, one that goes in is looked up from where it enters. (Clamping r to the top
+        // instead made any ray sideways of the planet a grazing one: a red sun and moon.)
+        float disc = r * r * (mu * mu - 1.0) + top * top;
+        if (mu >= 0.0 || disc <= 0.0) {
+            return vec3(1.0);
+        }
+        float d = -r * mu - sqrt(disc);
+        mu = clamp((r * mu + d) / top, -1.0, 1.0);
+        r = top;
+    }
+    r = max(r, bottom);
     float big_h = sqrt(top * top - bottom * bottom);
     float rho = sqrt(max(r * r - bottom * bottom, 0.0));
     float d = distance_to_top(r, mu);

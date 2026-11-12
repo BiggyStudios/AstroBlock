@@ -555,7 +555,7 @@ impl Game {
                 self.throw_block(block, center, t);
                 taken += 1;
                 // Treetops come away in armfuls.
-                if taken >= 3 || !is_plant(block) {
+                if taken >= 3 || !block.is_plant() {
                     break;
                 }
             }
@@ -1132,19 +1132,10 @@ impl Game {
     }
 }
 
-/// Trees and such: a funnel takes several at a time.
-fn is_plant(block: Block) -> bool {
-    use Block::*;
-    matches!(
-        block,
-        OakLeaves | SpruceLeaves | JungleLeaves | OakLog | SpruceLog | Cactus
-    )
-}
-
 /// What a tornado can lift: loose and light things (not stone, not models with contents).
 fn can_be_ripped(block: Block) -> bool {
     use Block::*;
-    is_plant(block)
+    block.is_plant()
         || matches!(
             block,
             OakPlanks
