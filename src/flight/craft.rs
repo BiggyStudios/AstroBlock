@@ -55,6 +55,8 @@ pub const FUEL_ENERGY: f64 = 2_000_000.0;
 /// A drill while it bores (W), and what opening a big door costs (J).
 pub const DRILL_POWER: f64 = 12_000.0;
 pub const BIG_DOOR_ENERGY: f64 = 40_000.0;
+/// An RTG on board: what it makes, day and night, for ever (W).
+pub const RTG_POWER: f64 = 10_000.0;
 
 /// `Part::facing` of a door: bits 0-2 the way its front looks (as for any part), bits 3-6 which
 /// cell of the door it is (across + 3 x up), bit 7 open.
@@ -78,6 +80,7 @@ pub fn is_vehicle_model(block: Block) -> bool {
         Block::Accumulator
             | Block::CoalGenerator
             | Block::SolarPanel
+            | Block::Rtg
             | Block::Door
             | Block::SlidingDoor
             | Block::BigDoor
@@ -228,6 +231,8 @@ pub fn engine_kind(block: Block) -> Option<EngineKind> {
             power: 40_000.0,
             ..kind(600.0, f64::INFINITY, AirUse::Vacuum(0.0))?
         }),
+        // Antimatter heats what it throws out: a rocket thirty times as frugal, at a price.
+        Block::AntimatterDrive => kind(40_000.0, 120_000.0, AirUse::Rocket),
         _ => None,
     }
 }
@@ -267,6 +272,8 @@ pub fn part_mass(block: Block) -> f64 {
         VectorEngine => 560.0,
         Aerospike => 420.0,
         IonEngine => 300.0,
+        AntimatterDrive => 1_500.0,
+        Rtg => 250.0,
         VehicleDrill => 400.0,
         SolarPanel => 50.0,
         Accumulator => 300.0,
@@ -311,6 +318,7 @@ pub fn is_cube(block: Block) -> bool {
             | VectorEngine
             | Aerospike
             | IonEngine
+            | AntimatterDrive
             | VehicleDrill
     ) && !is_vehicle_model(block)
 }
@@ -327,6 +335,7 @@ pub fn can_turn(block: Block) -> bool {
             | VectorEngine
             | Aerospike
             | IonEngine
+            | AntimatterDrive
             | VehicleDrill
             | SolarPanel
             | Wing
@@ -347,13 +356,15 @@ pub fn auto_facing(block: Block, outward: DVec3, stats: &Stats) -> u8 {
         | Block::OrbitalEngine
         | Block::VectorEngine
         | Block::Aerospike
-        | Block::IonEngine => facing_of(outward),
+        | Block::IonEngine
+        | Block::AntimatterDrive => facing_of(outward),
         // A drill bores away from what it is put on.
         Block::VehicleDrill => facing_of(outward),
         // Panels face the sky; machines and doors face out (or forward, put on a floor).
         Block::SolarPanel => facing_of(up),
         Block::Accumulator
         | Block::CoalGenerator
+        | Block::Rtg
         | Block::Door
         | Block::SlidingDoor
         | Block::BigDoor => {
@@ -452,6 +463,8 @@ pub struct Stats {
     pub solar: Vec<DVec3>,
     /// Coal generators aboard (they burn the tanks' fuel).
     pub generators: usize,
+    /// RTGs aboard.
+    pub rtgs: usize,
     pub drills: Vec<Drill>,
     pub doors: Vec<CraftDoor>,
     /// Something on it runs on electricity: driven wheels, ion engines, drills, big doors.
@@ -493,6 +506,7 @@ impl Default for Stats {
             battery: 0.0,
             solar: Vec::new(),
             generators: 0,
+            rtgs: 0,
             drills: Vec::new(),
             doors: Vec::new(),
             electric: false,
@@ -788,6 +802,7 @@ impl Craft {
                 Block::Accumulator => s.battery += ACCUMULATOR_BATTERY,
                 Block::SolarPanel => s.solar.push(direction(part.facing)),
                 Block::CoalGenerator => s.generators += 1,
+                Block::Rtg => s.rtgs += 1,
                 Block::VehicleDrill => {
                     s.electric = true;
                     s.drills.push(Drill {

@@ -1,7 +1,10 @@
 //! Items: blocks you carry, materials, tools; stacks; and the Minecraft rules for mining
 //! (break times, which tool harvests what) and what blocks drop.
 
-use crate::world::{block::Block, textures::Tex};
+use crate::world::{
+    block::Block,
+    textures::{IconTex, Tex},
+};
 
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
@@ -202,7 +205,68 @@ pub enum Item {
     /// (Saves from when there were AI servers load them as computers.)
     #[serde(alias = "AiServer")]
     Computer,
+    /// A fluid: only ever what a recipe makes (it is piped, never carried: see `fluids`).
+    Fluid(crate::factory::fluids::Fluid),
+    // Chemistry and metals.
+    Sulfur,
+    Fluorite,
+    Saltpeter,
+    RawLead,
+    LeadIngot,
+    Alumina,
+    AluminiumIngot,
+    TitaniumIngot,
+    Zircon,
+    Zirconium,
+    ElectricMotor,
+    TurbineBlade,
+    SuperconductingMagnet,
+    // Nuclear.
+    Yellowcake,
+    DepletedUranium,
+    UraniumFuelRod,
+    MoxFuelRod,
+    /// Hot out of a reactor: it must cool in a cooling pool before it can be reprocessed.
+    SpentFuelRod,
+    CooledSpentFuel,
+    /// The chopped cladding of spent fuel.
+    FuelHulls,
+    RecoveredUranium,
+    Plutonium,
+    /// Held in a magnetic bottle.
+    Antimatter,
 }
+
+/// What the chemistry and metal chains make, in catalog order.
+pub const CHEMISTRY: [Item; 13] = [
+    Item::Sulfur,
+    Item::Fluorite,
+    Item::Saltpeter,
+    Item::RawLead,
+    Item::LeadIngot,
+    Item::Alumina,
+    Item::AluminiumIngot,
+    Item::TitaniumIngot,
+    Item::Zircon,
+    Item::Zirconium,
+    Item::ElectricMotor,
+    Item::TurbineBlade,
+    Item::SuperconductingMagnet,
+];
+
+/// What the nuclear chains make, in catalog order.
+pub const NUCLEAR: [Item; 10] = [
+    Item::Yellowcake,
+    Item::DepletedUranium,
+    Item::UraniumFuelRod,
+    Item::MoxFuelRod,
+    Item::SpentFuelRod,
+    Item::CooledSpentFuel,
+    Item::FuelHulls,
+    Item::RecoveredUranium,
+    Item::Plutonium,
+    Item::Antimatter,
+];
 
 /// What industry makes, in catalog order.
 pub const INDUSTRY: [Item; 20] = [
@@ -244,19 +308,22 @@ pub enum Category {
     Materials,
     /// Wire, boards, chips, screens and computers.
     Electronics,
+    /// Uranium, fuel rods, plutonium, antimatter, waste.
+    Nuclear,
     /// Tools, weapons and armor.
     Gear,
     Food,
 }
 
 impl Category {
-    pub const ALL: [Category; 8] = [
+    pub const ALL: [Category; 9] = [
         Category::Terrain,
         Category::Building,
         Category::Factory,
         Category::Vehicles,
         Category::Materials,
         Category::Electronics,
+        Category::Nuclear,
         Category::Gear,
         Category::Food,
     ];
@@ -269,6 +336,7 @@ impl Category {
             Category::Vehicles => "vehicles",
             Category::Materials => "materials",
             Category::Electronics => "electronics",
+            Category::Nuclear => "nuclear",
             Category::Gear => "gear",
             Category::Food => "food",
         }
@@ -283,13 +351,16 @@ impl Category {
     }
 }
 
-/// How an item looks in the inventory and on the ground.
+/// How an item looks in the inventory (and, but for pictures, on the ground and in hand).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Icon {
-    /// An isometric cube with these (top, left, right) faces.
+    /// A flat tile of the block's side (`Block::icon_faces`).
     Block(Block),
     /// A flat sprite (alpha = transparency).
     Sprite(Tex),
+    /// A machine's picture, only in the interface (`IconTex`); in the world the machine
+    /// shows its model.
+    Picture(IconTex),
 }
 
 impl Item {
@@ -335,6 +406,8 @@ impl Item {
         items.push(Item::Rocket);
         items.push(Item::Cable);
         items.extend(INDUSTRY);
+        items.extend(CHEMISTRY);
+        items.extend(NUCLEAR);
         items
     }
 
@@ -342,6 +415,7 @@ impl Item {
     /// are factory or vehicle parts, or listed under building here.
     pub fn category(self) -> Category {
         match self {
+            Item::Block(Block::VitrifiedWaste) => Category::Nuclear,
             Item::Block(b) if b.is_factory() => Category::Factory,
             Item::Cable => Category::Factory,
             Item::Block(b) if b.is_vehicle_part() => Category::Vehicles,
@@ -358,7 +432,9 @@ impl Item {
                 | Block::Torch
                 | Block::Door
                 | Block::SlidingDoor
-                | Block::BigDoor,
+                | Block::BigDoor
+                | Block::Concrete
+                | Block::SteelPlating,
             ) => Category::Building,
             Item::Block(_) => Category::Terrain,
             Item::Tool(..) | Item::Armor(..) => Category::Gear,
@@ -384,7 +460,31 @@ impl Item {
             | Item::Plastic
             | Item::Rubber
             | Item::Silicon
-            | Item::SteelIngot => Category::Materials,
+            | Item::SteelIngot
+            | Item::Fluid(_)
+            | Item::Sulfur
+            | Item::Fluorite
+            | Item::Saltpeter
+            | Item::RawLead
+            | Item::LeadIngot
+            | Item::Alumina
+            | Item::AluminiumIngot
+            | Item::TitaniumIngot
+            | Item::Zircon
+            | Item::Zirconium => Category::Materials,
+            Item::Yellowcake
+            | Item::DepletedUranium
+            | Item::UraniumFuelRod
+            | Item::MoxFuelRod
+            | Item::SpentFuelRod
+            | Item::CooledSpentFuel
+            | Item::FuelHulls
+            | Item::RecoveredUranium
+            | Item::Plutonium
+            | Item::Antimatter => Category::Nuclear,
+            Item::ElectricMotor | Item::TurbineBlade | Item::SuperconductingMagnet => {
+                Category::Electronics
+            }
             Item::SiliconWafer
             | Item::CopperWire
             | Item::InsulatedWire
@@ -421,6 +521,14 @@ impl Item {
             Item::Cpu => "CPU".into(),
             Item::Led => "LED".into(),
             Item::AiChip => "AI Chip".into(),
+            Item::MoxFuelRod => "MOX Fuel Rod".into(),
+            Item::Fluid(f) => {
+                let mut name = f.name().to_string();
+                if let Some(first) = name.get_mut(0..1) {
+                    first.make_ascii_uppercase();
+                }
+                name
+            }
             other => {
                 // "SiliconWafer" -> "Silicon Wafer"
                 let raw = format!("{other:?}");
@@ -457,7 +565,7 @@ impl Item {
         match self {
             Item::Block(Block::Torch) => Icon::Sprite(Tex::TorchSide),
             Item::Block(Block::PowerPole) => Icon::Sprite(Tex::PoleIcon),
-            Item::Block(b) => Icon::Block(b),
+            Item::Block(b) => IconTex::of(b).map_or(Icon::Block(b), Icon::Picture),
             Item::Stick => Icon::Sprite(Tex::Stick),
             Item::Coal => Icon::Sprite(Tex::Coal),
             Item::Charcoal => Icon::Sprite(Tex::Charcoal),
@@ -499,6 +607,30 @@ impl Item {
             Item::PowerSupply => Icon::Sprite(Tex::PowerSupply),
             Item::ComputerCase => Icon::Sprite(Tex::ComputerCase),
             Item::Computer => Icon::Sprite(Tex::Computer),
+            Item::Fluid(f) => Icon::Sprite(f.tex()),
+            Item::Sulfur => Icon::Sprite(Tex::Sulfur),
+            Item::Fluorite => Icon::Sprite(Tex::Fluorite),
+            Item::Saltpeter => Icon::Sprite(Tex::Saltpeter),
+            Item::RawLead => Icon::Sprite(Tex::RawLead),
+            Item::LeadIngot => Icon::Sprite(Tex::LeadIngot),
+            Item::Alumina => Icon::Sprite(Tex::Alumina),
+            Item::AluminiumIngot => Icon::Sprite(Tex::AluminiumIngot),
+            Item::TitaniumIngot => Icon::Sprite(Tex::TitaniumIngot),
+            Item::Zircon => Icon::Sprite(Tex::Zircon),
+            Item::Zirconium => Icon::Sprite(Tex::Zirconium),
+            Item::ElectricMotor => Icon::Sprite(Tex::ElectricMotor),
+            Item::TurbineBlade => Icon::Sprite(Tex::TurbineBlade),
+            Item::SuperconductingMagnet => Icon::Sprite(Tex::Magnet),
+            Item::Yellowcake => Icon::Sprite(Tex::Yellowcake),
+            Item::DepletedUranium => Icon::Sprite(Tex::DepletedUranium),
+            Item::UraniumFuelRod => Icon::Sprite(Tex::UraniumFuelRod),
+            Item::MoxFuelRod => Icon::Sprite(Tex::MoxFuelRod),
+            Item::SpentFuelRod => Icon::Sprite(Tex::SpentFuelRod),
+            Item::CooledSpentFuel => Icon::Sprite(Tex::CooledSpentFuel),
+            Item::FuelHulls => Icon::Sprite(Tex::FuelHulls),
+            Item::RecoveredUranium => Icon::Sprite(Tex::RecoveredUranium),
+            Item::Plutonium => Icon::Sprite(Tex::Plutonium),
+            Item::Antimatter => Icon::Sprite(Tex::Antimatter),
         }
     }
 
@@ -539,6 +671,7 @@ impl Item {
             Item::RawIron | Item::Block(Block::IronOre) => Some(Item::IronIngot),
             Item::RawCopper | Item::Block(Block::CopperOre) => Some(Item::CopperIngot),
             Item::RawGold | Item::Block(Block::GoldOre) => Some(Item::GoldIngot),
+            Item::RawLead | Item::Block(Block::LeadOre) => Some(Item::LeadIngot),
             Item::Block(Block::Cobblestone) => Some(Item::Block(Block::Stone)),
             Item::Block(Block::OakLog | Block::SpruceLog) => Some(Item::Charcoal),
             Item::Block(Block::Sand) => Some(Item::Block(Block::Glass)),
@@ -694,6 +827,15 @@ pub fn mining(block: Block) -> Mining {
         Door | DoorOpen => m(3.0, Some(Axe), None),
         SlidingDoor | SlidingDoorOpen => m(2.0, Some(Pickaxe), None),
         BigDoor | BigDoorOpen => m(3.5, Some(Pickaxe), None),
+        SulfurOre | SaltpeterOre => m(2.0, Some(Pickaxe), Some(0)),
+        LeadOre | FluoriteOre => m(3.0, Some(Pickaxe), Some(1)),
+        Concrete => m(2.5, Some(Pickaxe), Some(0)),
+        SteelPlating | VitrifiedWaste => m(5.0, Some(Pickaxe), Some(1)),
+        Pipe => m(1.0, Some(Pickaxe), None),
+        StorageTank | WaterPump | Electrolyzer | Centrifuge | FuelFabricator | Boiler
+        | GeothermalWell | WindTurbine | Rtg | Blender | SteamTurbine | NuclearReactor
+        | CoolingPool | ReprocessingPlant | ParticleAccelerator => m(3.5, Some(Pickaxe), Some(0)),
+        AntimatterDrive => m(1.2, None, None),
     }
 }
 
@@ -737,6 +879,10 @@ pub fn drops(block: Block, tool: Option<(ToolKind, Tier)>, roll: f32) -> Option<
         CopperOre => Item::RawCopper,
         GoldOre => Item::RawGold,
         DiamondOre => Item::Diamond,
+        LeadOre => Item::RawLead,
+        FluoriteOre => Item::Fluorite,
+        SulfurOre => return Some(ItemStack::new(Item::Sulfur, 2)),
+        SaltpeterOre => return Some(ItemStack::new(Item::Saltpeter, 2)),
         // No saplings yet: leaves sometimes drop a stick.
         OakLeaves | SpruceLeaves | JungleLeaves => {
             return (roll < 0.05).then(|| ItemStack::one(Item::Stick));

@@ -6,7 +6,11 @@
 
 use crate::render::TextureArrayData;
 
+mod chemistry;
+mod icons;
 mod industry;
+
+pub use icons::IconTex;
 
 pub const TEX_SIZE: usize = 16;
 
@@ -232,6 +236,63 @@ textures! {
     DoorPlanks,
     SlidingPanel,
     ShutterPanel,
+    // Chemistry and nuclear power (`textures/chemistry.rs`). Block faces first (alpha 0).
+    SulfurOre,
+    LeadOre,
+    FluoriteOre,
+    SaltpeterOre,
+    Concrete,
+    SteelPlate,
+    VitrifiedSide,
+    VitrifiedTop,
+    ControlPanel,
+    ControlPanelLit,
+    Cherenkov,
+    HotCell,
+    HotCellLit,
+    TankPaint,
+    AntimatterFace,
+    // Pipes: the run, and the collars, flanges and fittings.
+    PipeSteel,
+    PipeFitting,
+    // Fluids, as flasks (`Fluid::tex`, in `Fluid::ALL`'s order).
+    FluidWater,
+    FluidSteam,
+    FluidSulfuricAcid,
+    FluidNitricAcid,
+    FluidHydrofluoricAcid,
+    FluidHydrogen,
+    FluidOxygen,
+    FluidHexafluoride,
+    FluidEnrichedHexafluoride,
+    FluidDissolvedFuel,
+    FluidLoadedSolvent,
+    FluidLiquidWaste,
+    FluidSolvent,
+    // What the new chains make (item sprites).
+    Sulfur,
+    Fluorite,
+    Saltpeter,
+    RawLead,
+    LeadIngot,
+    Alumina,
+    AluminiumIngot,
+    TitaniumIngot,
+    Zircon,
+    Zirconium,
+    ElectricMotor,
+    TurbineBlade,
+    Magnet,
+    Yellowcake,
+    DepletedUranium,
+    UraniumFuelRod,
+    MoxFuelRod,
+    SpentFuelRod,
+    CooledSpentFuel,
+    FuelHulls,
+    RecoveredUranium,
+    Plutonium,
+    Antimatter,
 }
 
 impl Tex {
@@ -257,7 +318,12 @@ pub fn generate() -> TextureArrayData {
     for (i, t) in Tex::ALL.iter().enumerate() {
         debug_assert_eq!(*t as usize, i, "Tex::ALL must be in declaration order");
     }
-    let layers = Tex::ALL.iter().map(|&t| make(t).into_bytes()).collect();
+    // (The interface's pictures come after every `Tex`: `IconTex::layer`.)
+    let layers = Tex::ALL
+        .iter()
+        .map(|&t| make(t).into_bytes())
+        .chain(IconTex::ALL.iter().map(|&i| icons::make(i).into_bytes()))
+        .collect();
     TextureArrayData {
         size: TEX_SIZE as u32,
         layers,
@@ -1476,4 +1542,50 @@ fn fur(r: &mut Rng) -> Img {
         img.shade(x, y, 1.05);
     }
     img
+}
+
+/// Writes sprites eight times their size on a grey ground, seven to a row, as a BMP (to look
+/// at them: see the ignored `write_*` tests).
+#[cfg(test)]
+fn write_sheet(path: &str, sprites: &[Vec<[u8; 4]>]) {
+    const ZOOM: usize = 8;
+    let columns = 7;
+    let rows = sprites.len().div_ceil(columns);
+    let cell = TEX_SIZE * ZOOM + 8;
+    let (w, h) = (columns * cell, rows * cell);
+    let mut rgb = vec![[96u8, 102, 116]; w * h];
+    for (i, px) in sprites.iter().enumerate() {
+        let (ox, oy) = ((i % columns) * cell + 4, (i / columns) * cell + 4);
+        for y in 0..TEX_SIZE * ZOOM {
+            for x in 0..TEX_SIZE * ZOOM {
+                let p = px[(y / ZOOM) * TEX_SIZE + x / ZOOM];
+                if p[3] >= 128 {
+                    rgb[(oy + y) * w + ox + x] = [p[0], p[1], p[2]];
+                }
+            }
+        }
+    }
+    let row = (w * 3).div_ceil(4) * 4;
+    let mut file = Vec::new();
+    let size = 54 + row * h;
+    file.extend(b"BM");
+    file.extend((size as u32).to_le_bytes());
+    file.extend([0u8; 4]);
+    file.extend(54u32.to_le_bytes());
+    file.extend(40u32.to_le_bytes());
+    file.extend((w as i32).to_le_bytes());
+    file.extend((h as i32).to_le_bytes());
+    file.extend(1u16.to_le_bytes());
+    file.extend(24u16.to_le_bytes());
+    file.extend([0u8; 24]);
+    for y in (0..h).rev() {
+        let start = file.len();
+        for x in 0..w {
+            let [r, g, b] = rgb[y * w + x];
+            file.extend([b, g, r]);
+        }
+        file.resize(start + row, 0);
+    }
+    std::fs::create_dir_all("target").unwrap();
+    std::fs::write(path, file).unwrap();
 }

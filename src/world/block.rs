@@ -159,6 +159,58 @@ pub enum Block {
     /// Three by three, rolls up on a motor: needs power.
     BigDoor,
     BigDoorOpen,
+    // More ores (the chemistry and nuclear chains, see `factory::recipes`).
+    /// Yellow crystals round volcanoes (and deep down anywhere): sulfuric acid.
+    SulfurOre,
+    /// Galena: lead, for shielding and RTGs.
+    LeadOre,
+    /// Purple crystals in mountains: hydrofluoric acid.
+    FluoriteOre,
+    /// A white nitrate crust just under deserts: nitric acid.
+    SaltpeterOre,
+    // Building blocks.
+    /// Poured stone, out of a blender.
+    Concrete,
+    /// A block of steel plate.
+    SteelPlating,
+    /// Nuclear waste set in glass, in a steel can: safe to keep (it glows a little).
+    VitrifiedWaste,
+    // Fluids and power (factory parts, models).
+    /// Carries fluids between machines and tanks: every pipe touching another joins it.
+    Pipe,
+    /// Holds a lot of one fluid.
+    StorageTank,
+    /// Pumps water from the water next to it.
+    WaterPump,
+    /// Splits water into hydrogen and oxygen; aluminium out of alumina.
+    Electrolyzer,
+    /// Spins uranium hexafluoride apart: enriched, and depleted uranium.
+    Centrifuge,
+    /// Makes fuel rods.
+    FuelFabricator,
+    /// Burns fuel to boil water into steam.
+    Boiler,
+    /// Boils water on the heat underground (lava near it, or deep down).
+    GeothermalWell,
+    /// Makes power from the wind: more on high ground and in storms.
+    WindTurbine,
+    /// A radioisotope generator: a little power for ever, in a factory or on a vehicle.
+    Rtg,
+    // Big machines: each fills a block of cells round the one it was put on (`structure`).
+    /// Five by five: mixes acids and leaches ore.
+    Blender,
+    /// Three by three: steam into power.
+    SteamTurbine,
+    /// Five by five: fuel rods and water into steam. Melts down if it runs dry.
+    NuclearReactor,
+    /// Three by three: spent fuel cools under water.
+    CoolingPool,
+    /// Three by three: takes spent fuel apart into uranium, plutonium and waste.
+    ReprocessingPlant,
+    /// Seven by seven: a ring that makes plutonium and antimatter, on a lot of power.
+    ParticleAccelerator,
+    /// A vehicle engine: antimatter heats its propellant. Very fast exhaust.
+    AntimatterDrive,
 }
 
 /// What kind of door a door block belongs to.
@@ -222,7 +274,7 @@ pub enum Tint {
 
 impl Block {
     /// Every block, in declaration order.
-    pub const ALL: [Block; 87] = {
+    pub const ALL: [Block; 111] = {
         use Block::*;
         [
             Air,
@@ -312,6 +364,30 @@ impl Block {
             SlidingDoorOpen,
             BigDoor,
             BigDoorOpen,
+            SulfurOre,
+            LeadOre,
+            FluoriteOre,
+            SaltpeterOre,
+            Concrete,
+            SteelPlating,
+            VitrifiedWaste,
+            Pipe,
+            StorageTank,
+            WaterPump,
+            Electrolyzer,
+            Centrifuge,
+            FuelFabricator,
+            Boiler,
+            GeothermalWell,
+            WindTurbine,
+            Rtg,
+            Blender,
+            SteamTurbine,
+            NuclearReactor,
+            CoolingPool,
+            ReprocessingPlant,
+            ParticleAccelerator,
+            AntimatterDrive,
         ]
     };
 
@@ -320,11 +396,35 @@ impl Block {
         ((Block::VehicleCore as u8..=Block::LandingGear as u8).contains(&(self as u8))
             && self != Block::Hull)
             || (Block::LargeWheel as u8..=Block::VehicleDrill as u8).contains(&(self as u8))
+            || self == Block::AntimatterDrive
     }
 
-    /// Part of a factory (see `factory`): conveyors, poles and machines.
+    /// Part of a factory (see `factory`): conveyors, pipes, poles and machines.
     pub fn is_factory(self) -> bool {
-        self == Block::Conveyor || self.is_electric()
+        matches!(self, Block::Conveyor | Block::Pipe) || self.is_electric()
+    }
+
+    /// The cells a model block fills (see `factory::footprint`): this many cells out from the
+    /// one it was put on, each way across, and this many up. (0, 1) for one cell.
+    pub fn structure(self) -> (i32, i32) {
+        match self {
+            Block::Blender => (2, 4),
+            Block::Miner => (1, 5),
+            Block::NuclearReactor => (2, 5),
+            Block::SteamTurbine => (1, 2),
+            Block::CoolingPool => (1, 1),
+            Block::ReprocessingPlant => (1, 3),
+            Block::ParticleAccelerator => (3, 2),
+            Block::Centrifuge => (0, 3),
+            Block::Electrolyzer | Block::Boiler | Block::StorageTank => (0, 2),
+            Block::WindTurbine => (0, 8),
+            _ => (0, 1),
+        }
+    }
+
+    /// Fills more than its own cell (`structure`).
+    pub fn is_structure(self) -> bool {
+        self.structure() != (0, 1)
     }
 
     /// A cell of a door, and which kind; whether it stands open.
@@ -372,6 +472,21 @@ impl Block {
                 | Block::ChipFab
                 | Block::Accumulator
                 | Block::SolarPanel
+                | Block::StorageTank
+                | Block::WaterPump
+                | Block::Electrolyzer
+                | Block::Centrifuge
+                | Block::FuelFabricator
+                | Block::Boiler
+                | Block::GeothermalWell
+                | Block::WindTurbine
+                | Block::Rtg
+                | Block::Blender
+                | Block::SteamTurbine
+                | Block::NuclearReactor
+                | Block::CoolingPool
+                | Block::ReprocessingPlant
+                | Block::ParticleAccelerator
         )
     }
 
@@ -412,6 +527,7 @@ impl Block {
         match self {
             Block::OuterCore | Block::Lava => 15,
             Block::InnerCore => 12,
+            Block::VitrifiedWaste => 5,
             _ => 0,
         }
     }
@@ -511,6 +627,25 @@ impl Block {
             Door | DoorOpen => all(Tex::DoorPlanks),
             SlidingDoor | SlidingDoorOpen => all(Tex::SlidingPanel),
             BigDoor | BigDoorOpen => all(Tex::ShutterPanel),
+            SulfurOre => all(Tex::SulfurOre),
+            LeadOre => all(Tex::LeadOre),
+            FluoriteOre => all(Tex::FluoriteOre),
+            SaltpeterOre => all(Tex::SaltpeterOre),
+            Concrete => all(Tex::Concrete),
+            SteelPlating => all(Tex::SteelPlate),
+            VitrifiedWaste => [Tex::VitrifiedTop, Tex::VitrifiedSide, Tex::VitrifiedTop],
+            Pipe => all(Tex::MachineTop),
+            StorageTank | Centrifuge | Electrolyzer => {
+                [Tex::TankPaint, Tex::TankPaint, Tex::MachineTop]
+            }
+            NuclearReactor | CoolingPool | ReprocessingPlant => {
+                [Tex::Concrete, Tex::Concrete, Tex::Concrete]
+            }
+            WaterPump | FuelFabricator | Boiler | GeothermalWell | WindTurbine | Rtg | Blender
+            | SteamTurbine | ParticleAccelerator => {
+                [Tex::MachineTop, Tex::MachineSide, Tex::MachineSide]
+            }
+            AntimatterDrive => all(Tex::AntimatterFace),
         }
     }
 
@@ -521,7 +656,7 @@ impl Block {
             Dirt => Material::Dirt,
             OakLog | SpruceLog | OakPlanks | SprucePlanks | CraftingTable | Chest | Torch
             | PowerPole | Door | DoorOpen => Material::Wood,
-            Sand | RedSand | IlmeniteSand | Regolith | Ash => Material::Sand,
+            Sand | RedSand | IlmeniteSand | Regolith | Ash | SaltpeterOre => Material::Sand,
             Gravel => Material::Gravel,
             Snow => Material::Snow,
             Glass | Ice => Material::Glass,
@@ -548,6 +683,17 @@ impl Block {
             Block::ChipFab => [Tex::CleanPanel, Tex::FabFront, Tex::CleanPanel],
             Block::Accumulator => [Tex::MachineTop, Tex::AccumulatorFront, Tex::MachineSide],
             Block::SolarPanel => [Tex::SolarCell, Tex::SolarCell, Tex::MachineSide],
+            Block::NuclearReactor => [Tex::Concrete, Tex::ControlPanelLit, Tex::Hazard],
+            Block::ReprocessingPlant => [Tex::Concrete, Tex::HotCellLit, Tex::Concrete],
+            Block::CoolingPool => [Tex::Cherenkov, Tex::Concrete, Tex::Concrete],
+            Block::ParticleAccelerator => [Tex::MachineTop, Tex::ControlPanelLit, Tex::Hazard],
+            Block::FuelFabricator => [Tex::MachineTop, Tex::ControlPanel, Tex::MachineSide],
+            Block::Boiler => [Tex::MachineTop, Tex::GeneratorFrontLit, Tex::MachineSide],
+            Block::Blender => [Tex::TankPaint, Tex::Hazard, Tex::MachineSide],
+            Block::SteamTurbine | Block::WindTurbine => {
+                [Tex::TankPaint, Tex::MachineSide, Tex::TankPaint]
+            }
+            Block::Rtg => [Tex::CableSkin, Tex::Hazard, Tex::CableSkin],
             _ => {
                 let [top, side, _] = self.textures();
                 [top, side, side]
@@ -588,7 +734,11 @@ mod tests {
         for (i, b) in Block::ALL.iter().enumerate() {
             assert_eq!(*b as usize, i);
         }
-        assert_eq!(*Block::ALL.last().unwrap(), Block::BigDoorOpen);
+        assert_eq!(*Block::ALL.last().unwrap(), Block::AntimatterDrive);
+        assert!(Block::Pipe.is_factory() && !Block::Pipe.is_electric() && Block::Pipe.is_model());
+        assert!(Block::NuclearReactor.is_machine() && Block::NuclearReactor.is_structure());
+        assert!(Block::AntimatterDrive.is_vehicle_part() && !Block::Rtg.is_vehicle_part());
+        assert!(!Block::Concrete.is_model() && !Block::SulfurOre.is_factory());
         assert!(Block::Assembler.is_machine() && Block::Assembler.is_model());
         assert!(!Block::OilShale.is_model() && !Block::OilShale.is_factory());
         assert!(Block::Wheel.is_vehicle_part() && !Block::Hull.is_vehicle_part());

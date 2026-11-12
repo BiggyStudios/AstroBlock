@@ -88,7 +88,12 @@ pub enum SlotId {
     MachineIn(usize),
     /// One of what a recipe machine can make (click to pick it).
     Recipe(usize),
+    /// A machine's second output (what a recipe also makes).
+    Extra,
 }
+
+/// GUI pixels per gauge line on a machine's screen (its tanks).
+const GAUGE_H: f32 = 12.0;
 
 /// Cell pitch and content width, in GUI pixels.
 const CELL: f32 = 20.0;
@@ -132,6 +137,8 @@ pub struct Layout {
     catalog: Catalog,
     /// A machine screen's working row (ingredients, progress, output), GUI pixels down.
     work_y: f32,
+    /// Where a machine screen's gauges start (GUI pixels down).
+    gauges_y: f32,
 }
 
 /// Recipes in a row of a machine's screen.
@@ -148,6 +155,7 @@ impl Layout {
         recipe: Option<Item>,
     ) -> Self {
         let mut work_y = 30.0;
+        let mut gauges_y = 0.0;
         let mut slots = Vec::new();
         let mut labels = Vec::new();
         let mut tabs = Vec::new();
@@ -203,26 +211,40 @@ impl Layout {
                 let rows = list.len().div_ceil(RECIPE_COLUMNS) as f32;
                 work_y = 10.0 + rows * CELL + 14.0;
                 labels.push((0.0, work_y - 10.0, "needs"));
-                let needs = recipe
-                    .and_then(|r| recipes::find(kind, r))
-                    .map_or(0, |r| r.inputs.len());
+                let picked = recipe.and_then(|r| recipes::find(kind, r));
+                let needs = picked.map_or(0, |r| r.inputs.len());
                 for i in 0..needs {
                     slots.push((SlotId::MachineIn(i), i as f32 * CELL, work_y));
                 }
-                slots.push((SlotId::FurnaceOut, 140.0, work_y));
-                work_y + CELL + 16.0
+                // (A fluid product has no slot: it is piped away.)
+                if !picked.is_some_and(|r| matches!(r.output, Item::Fluid(_))) {
+                    slots.push((SlotId::FurnaceOut, 140.0, work_y));
+                }
+                if picked.is_some_and(|r| r.extra.is_some()) {
+                    slots.push((SlotId::Extra, 160.0, work_y));
+                }
+                gauges_y = work_y + CELL + 16.0;
+                gauges_y + factory::gauge_count(kind, recipe) as f32 * GAUGE_H
             }
             Screen::Machine(_, kind) => {
                 labels.push((40.0, 0.0, kind.name()));
                 match kind {
-                    MachineKind::Generator => slots.push((SlotId::FurnaceFuel, 40.0, 30.0)),
+                    MachineKind::Generator | MachineKind::Boiler => {
+                        slots.push((SlotId::FurnaceFuel, 40.0, 30.0))
+                    }
+                    MachineKind::Reactor => {
+                        slots.push((SlotId::FurnaceFuel, 40.0, 30.0));
+                        slots.push((SlotId::FurnaceOut, 120.0, 30.0));
+                    }
                     MachineKind::ElectricFurnace => {
                         slots.push((SlotId::FurnaceIn, 40.0, 30.0));
                         slots.push((SlotId::FurnaceOut, 120.0, 30.0));
                     }
-                    _ => slots.push((SlotId::FurnaceOut, 120.0, 30.0)),
+                    k if k.has_output() => slots.push((SlotId::FurnaceOut, 120.0, 30.0)),
+                    _ => {}
                 }
-                72.0
+                gauges_y = 72.0;
+                gauges_y + factory::gauge_count(kind, recipe) as f32 * GAUGE_H
             }
             Screen::Power(_) => {
                 labels.push((0.0, 0.0, "power"));
@@ -280,6 +302,7 @@ impl Layout {
             tabs,
             catalog,
             work_y,
+            gauges_y,
         }
     }
 
@@ -456,7 +479,11 @@ pub fn draw(
             // The fuel burning (generator) or the work going on, and a word on how it goes.
             let m = view.machine;
             let fill = m.map_or(0.0, |m| {
-                if kind == MachineKind::Generator {
+                let burns = matches!(
+                    kind,
+                    MachineKind::Generator | MachineKind::Boiler | MachineKind::Reactor
+                );
+                if burns {
                     if m.energy_total > 0.0 {
                         m.energy / m.energy_total
                     } else {
@@ -484,6 +511,19 @@ pub fn draw(
                 let text = recipe_line(r);
                 let w = ui.text_width(&text);
                 ui.text_plain(x - w, y, &text, ACCENT);
+            }
+            // Its tanks: what is in them, as words and a line in the fluid's colour.
+            if let Some(m) = m {
+                for (i, g) in m.gauges().iter().enumerate() {
+                    let gy = layout.gauges_y + i as f32 * GAUGE_H;
+                    let (x, y) = layout.at(0.0, gy);
+                    ui.text_plain(x, y, &g.text, LABEL);
+                    let (bx, by) = layout.at(0.0, gy + 9.0);
+                    ui.rect(bx, by, WIDTH * s, s, FAINT);
+                    let [r, gr, b] = g.color;
+                    let fill = (WIDTH * s * g.fill.clamp(0.0, 1.0)).round();
+                    ui.rect(bx, by, fill, s, [r, gr, b, 230]);
+                }
             }
         }
         Screen::Power(_) => draw_power(ui, layout, view.power),
@@ -517,7 +557,7 @@ pub fn draw(
             _ => (view.slot)(id),
         };
         let glow = anim.hover.get(&id).copied().unwrap_or(0.0);
-        let result = matches!(id, SlotId::Output | SlotId::FurnaceOut);
+        let result = matches!(id, SlotId::Output | SlotId::FurnaceOut | SlotId::Extra);
         // The recipe it is set to stands out.
         let picked = matches!(id, SlotId::Recipe(_))
             && stack.is_some_and(|s| view.machine.and_then(|m| m.recipe) == Some(s.item));
@@ -758,11 +798,21 @@ fn recipe_card(ui: &mut Ui, x: f32, y: f32, r: &recipes::Recipe) {
         .iter()
         .map(|(item, n)| format!("{n} {}", item.name().to_lowercase()))
         .collect();
-    facts.push(format!(
-        "{} s, {:.0} kw",
-        r.time,
-        r.machine.power() / 1000.0
-    ));
+    facts.extend(
+        r.fluids
+            .iter()
+            .map(|(fluid, n)| format!("{n} l {} (piped)", fluid.name())),
+    );
+    let makes = r.makes();
+    if makes.len() > 1 || matches!(r.output, Item::Fluid(_)) {
+        facts.push(format!("makes {}", makes.join(", ")));
+    }
+    let kw = r.machine.power() / 1000.0;
+    facts.push(if kw >= 1000.0 {
+        format!("{} s, {:.1} mw", r.time, kw / 1000.0)
+    } else {
+        format!("{} s, {kw:.0} kw", r.time)
+    });
     let (_, ch) = ui.char_size();
     let width = std::iter::once(&name)
         .chain(&facts)

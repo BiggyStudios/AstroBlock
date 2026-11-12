@@ -555,7 +555,7 @@ impl Vessel {
         let Some(craft) = self.craft.take() else {
             return;
         };
-        if craft.stats.solar.is_empty() && craft.stats.generators == 0 {
+        if craft.stats.solar.is_empty() && craft.stats.generators == 0 && craft.stats.rtgs == 0 {
             self.craft = Some(craft);
             return;
         }

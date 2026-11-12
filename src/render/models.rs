@@ -10,6 +10,7 @@
 use glam::{DVec3, Vec3};
 
 use crate::{
+    factory::fluids::Fluid,
     render::{BlockVertex, ChunkMesh},
     survival::items::{Icon, Item},
     world::{
@@ -53,6 +54,33 @@ pub struct ModelState {
     /// Which cell of a door this is: across + 3 x up, from the bottom left seen from its front.
     #[serde(default)]
     pub piece: u8,
+    /// A pipe: which ways it joins (bits: +u, -u, +v, -v, up, down; see `factory::fluids`).
+    #[serde(default)]
+    pub links: u8,
+    /// A cell of a big machine other than its first: how far from that one it is (grid steps
+    /// u, v, k). Only the first draws the machine.
+    #[serde(default)]
+    pub offset: [i8; 3],
+    /// A storage tank: which fluid fills its gauge (`Fluid` + 1; 0 none), to `level`.
+    #[serde(default)]
+    pub fluid: u8,
+    /// A reactor overheating: its warning light is on.
+    #[serde(default)]
+    pub alarm: bool,
+    /// A pipe: which of its joins (`links`) are machines (a flange there). Its line's fluid is
+    /// `fluid` (a band of its colour).
+    #[serde(default)]
+    pub ports: u8,
+    /// A pipe joined to nothing (or one way): which way it runs, along u (0), v (1) or up (2).
+    #[serde(default)]
+    pub axis: u8,
+}
+
+impl ModelState {
+    /// The first cell of a big machine (the one that draws it).
+    pub fn is_core(&self) -> bool {
+        self.offset == [0; 3]
+    }
 }
 
 /// Steps of an accumulator's gauge (`ModelState::level`).
@@ -224,8 +252,6 @@ pub const BELT_TOP: f32 = 3.5;
 pub const POLE_TOP: f32 = 33.0;
 pub const MACHINE_TOP: f32 = 15.0;
 pub const MINER_TOP: f32 = 78.0;
-/// Blocks a miner's rig stands tall (the cells over it are kept clear).
-pub const MINER_HEIGHT: i32 = 5;
 pub const REFINERY_TOP: f32 = 13.0;
 /// How far a miner's drill goes down and comes back (model units).
 const DRILL_STROKE: f32 = 50.0;
@@ -655,29 +681,51 @@ impl MovingPart {
     }
 }
 
-/// A miner: a drilling rig five blocks tall. A deck striped round its edge with the control
-/// house at its front and a gearbox at the back, a derrick of four legs leaning in (rings and
-/// braces up each side) with the crown block on top, and the rail the top drive runs down.
-/// The drill and what drives it move: `miner_parts`.
+/// A miner: a drilling rig three blocks square and five tall (`Block::structure`), built about
+/// its middle cell, where the drill goes down. A deck striped round its edge on corner jacks,
+/// the control house at its front, the engine with its stacks at the back, mud tanks on one
+/// side and a rack of drill pipe on the other; a derrick of four legs leaning in from the
+/// deck's corners (rings and braces up each side) with the crown block on top, and the rail
+/// the top drive runs down. The drill and what drives it move: `miner_parts`.
 fn miner(front: Tex) -> Vec<Quad> {
     use Tex::*;
-    let mut q = quads_of(&[
+    let mut b = vec![
         cuboid(
-            [0.0, 0.0, 0.0],
-            [16.0, 16.0, 2.0],
+            [-16.0, -16.0, 1.0],
+            [32.0, 32.0, 3.0],
             MachineTop,
             Hazard,
             MachineTop,
         ),
+        // The rotary table round the hole.
+        dark([2.0, 2.0, 3.0], [14.0, 14.0, 4.5]),
+        // The control house: its panel at the front (the front texture's lower rows, as the
+        // one-block miner showed it), the cab over it, the roof.
         ModelBox {
             front,
-            ..steel([3.0, 0.5, 2.0], [13.0, 3.5, 8.0])
+            ..steel([0.0, -15.0, 3.0], [16.0, -6.0, 8.0])
         },
-        steel([2.5, 0.0, 8.0], [13.5, 4.0, 8.75]),
-        steel([3.5, 12.0, 2.0], [12.5, 15.5, 9.0]),
-        dark([4.5, 12.5, 9.0], [7.5, 15.0, 10.5]),
-        dark([5.0, 5.0, 2.0], [11.0, 11.0, 3.0]),
-        steel([4.0, 4.0, 72.0], [12.0, 12.0, 75.0]),
+        cuboid(
+            [0.5, -14.0, 8.0],
+            [15.5, -6.0, 14.0],
+            MachineTop,
+            MachineSide,
+            MachineTop,
+        ),
+        steel([-1.0, -15.5, 14.0], [17.0, -5.0, 15.0]),
+        // The engine and its stacks.
+        cuboid(
+            [-12.0, 20.0, 3.0],
+            [28.0, 31.0, 13.0],
+            TankPaint,
+            MachineSide,
+            TankPaint,
+        ),
+        steel([-10.0, 22.0, 13.0], [6.0, 29.0, 15.0]),
+        dark([18.0, 23.0, 13.0], [21.0, 26.0, 24.0]),
+        dark([23.0, 23.0, 13.0], [26.0, 26.0, 21.0]),
+        // The crown block, and where cables meet it.
+        steel([3.0, 3.0, 72.0], [13.0, 13.0, 75.0]),
         dark([6.0, 7.0, 75.0], [10.0, 9.0, 76.5]),
         cuboid(
             [7.25, 7.25, 76.5],
@@ -686,34 +734,52 @@ fn miner(front: Tex) -> Vec<Quad> {
             Insulator,
             Insulator,
         ),
-    ]);
+    ];
+    // Jacks under the deck's corners.
+    for (x, y) in [(-16.0, -16.0), (28.0, -16.0), (-16.0, 28.0), (28.0, 28.0)] {
+        b.push(dark([x, y, 0.0], [x + 4.0, y + 4.0, 1.0]));
+    }
+    // Two mud tanks on the right.
+    b.extend(drum([26.0, -6.0], 5.0, [3.0, 15.0], MachineTop, TankPaint));
+    b.extend(drum([26.0, 8.0], 5.0, [3.0, 15.0], MachineTop, TankPaint));
+    let mut q = tiled_quads(&b);
     // The beacon, dark (it blinks while the drill works).
-    q.extend(lamp([4.25, 4.25, 75.0], [5.75, 5.75, 76.5], [70, 24, 22]));
+    q.extend(lamp([3.25, 3.25, 75.0], [4.75, 4.75, 76.5], [70, 24, 22]));
+    // A rack of drill pipe on the left: two trestles, the pipes lying along them.
+    for y in [-8.0, 16.0] {
+        beam([-14.0, y, 3.0], [-14.0, y, 8.0], 0.6, RigSteel, &mut q);
+        beam([-6.0, y, 3.0], [-6.0, y, 8.0], 0.6, RigSteel, &mut q);
+        beam([-14.0, y, 8.0], [-6.0, y, 8.0], 0.5, RigSteel, &mut q);
+    }
+    for i in 0..4 {
+        let x = -13.0 + i as f32 * 2.2;
+        beam([x, -12.0, 9.0], [x, 20.0, 9.0], 0.9, MachineTop, &mut q);
+    }
     let corner = |i: usize, z: f32| {
-        let half = 6.25 + (2.75 - 6.25) * (z / 72.0);
+        let half = 13.0 + (3.5 - 13.0) * ((z - 3.0) / 69.0);
         let (sx, sy) = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)][i];
         [8.0 + sx * half, 8.0 + sy * half, z]
     };
     for i in 0..4 {
-        beam(corner(i, 2.0), corner(i, 72.0), 0.75, RigSteel, &mut q);
+        beam(corner(i, 3.0), corner(i, 72.0), 1.0, RigSteel, &mut q);
     }
-    let rings = [12.0, 27.0, 42.0, 57.0, 71.0];
+    let rings = [14.0, 29.0, 44.0, 58.0, 71.0];
     for (n, &z) in rings.iter().enumerate() {
         for i in 0..4 {
-            beam(corner(i, z), corner((i + 1) % 4, z), 0.45, RigSteel, &mut q);
+            beam(corner(i, z), corner((i + 1) % 4, z), 0.55, RigSteel, &mut q);
         }
-        if let Some(&up) = rings.get(n + 1) {
-            for i in 0..4 {
-                let (a, b) = if (n + i) % 2 == 0 {
-                    (i, (i + 1) % 4)
-                } else {
-                    ((i + 1) % 4, i)
-                };
-                beam(corner(a, z), corner(b, up), 0.35, RigSteel, &mut q);
-            }
+        let below = if n == 0 { 3.0 } else { rings[n - 1] };
+        for i in 0..4 {
+            let (a, c) = if (n + i) % 2 == 0 {
+                (i, (i + 1) % 4)
+            } else {
+                ((i + 1) % 4, i)
+            };
+            beam(corner(a, below), corner(c, z), 0.4, RigSteel, &mut q);
         }
     }
-    beam([8.0, 10.5, 3.0], [8.0, 10.5, 72.0], 0.5, MachineTop, &mut q);
+    // The rail the top drive runs down.
+    beam([8.0, 10.5, 4.5], [8.0, 10.5, 72.0], 0.5, MachineTop, &mut q);
     q
 }
 
@@ -1013,6 +1079,773 @@ fn slats(x0: f32, x1: f32, row: f32, mut moving: Vec<MovingPart>) -> Vec<MovingP
     moving
 }
 
+// ---- Pipes, tanks, power and the big machines -------------------------------------------
+
+/// Boxes cut along the block grid, so each piece's texels stay within one block (`box_quads`
+/// gives positional uvs 0..16), the faces of the cuts left out. For models bigger than a block.
+fn tiled_quads(boxes: &[ModelBox]) -> Vec<Quad> {
+    let cuts = |lo: f32, hi: f32| {
+        let mut out = Vec::new();
+        let mut a = lo;
+        while a < hi - 1e-4 {
+            let b = (((a / 16.0).floor() + 1.0) * 16.0).min(hi);
+            out.push((a, b));
+            a = b;
+        }
+        out
+    };
+    let mut out = Vec::new();
+    for b in boxes {
+        if b.full_uv {
+            box_quads(b, &mut out);
+            continue;
+        }
+        for &(x0, x1) in &cuts(b.from[0], b.to[0]) {
+            for &(y0, y1) in &cuts(b.from[1], b.to[1]) {
+                for &(z0, z1) in &cuts(b.from[2], b.to[2]) {
+                    let o = [x0, y0, z0].map(|v| (v / 16.0).floor() * 16.0);
+                    let sub = ModelBox {
+                        from: [x0 - o[0], y0 - o[1], z0 - o[2]],
+                        to: [x1 - o[0], y1 - o[1], z1 - o[2]],
+                        ..*b
+                    };
+                    let mut quads = Vec::new();
+                    box_quads(&sub, &mut quads);
+                    for mut q in quads {
+                        q.corners = q.corners.map(|[x, y, z]| [x + o[0], y + o[1], z + o[2]]);
+                        let cut = (0..3).any(|axis| {
+                            let v = q.corners[0][axis];
+                            q.corners.iter().all(|c| (c[axis] - v).abs() < 1e-4)
+                                && v > b.from[axis] + 1e-4
+                                && v < b.to[axis] - 1e-4
+                        });
+                        if !cut {
+                            out.push(q);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A drum standing about (cx, cy) of radius `r` from `z0` to `z1`: three boxes that round its
+/// corners off.
+fn drum([cx, cy]: [f32; 2], r: f32, [z0, z1]: [f32; 2], top: Tex, side: Tex) -> Vec<ModelBox> {
+    let b = |hx: f32, hy: f32| {
+        cuboid(
+            [cx - hx, cy - hy, z0],
+            [cx + hx, cy + hy, z1],
+            top,
+            side,
+            top,
+        )
+    };
+    vec![b(r, r * 0.55), b(r * 0.55, r), b(r * 0.83, r * 0.83)]
+}
+
+/// A drum lying along y about the line (x = cx, z = cz), from `y0` to `y1`.
+fn lying_drum(
+    [cx, cz]: [f32; 2],
+    r: f32,
+    [y0, y1]: [f32; 2],
+    end: Tex,
+    side: Tex,
+) -> Vec<ModelBox> {
+    let b = |hx: f32, hz: f32| ModelBox {
+        front: end,
+        back: end,
+        ..cuboid(
+            [cx - hx, y0, cz - hz],
+            [cx + hx, y1, cz + hz],
+            side,
+            side,
+            side,
+        )
+    };
+    vec![b(r, r * 0.55), b(r * 0.55, r), b(r * 0.83, r * 0.83)]
+}
+
+/// An insulator for cables at (8, 8), its top at `top`.
+fn insulator(top: f32) -> ModelBox {
+    cuboid(
+        [7.25, 7.25, top - 1.5],
+        [8.75, 8.75, top],
+        Tex::Insulator,
+        Tex::Insulator,
+        Tex::Insulator,
+    )
+}
+
+/// Where cables meet a machine that isn't an ordinary box (model units up, at its middle).
+pub fn structure_top(kind: crate::factory::MachineKind) -> f32 {
+    use crate::factory::MachineKind::*;
+    match kind {
+        Blender => 66.0,
+        Reactor => 76.0,
+        SteamTurbine => 31.0,
+        CoolingPool => 27.0,
+        Reprocessing => 44.0,
+        Accelerator => 22.0,
+        Centrifuge => 47.0,
+        Electrolyzer => 31.0,
+        Boiler => 31.0,
+        Tank => 32.0,
+        Geothermal => 15.0,
+        _ => MACHINE_TOP,
+    }
+}
+
+/// A round bar along `axis` (0 x, 1 y, 2 z) through the middle of the cell, `r` thick each way,
+/// from `a` to `b` along it (three boxes, like `drum`).
+fn rod(axis: usize, r: f32, [a, b]: [f32; 2], tex: Tex) -> [ModelBox; 3] {
+    let (p, q) = ((axis + 1) % 3, (axis + 2) % 3);
+    [(r, r * 0.55), (r * 0.55, r), (r * 0.83, r * 0.83)].map(|(hp, hq)| {
+        let (mut from, mut to) = ([8.0; 3], [8.0; 3]);
+        from[axis] = a;
+        to[axis] = b;
+        (from[p], to[p]) = (8.0 - hp, 8.0 + hp);
+        (from[q], to[q]) = (8.0 - hq, 8.0 + hq);
+        cuboid(from, to, tex, tex, tex)
+    })
+}
+
+/// Pipe sizes (model units out from the middle): the run, its collars, a fitting where it
+/// turns or branches, the band showing its fluid, the flange on a machine.
+const PIPE_R: f32 = 2.6;
+const COLLAR_R: f32 = 3.3;
+const FITTING_R: f32 = 3.6;
+const BAND_R: f32 = 2.85;
+const FLANGE_R: f32 = 4.4;
+
+/// A pipe (`links`: which ways it joins, bits +x, -x, +y, -y, +z, -z; model x and y are the
+/// grid's u and v, it is never turned). A straight run through the cell with a collar where
+/// it meets the next, a capped end where it stops, a fitting where it turns or branches, a
+/// flange where it meets a machine (`ports`), and a band in its fluid's colour (`fluid`).
+/// On its own it runs along `axis`.
+fn pipe(state: ModelState) -> Vec<Quad> {
+    use Tex::*;
+    let links = state.links & 0b11_1111;
+    let joined = |side: usize| links & (1 << side) != 0;
+    let mut boxes = Vec::new();
+    // Each way it goes: along one axis (straight, or an end), or several (a fitting).
+    let axes: Vec<usize> = (0..3)
+        .filter(|&a| joined(2 * a) || joined(2 * a + 1))
+        .collect();
+    let straight = axes.len() <= 1;
+    let mut bands = Vec::new();
+    if straight {
+        let axis = axes.first().copied().unwrap_or(state.axis.min(2) as usize);
+        boxes.extend(rod(axis, PIPE_R, [0.0, 16.0], PipeSteel));
+        bands.extend(rod(axis, BAND_R, [6.75, 9.25], Lamp));
+        // Capped where it doesn't go on.
+        for (side, [a, b]) in [(2 * axis, [14.6, 16.0]), (2 * axis + 1, [0.0, 1.4])] {
+            if !joined(side) {
+                boxes.extend(rod(axis, COLLAR_R, [a, b], PipeFitting));
+            }
+        }
+    } else {
+        boxes.extend(rod(
+            2,
+            FITTING_R,
+            [8.0 - FITTING_R, 8.0 + FITTING_R],
+            PipeFitting,
+        ));
+        for side in (0..6).filter(|&s| joined(s)) {
+            let (axis, plus) = (side / 2, side % 2 == 0);
+            let span = |a: f32, b: f32| if plus { [a, b] } else { [16.0 - b, 16.0 - a] };
+            boxes.extend(rod(axis, PIPE_R, span(8.0, 16.0), PipeSteel));
+            bands.extend(rod(axis, BAND_R, span(12.0, 13.6), Lamp));
+        }
+    }
+    // A collar at each end it joins (the next pipe's makes it whole), a flange on a machine.
+    for side in (0..6).filter(|&s| joined(s)) {
+        let (axis, plus) = (side / 2, side % 2 == 0);
+        let span = |a: f32, b: f32| if plus { [a, b] } else { [16.0 - b, 16.0 - a] };
+        if state.ports & (1 << side) != 0 {
+            let (mut from, mut to) = ([8.0 - FLANGE_R; 3], [8.0 + FLANGE_R; 3]);
+            [from[axis], to[axis]] = span(14.6, 16.0);
+            boxes.push(cuboid(from, to, PipeFitting, PipeFitting, PipeFitting));
+            boxes.extend(rod(axis, COLLAR_R, span(13.4, 14.6), PipeFitting));
+        } else {
+            boxes.extend(rod(axis, COLLAR_R, span(15.0, 16.0), PipeFitting));
+        }
+    }
+    let mut quads = quads_of(&boxes);
+    // (An empty pipe that has carried nothing yet is bare.)
+    if let Some(fluid) = state
+        .fluid
+        .checked_sub(1)
+        .and_then(|f| Fluid::ALL.get(f as usize))
+    {
+        quads.extend(tinted(quads_of(&bands), fluid.color()));
+    }
+    quads
+}
+
+/// A storage tank: a white drum two blocks tall on a plinth, a gauge window up its front.
+fn storage_tank() -> Vec<ModelBox> {
+    use Tex::*;
+    let mut b = vec![steel([0.0, 0.0, 0.0], [16.0, 16.0, 1.5])];
+    b.extend(drum([8.0, 8.0], 7.0, [1.5, 29.0], TankPaint, TankPaint));
+    b.extend(drum([8.0, 8.0], 5.0, [29.0, 30.5], MachineTop, MachineSide));
+    b.push(steel([6.0, 0.6, 3.0], [10.0, 1.2, 3.8]));
+    b.push(steel([6.0, 0.6, GAUGE_TOP], [10.0, 1.2, GAUGE_TOP + 0.8]));
+    b.push(steel([6.0, 0.6, 3.8], [6.6, 1.2, GAUGE_TOP]));
+    b.push(steel([9.4, 0.6, 3.8], [10.0, 1.2, GAUGE_TOP]));
+    b.push(steel([3.0, 3.0, 30.5], [5.0, 5.0, 32.0]));
+    b
+}
+
+/// A storage tank's gauge: from here up to `GAUGE_TOP`, filled to `level` of `LEVELS`.
+const GAUGE_BOTTOM: f32 = 3.8;
+const GAUGE_TOP: f32 = 27.0;
+
+fn gauge_fill(level: u8) -> f32 {
+    GAUGE_BOTTOM + (GAUGE_TOP - GAUGE_BOTTOM) * level.min(LEVELS) as f32 / LEVELS as f32
+}
+
+/// A water pump: its body on a plinth, the intake down into the water, the motor at the back,
+/// and the outlet up out of its side.
+fn water_pump() -> Vec<ModelBox> {
+    use Tex::*;
+    vec![
+        steel([0.0, 0.0, 0.0], [16.0, 16.0, 1.5]),
+        ModelBox {
+            front: PumpFront,
+            ..steel([2.0, 1.0, 1.5], [14.0, 11.0, 10.0])
+        },
+        dark([4.0, 11.0, 2.0], [12.0, 15.5, 9.0]),
+        dark([6.5, 4.5, -14.0], [9.5, 7.5, 1.5]),
+        cuboid(
+            [10.0, 4.5, 10.0],
+            [13.0, 7.5, 16.0],
+            MachineSide,
+            MachineTop,
+            MachineSide,
+        ),
+        insulator(11.5),
+    ]
+}
+
+/// An electrolyzer: a stack of cells in a white housing, two gas pipes up out of it (hydrogen
+/// red, oxygen blue: `glow_quads` lights their bands), a panel at the front.
+fn electrolyzer(lit: bool) -> Vec<ModelBox> {
+    use Tex::*;
+    let panel = if lit { ControlPanelLit } else { ControlPanel };
+    let mut b = vec![steel([0.0, 0.0, 0.0], [16.0, 16.0, 1.5])];
+    b.push(ModelBox {
+        front: panel,
+        ..cuboid(
+            [1.5, 1.5, 1.5],
+            [14.5, 14.5, 22.0],
+            TankPaint,
+            TankPaint,
+            TankPaint,
+        )
+    });
+    for z in [6.0, 11.0, 16.0] {
+        b.push(dark([1.0, 1.0, z], [15.0, 15.0, z + 1.0]));
+    }
+    b.push(steel([2.5, 9.0, 22.0], [5.5, 12.0, 28.0]));
+    b.push(steel([10.5, 9.0, 22.0], [13.5, 12.0, 28.0]));
+    b.push(steel([6.0, 6.0, 22.0], [10.0, 10.0, 29.5]));
+    b.push(insulator(31.0));
+    b
+}
+
+/// A gas centrifuge: a tall slim drum in steel bands on a base, its drive on top.
+fn centrifuge() -> Vec<ModelBox> {
+    use Tex::*;
+    let mut b = vec![steel([0.0, 0.0, 0.0], [16.0, 16.0, 2.0])];
+    b.extend(drum([8.0, 8.0], 4.5, [2.0, 42.0], TankPaint, TankPaint));
+    for z in [8.0, 18.0, 28.0, 38.0] {
+        b.extend(drum([8.0, 8.0], 5.2, [z, z + 1.0], MachineTop, MachineSide));
+    }
+    b.push(dark([5.0, 5.0, 42.0], [11.0, 11.0, 44.0]));
+    b.push(steel([1.0, 2.0, 2.0], [4.0, 5.0, 12.0]));
+    b.push(steel([12.0, 11.0, 2.0], [15.0, 14.0, 12.0]));
+    b.push(insulator(47.0));
+    b
+}
+
+/// A boiler: a firebox (its door flickers: `moving_parts`) under a drum lying across it, and a
+/// chimney.
+fn boiler() -> Vec<ModelBox> {
+    use Tex::*;
+    let mut b = vec![
+        steel([0.0, 0.0, 0.0], [16.0, 16.0, 1.5]),
+        ModelBox {
+            front: GeneratorFront,
+            ..steel([1.0, 1.0, 1.5], [15.0, 15.0, 12.0])
+        },
+    ];
+    b.extend(lying_drum(
+        [8.0, 20.0],
+        7.0,
+        [1.5, 14.5],
+        MachineTop,
+        TankPaint,
+    ));
+    b.push(steel([11.0, 11.0, 12.0], [14.0, 14.0, 34.0]));
+    b.push(dark([10.5, 10.5, 34.0], [14.5, 14.5, 35.0]));
+    b.push(steel([3.0, 6.0, 26.0], [5.0, 8.0, 29.5]));
+    b.push(insulator(31.0));
+    b
+}
+
+/// A geothermal well: a concrete pad, the casing up out of the ground with its valves (red
+/// wheels), the steam line off to the side.
+fn geothermal() -> Vec<ModelBox> {
+    use Tex::*;
+    vec![
+        cuboid(
+            [0.0, 0.0, 0.0],
+            [16.0, 16.0, 2.0],
+            Concrete,
+            Concrete,
+            Concrete,
+        ),
+        steel([5.5, 5.5, 2.0], [10.5, 10.5, 11.0]),
+        dark([4.5, 4.5, 4.0], [11.5, 11.5, 5.0]),
+        dark([4.5, 4.5, 9.0], [11.5, 11.5, 10.0]),
+        cuboid(
+            [10.5, 6.5, 6.0],
+            [16.0, 9.5, 9.0],
+            MachineSide,
+            MachineTop,
+            MachineSide,
+        ),
+        steel([7.0, 7.0, 11.0], [9.0, 9.0, 13.5]),
+        insulator(15.0),
+    ]
+}
+
+/// An RTG: a dark finned drum on legs, a hazard band round it, its core glowing faintly at the
+/// top (`glow_quads`).
+fn rtg() -> Vec<ModelBox> {
+    use Tex::*;
+    let mut b = vec![steel([3.0, 3.0, 0.0], [13.0, 13.0, 1.0])];
+    b.extend(drum([8.0, 8.0], 3.5, [1.0, 12.0], CableSkin, CableSkin));
+    for (x0, y0, x1, y1) in [
+        (0.5, 7.5, 4.5, 8.5),
+        (11.5, 7.5, 15.5, 8.5),
+        (7.5, 0.5, 8.5, 4.5),
+        (7.5, 11.5, 8.5, 15.5),
+    ] {
+        b.push(dark([x0, y0, 2.0], [x1, y1, 11.0]));
+    }
+    b.push(cuboid(
+        [4.2, 4.2, 5.0],
+        [11.8, 11.8, 7.0],
+        Hazard,
+        Hazard,
+        Hazard,
+    ));
+    b
+}
+
+/// A wind turbine: a tapering white tower eight blocks tall on a foundation, the nacelle on
+/// top facing the model's front. The rotor turns: `moving_parts`.
+fn wind_turbine() -> Vec<Quad> {
+    use Tex::*;
+    let mut q = tiled_quads(&[
+        cuboid(
+            [1.0, 1.0, 0.0],
+            [15.0, 15.0, 2.0],
+            Concrete,
+            Concrete,
+            Concrete,
+        ),
+        dark([6.0, 0.5, 2.0], [10.0, 2.0, 7.0]),
+        insulator(6.0),
+    ]);
+    // The tower, in rings that narrow as it goes up.
+    for i in 0..12 {
+        let z0 = 2.0 + i as f32 * 10.0;
+        let r = 4.8 - i as f32 * 0.22;
+        q.extend(tiled_quads(&drum(
+            [8.0, 8.0],
+            r,
+            [z0, z0 + 10.0],
+            TankPaint,
+            TankPaint,
+        )));
+    }
+    q.extend(tiled_quads(&[
+        cuboid(
+            [4.5, 0.5, 120.0],
+            [11.5, 17.0, 127.0],
+            TankPaint,
+            TankPaint,
+            MachineSide,
+        ),
+        dark([5.5, 16.5, 121.0], [10.5, 17.5, 126.0]),
+    ]));
+    q
+}
+
+/// Where a wind turbine's rotor turns (model units), and how long its blades are.
+const ROTOR: [f32; 3] = [8.0, -1.0, 123.5];
+const BLADE: f32 = 46.0;
+
+/// The rotor: a hub and three blades.
+fn rotor() -> Vec<Quad> {
+    use Tex::*;
+    let [x, y, z] = ROTOR;
+    let mut q = quads_of(&[cuboid(
+        [x - 2.5, y - 1.0, z - 2.5],
+        [x + 2.5, y + 2.0, z + 2.5],
+        MachineTop,
+        MachineSide,
+        MachineTop,
+    )]);
+    for i in 0..3 {
+        let a = i as f32 * std::f32::consts::TAU / 3.0;
+        let (s, c) = a.sin_cos();
+        let at = |r: f32| [x + c * r, y - 0.5, z + s * r];
+        beam(at(2.0), at(BLADE * 0.35), 1.6, CleanPanel, &mut q);
+        beam(at(BLADE * 0.35), at(BLADE * 0.75), 1.1, CleanPanel, &mut q);
+        beam(at(BLADE * 0.75), at(BLADE), 0.6, CleanPanel, &mut q);
+    }
+    q
+}
+
+/// A blender, five blocks square: a hazard-edged slab, a great white vat on legs with a coned
+/// foot, its lid, the gearbox and motor that turn its paddles, a ladder up its side, pipes
+/// down from its top, and the control cabinet at the front.
+fn blender(lit: bool) -> Vec<Quad> {
+    use Tex::*;
+    let c = [8.0, 8.0];
+    let mut b = vec![
+        cuboid(
+            [-32.0, -32.0, 0.0],
+            [48.0, 48.0, 2.0],
+            MachineTop,
+            Hazard,
+            MachineTop,
+        ),
+        steel([-20.0, -20.0, 2.0], [-17.0, -17.0, 16.0]),
+        steel([33.0, -20.0, 2.0], [36.0, -17.0, 16.0]),
+        steel([-20.0, 33.0, 2.0], [-17.0, 36.0, 16.0]),
+        steel([33.0, 33.0, 2.0], [36.0, 36.0, 16.0]),
+    ];
+    b.extend(drum(c, 12.0, [6.0, 12.0], MachineTop, MachineSide));
+    b.extend(drum(c, 22.0, [12.0, 52.0], TankPaint, TankPaint));
+    b.extend(drum(c, 23.0, [24.0, 25.5], MachineTop, MachineSide));
+    b.extend(drum(c, 23.0, [40.0, 41.5], MachineTop, MachineSide));
+    b.extend(drum(c, 20.0, [52.0, 54.0], MachineTop, MachineSide));
+    b.extend([
+        steel([0.0, 0.0, 54.0], [16.0, 16.0, 62.0]),
+        dark([16.0, 3.0, 55.0], [26.0, 13.0, 61.0]),
+        steel([7.0, 7.0, 62.0], [9.0, 9.0, 64.5]),
+        insulator(66.0),
+        // The control cabinet.
+        ModelBox {
+            front: if lit { ControlPanelLit } else { ControlPanel },
+            ..steel([-10.0, -31.0, 2.0], [26.0, -24.0, 22.0])
+        },
+        // The ladder's rails.
+        steel([29.0, -2.5, 2.0], [30.0, -1.5, 54.0]),
+        steel([29.0, 3.5, 2.0], [30.0, 4.5, 54.0]),
+    ]);
+    let mut q = tiled_quads(&b);
+    for i in 0..13 {
+        let z = 5.0 + i as f32 * 4.0;
+        beam([29.5, -2.0, z], [29.5, 4.0, z], 0.35, MachineTop, &mut q);
+    }
+    for (x, y) in [(-12.0, 20.0), (28.0, 20.0)] {
+        beam([x, y, 54.0], [x, y, 60.0], 1.5, MachineSide, &mut q);
+        let out = if x < 0.0 { -30.0 } else { 46.0 };
+        beam([x, y, 60.0], [out, y, 60.0], 1.5, MachineSide, &mut q);
+        beam([out, y, 60.0], [out, y, 2.0], 1.5, MachineSide, &mut q);
+    }
+    q
+}
+
+/// A steam turbine, three blocks square: its casing lying along the model's y on a plinth, the
+/// steam line into its top, the generator behind it; the coupling between them turns.
+fn steam_turbine() -> Vec<Quad> {
+    use Tex::*;
+    let mut b = vec![steel([-16.0, -16.0, 0.0], [32.0, 32.0, 3.0])];
+    b.extend(lying_drum(
+        [8.0, 14.0],
+        10.0,
+        [-14.0, 14.0],
+        MachineTop,
+        MachineSide,
+    ));
+    b.extend(lying_drum(
+        [8.0, 14.0],
+        11.0,
+        [-14.0, -11.0],
+        MachineTop,
+        MachineTop,
+    ));
+    b.extend(lying_drum(
+        [8.0, 14.0],
+        11.0,
+        [11.0, 14.0],
+        MachineTop,
+        MachineTop,
+    ));
+    b.extend([
+        cuboid(
+            [-6.0, 19.0, 3.0],
+            [22.0, 31.0, 25.0],
+            TankPaint,
+            TankPaint,
+            TankPaint,
+        ),
+        steel([5.0, -2.0, 24.0], [11.0, 4.0, 28.0]),
+        steel([3.5, -3.5, 28.0], [12.5, 5.5, 29.5]),
+        steel([7.0, 7.0, 24.0], [9.0, 9.0, 29.5]),
+        insulator(31.0),
+        steel([-4.0, -14.0, 3.0], [20.0, -10.0, 6.0]),
+    ]);
+    tiled_quads(&b)
+}
+
+/// The coupling between a steam turbine and its generator: a flanged disc on the shaft.
+fn turbine_coupling() -> Vec<Quad> {
+    let mut q = quads_of(&[
+        steel([4.0, 15.0, 10.0], [12.0, 17.0, 18.0]),
+        dark([7.0, 14.0, 13.0], [9.0, 19.0, 15.0]),
+    ]);
+    q.extend(quads_of(&[dark([3.5, 15.5, 13.0], [12.5, 16.5, 15.0])]));
+    q
+}
+
+/// A nuclear reactor, five blocks square: a concrete containment rising to a stepped dome on a
+/// slab, the steam lines down its side, and the control building at its front (its panel lit
+/// while it runs). A warning light on the roof glows red while it overheats (`glow_quads`).
+fn reactor(lit: bool) -> Vec<Quad> {
+    use Tex::*;
+    let c = [8.0, 8.0];
+    let mut b = vec![cuboid(
+        [-32.0, -32.0, 0.0],
+        [48.0, 48.0, 4.0],
+        Concrete,
+        Concrete,
+        Concrete,
+    )];
+    b.extend(drum(c, 30.0, [4.0, 56.0], Concrete, Concrete));
+    b.extend(drum(c, 31.0, [52.0, 54.0], MachineTop, MachineSide));
+    b.extend(drum(c, 26.0, [56.0, 62.0], Concrete, Concrete));
+    b.extend(drum(c, 20.0, [62.0, 68.0], Concrete, Concrete));
+    b.extend(drum(c, 12.0, [68.0, 73.0], Concrete, Concrete));
+    b.extend([
+        steel([6.0, 6.0, 73.0], [10.0, 10.0, 74.5]),
+        insulator(76.0),
+        // The control building.
+        ModelBox {
+            front: if lit { ControlPanelLit } else { ControlPanel },
+            ..cuboid(
+                [-20.0, -32.0, 4.0],
+                [36.0, -22.0, 26.0],
+                Concrete,
+                Concrete,
+                Concrete,
+            )
+        },
+        cuboid(
+            [-21.0, -33.0, 26.0],
+            [37.0, -21.0, 27.5],
+            Hazard,
+            Hazard,
+            Hazard,
+        ),
+        dark([-16.0, -32.5, 4.0], [-6.0, -31.5, 18.0]),
+        // Steam lines.
+        steel([36.0, 2.0, 4.0], [41.0, 7.0, 46.0]),
+        steel([36.0, 10.0, 4.0], [41.0, 15.0, 46.0]),
+    ]);
+    tiled_quads(&b)
+}
+
+/// Where the reactor's warning light is.
+const ALARM: ([f32; 3], [f32; 3]) = ([26.0, -30.0, 27.5], [30.0, -26.0, 30.0]);
+
+/// A cooling pool, three blocks square: concrete walls round water lit blue (`glow_quads`), a
+/// gantry crane over it.
+fn cooling_pool() -> Vec<Quad> {
+    use Tex::*;
+    let wall = |from, to| cuboid(from, to, Concrete, Concrete, Concrete);
+    let mut b = vec![
+        wall([-16.0, -16.0, 0.0], [32.0, 32.0, 2.0]),
+        wall([-16.0, -16.0, 2.0], [32.0, -13.0, 16.0]),
+        wall([-16.0, 29.0, 2.0], [32.0, 32.0, 16.0]),
+        wall([-16.0, -13.0, 2.0], [-13.0, 29.0, 16.0]),
+        wall([29.0, -13.0, 2.0], [32.0, 29.0, 16.0]),
+        // The racks under the water.
+        dark([-10.0, -10.0, 2.0], [26.0, 26.0, 8.0]),
+        // The gantry.
+        steel([-15.5, 6.0, 16.0], [-13.5, 10.0, 26.0]),
+        steel([29.5, 6.0, 16.0], [31.5, 10.0, 26.0]),
+        steel([-15.5, 6.5, 24.0], [31.5, 9.5, 26.0]),
+        dark([5.0, 5.5, 20.0], [11.0, 10.5, 24.0]),
+        insulator(27.0),
+    ];
+    b.push(steel([-12.0, -16.5, 4.0], [-4.0, -15.5, 12.0]));
+    tiled_quads(&b)
+}
+
+/// The pool's water (a quad over the racks).
+fn pool_water() -> Vec<Quad> {
+    let z = 13.5;
+    vec![Quad {
+        corners: [
+            [-13.0, -13.0, z],
+            [29.0, -13.0, z],
+            [29.0, 29.0, z],
+            [-13.0, 29.0, z],
+        ],
+        uv: [[0.0, 16.0], [16.0, 16.0], [16.0, 0.0], [0.0, 0.0]],
+        tex: Tex::Cherenkov,
+        tint: 0,
+    }]
+}
+
+/// A reprocessing plant, three blocks square: a heavy concrete block with two hot cell windows
+/// at its front (lit while it works), a stack on its roof, pipes down its side.
+fn reprocessing(lit: bool) -> Vec<Quad> {
+    use Tex::*;
+    let window = if lit { HotCellLit } else { HotCell };
+    let b = vec![
+        cuboid(
+            [-16.0, -15.0, 0.0],
+            [32.0, 32.0, 40.0],
+            Concrete,
+            Concrete,
+            Concrete,
+        ),
+        ModelBox {
+            front: window,
+            full_uv: true,
+            ..cuboid(
+                [-12.0, -16.0, 10.0],
+                [2.0, -15.0, 24.0],
+                Concrete,
+                Concrete,
+                Concrete,
+            )
+        },
+        ModelBox {
+            front: window,
+            full_uv: true,
+            ..cuboid(
+                [14.0, -16.0, 10.0],
+                [28.0, -15.0, 24.0],
+                Concrete,
+                Concrete,
+                Concrete,
+            )
+        },
+        dark([-11.0, -18.0, 25.0], [-9.0, -15.0, 27.0]),
+        dark([25.0, -18.0, 25.0], [27.0, -15.0, 27.0]),
+        steel([19.0, 19.0, 40.0], [26.0, 26.0, 47.5]),
+        cuboid(
+            [18.5, 18.5, 43.0],
+            [26.5, 26.5, 44.5],
+            Hazard,
+            Hazard,
+            Hazard,
+        ),
+        steel([7.0, 7.0, 40.0], [9.0, 9.0, 42.5]),
+        insulator(44.0),
+        steel([32.0, -6.0, 0.0], [35.0, -3.0, 36.0]),
+        steel([32.0, 4.0, 0.0], [35.0, 7.0, 36.0]),
+    ];
+    tiled_quads(&b)
+}
+
+/// The particle accelerator's ring: where its magnets stand (centre, radius).
+const RING: (f32, f32) = (8.0, 40.0);
+const MAGNETS: usize = 16;
+
+/// A particle accelerator, seven blocks square: a ring of blue magnets on a floor, the beam
+/// line between them (lit while it runs: `glow_quads`), the target chamber in the middle and
+/// the control desk at the front.
+fn accelerator(lit: bool) -> Vec<Quad> {
+    use Tex::*;
+    let mut q = tiled_quads(&[
+        cuboid(
+            [-48.0, -48.0, 0.0],
+            [64.0, 64.0, 2.0],
+            MachineTop,
+            Hazard,
+            MachineTop,
+        ),
+        steel([-2.0, -2.0, 2.0], [18.0, 18.0, 16.0]),
+        cuboid(
+            [-3.0, -3.0, 9.0],
+            [19.0, 19.0, 11.0],
+            Hazard,
+            Hazard,
+            Hazard,
+        ),
+        steel([7.0, 7.0, 16.0], [9.0, 9.0, 20.5]),
+        insulator(22.0),
+        ModelBox {
+            front: if lit { ControlPanelLit } else { ControlPanel },
+            ..steel([-8.0, -46.0, 2.0], [24.0, -40.0, 14.0])
+        },
+    ]);
+    let (c, r) = RING;
+    for i in 0..MAGNETS {
+        let a = i as f32 / MAGNETS as f32 * std::f32::consts::TAU;
+        let mut magnet = quads_of(&[
+            cuboid(
+                [c - 6.0, c - 4.0, 2.0],
+                [c + 6.0, c + 4.0, 14.0],
+                TankPaint,
+                TankPaint,
+                TankPaint,
+            ),
+            dark([c - 6.5, c - 4.5, 6.5], [c + 6.5, c + 4.5, 9.5]),
+        ]);
+        transform(&mut magnet, |[x, y, z]| [x, y + r, z]);
+        turn_z(&mut magnet, [c, c], a);
+        q.extend(tinted(magnet, [90, 140, 255]));
+        // The beam pipe on to the next magnet.
+        let b = (i as f32 + 0.5) / MAGNETS as f32 * std::f32::consts::TAU;
+        let at = |angle: f32| [c - r * angle.sin(), c + r * angle.cos(), 8.0];
+        let a0 = a + 0.17;
+        let a1 = (i + 1) as f32 / MAGNETS as f32 * std::f32::consts::TAU - 0.17;
+        beam(at(a0), at(b), 1.0, MachineTop, &mut q);
+        beam(at(b), at(a1), 1.0, MachineTop, &mut q);
+    }
+    q
+}
+
+/// The accelerator's beam line, glowing (as quads to light up).
+fn beam_glow() -> Vec<Quad> {
+    let (c, r) = RING;
+    let mut q = Vec::new();
+    for i in 0..MAGNETS * 2 {
+        let a0 = i as f32 / (MAGNETS * 2) as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / (MAGNETS * 2) as f32 * std::f32::consts::TAU;
+        let at = |angle: f32| [c - r * angle.sin(), c + r * angle.cos(), 8.0];
+        beam(at(a0), at(a1), 1.15, Tex::Lamp, &mut q);
+    }
+    tinted(q, [110, 230, 255])
+}
+
+/// A small lamp a big machine shows its state by (green while it works), or None for one in
+/// the usual place (`LAMP_FROM`).
+fn lamp_place(block: Block) -> ([f32; 3], [f32; 3]) {
+    match block {
+        Block::Blender => ([20.0, -31.5, 18.0], [23.0, -31.0, 20.0]),
+        Block::SteamTurbine => ([14.0, -14.5, 3.5], [17.0, -14.0, 5.5]),
+        Block::ReprocessingPlant => ([4.0, -15.5, 30.0], [8.0, -15.0, 33.0]),
+        Block::ParticleAccelerator => ([18.0, -46.5, 10.0], [22.0, -46.0, 12.0]),
+        Block::Centrifuge | Block::Electrolyzer => ([10.0, 0.9, 18.0], [12.0, 1.4, 19.5]),
+        Block::WaterPump => ([10.5, 0.5, 7.5], [12.5, 1.0, 9.0]),
+        _ => (LAMP_FROM, LAMP_TO),
+    }
+}
+
 /// The boxes of a model block that is only boxes (the chest's lid separately: see `chest`).
 fn model_boxes(block: Block, state: ModelState) -> Vec<ModelBox> {
     use Tex::*;
@@ -1071,7 +1904,7 @@ fn model_boxes(block: Block, state: ModelState) -> Vec<ModelBox> {
     }
 }
 
-/// The machines with a status lamp on their front (green while they work).
+/// The machines with a status lamp on their front (green while they work; see `lamp_place`).
 fn has_lamp(block: Block) -> bool {
     matches!(
         block,
@@ -1081,6 +1914,14 @@ fn has_lamp(block: Block) -> bool {
             | Block::Assembler
             | Block::ChipFab
             | Block::Accumulator
+            | Block::WaterPump
+            | Block::Electrolyzer
+            | Block::Centrifuge
+            | Block::FuelFabricator
+            | Block::Blender
+            | Block::SteamTurbine
+            | Block::ReprocessingPlant
+            | Block::ParticleAccelerator
     )
 }
 
@@ -1116,10 +1957,52 @@ fn accumulator_gauge(level: u8) -> Vec<Quad> {
 /// Every face of a model block that doesn't glow or move (see `glow_quads`, `moving_parts`).
 fn model_quads(block: Block, state: ModelState) -> Vec<Quad> {
     use Tex::*;
+    if !state.is_core() {
+        return Vec::new();
+    }
+    let lit = state.lit;
     let mut quads = match block {
         Block::Miner => miner(if state.lit { MinerFrontLit } else { MinerFront }),
         Block::Conveyor if state.bend != 0 => conveyor_bend(state.bend == 1),
         Block::SolarPanel => solar_panel(),
+        Block::Pipe => pipe(state),
+        Block::StorageTank => {
+            let mut b = storage_tank();
+            let fill = gauge_fill(if state.fluid == 0 { 0 } else { state.level });
+            if fill < GAUGE_TOP {
+                b.push(dark([6.6, 0.8, fill], [9.4, 1.2, GAUGE_TOP]));
+            }
+            tiled_quads(&b)
+        }
+        Block::WaterPump => tiled_quads(&water_pump()),
+        Block::Electrolyzer => tiled_quads(&electrolyzer(lit)),
+        Block::Centrifuge => tiled_quads(&centrifuge()),
+        Block::FuelFabricator => {
+            let mut b = housing(
+                if lit { ControlPanelLit } else { ControlPanel },
+                MachineSide,
+                MachineTop,
+            );
+            b.push(dark([2.5, 9.5, 13.5], [5.5, 13.5, 15.0]));
+            b.push(steel([10.0, 9.0, 13.5], [14.0, 14.0, 14.5]));
+            quads_of(&b)
+        }
+        Block::Boiler => tiled_quads(&boiler()),
+        Block::GeothermalWell => tiled_quads(&geothermal()),
+        Block::WindTurbine => wind_turbine(),
+        Block::Rtg => tiled_quads(&rtg()),
+        Block::Blender => blender(lit),
+        Block::SteamTurbine => steam_turbine(),
+        Block::NuclearReactor => reactor(lit),
+        Block::CoolingPool => {
+            let mut q = cooling_pool();
+            if !lit {
+                q.extend(pool_water());
+            }
+            q
+        }
+        Block::ReprocessingPlant => reprocessing(lit),
+        Block::ParticleAccelerator => accelerator(lit),
         b if b.door().is_some() => {
             let (kind, _) = b.door().unwrap_or((DoorKind::Hinged, false));
             door_model(kind, state.piece).0
@@ -1135,7 +2018,8 @@ fn model_quads(block: Block, state: ModelState) -> Vec<Quad> {
         _ => {}
     }
     if has_lamp(block) && !state.lit {
-        quads.extend(lamp(LAMP_FROM, LAMP_TO, [30, 44, 34]));
+        let (from, to) = lamp_place(block);
+        quads.extend(lamp(from, to, [30, 44, 34]));
     }
     quads
 }
@@ -1145,23 +2029,52 @@ fn model_quads(block: Block, state: ModelState) -> Vec<Quad> {
 fn glow_quads(block: Block, state: ModelState) -> Vec<Quad> {
     use Tex::*;
     let mut quads = Vec::new();
+    if !state.is_core() {
+        return quads;
+    }
     let (y, xs, zs) = HOUSING_FRONT;
     if state.lit {
         match block {
             Block::ElectricFurnace => quads = glow_face(ElectricFrontLit, ElectricFront, y, xs, zs),
             Block::Assembler => quads = glow_face(AssemblerFrontLit, AssemblerFront, y, xs, zs),
             Block::ChipFab => quads = glow_face(FabFrontLit, FabFront, y, xs, zs),
+            Block::FuelFabricator => quads = glow_face(ControlPanelLit, ControlPanel, y, xs, zs),
             Block::Miner => {
-                quads = glow_face(MinerFrontLit, MinerFront, 0.5, [3.0, 13.0], [2.0, 8.0])
+                quads = glow_face(MinerFrontLit, MinerFront, -15.0, [0.0, 16.0], [3.0, 8.0])
             }
             Block::OilPump => {
                 quads = glow_face(PumpFrontLit, PumpFront, 10.0, [3.0, 13.0], [1.5, 7.0])
             }
+            Block::CoolingPool => quads = pool_water(),
+            Block::ParticleAccelerator => quads = beam_glow(),
+            Block::Electrolyzer => {
+                quads.extend(lamp([2.3, 8.8, 25.0], [5.7, 12.2, 26.5], [255, 90, 80]));
+                quads.extend(lamp([10.3, 8.8, 25.0], [13.7, 12.2, 26.5], [100, 160, 255]));
+            }
+            Block::NuclearReactor => {
+                // The core seen through a port on the dome, Cherenkov blue.
+                quads.extend(lamp([5.0, 5.0, 73.0], [11.0, 11.0, 73.2], [90, 170, 255]));
+            }
             _ => {}
         }
         if has_lamp(block) {
-            quads.extend(lamp(LAMP_FROM, LAMP_TO, [90, 255, 120]));
+            let (from, to) = lamp_place(block);
+            quads.extend(lamp(from, to, [90, 255, 120]));
         }
+    }
+    match block {
+        Block::NuclearReactor if state.alarm => {
+            quads.extend(lamp(ALARM.0, ALARM.1, [255, 50, 30]));
+        }
+        Block::Rtg => quads.extend(lamp([6.0, 6.0, 12.0], [10.0, 10.0, 12.6], [255, 120, 50])),
+        Block::StorageTank if state.fluid > 0 && state.level > 0 => {
+            let color = crate::factory::fluids::Fluid::ALL
+                .get(state.fluid as usize - 1)
+                .map_or([255, 255, 255], |f| f.color());
+            let fill = gauge_fill(state.level);
+            quads.extend(lamp([6.6, 0.8, GAUGE_BOTTOM], [9.4, 1.2, fill], color));
+        }
+        _ => {}
     }
     if block == Block::Accumulator && state.level > 0 {
         let full =
@@ -1185,7 +2098,48 @@ pub fn moving_parts(block: Block, state: ModelState) -> Vec<MovingPart> {
     if let Some((kind, _)) = block.door() {
         return door_model(kind, state.piece).1;
     }
+    if !state.is_core() {
+        return Vec::new();
+    }
+    let fan = |center: [f32; 3], axis: usize, r: f32| {
+        // Two crossed blades across `axis`.
+        let (a, b) = ([0, 1, 2][(axis + 1) % 3], [0, 1, 2][(axis + 2) % 3]);
+        let mut q = Vec::new();
+        for (u, v) in [(a, b), (b, a)] {
+            let mut from = center;
+            let mut to = center;
+            from[u] -= r;
+            to[u] += r;
+            from[v] -= 0.3;
+            to[v] += 0.3;
+            from[axis] -= 0.2;
+            to[axis] += 0.2;
+            q.extend(quads_of(&[steel(from, to)]));
+        }
+        let mut dir = [0.0; 3];
+        dir[axis] = 1.0;
+        MovingPart::new(q, center, dir, Motion::Spin(9.0))
+    };
     match block {
+        Block::WindTurbine => vec![MovingPart::new(
+            rotor(),
+            ROTOR,
+            [0.0, 1.0, 0.0],
+            Motion::Spin(1.8),
+        )],
+        Block::SteamTurbine => vec![MovingPart::new(
+            turbine_coupling(),
+            [8.0, 16.0, 14.0],
+            [0.0, 1.0, 0.0],
+            Motion::Spin(14.0),
+        )],
+        Block::Blender => vec![fan([26.3, 8.0, 58.0], 0, 2.6)],
+        Block::Centrifuge => vec![fan([8.0, 8.0, 44.4], 2, 2.6)],
+        Block::WaterPump => vec![fan([8.0, 15.8, 5.5], 1, 2.6)],
+        Block::Boiler => vec![MovingPart::light(
+            glow_face(GeneratorFrontLit, GeneratorFront, y, xs, [1.5, 12.0]),
+            Motion::Flicker(8.0),
+        )],
         Block::Miner => miner_parts(),
         Block::OilPump => oil_pump_parts(),
         Block::CoalGenerator => vec![
@@ -1616,8 +2570,12 @@ pub fn held_model(block: Block) -> Vec<Quad> {
         .iter()
         .flat_map(|q| q.corners)
         .fold(0.0f32, |m, p| m.max(p[2]));
-    if top > 34.0 {
-        let s = 34.0 / top;
+    // (Big machines too: as wide as a block and a half at most.)
+    let wide = quads.iter().flat_map(|q| q.corners).fold(0.0f32, |m, p| {
+        m.max((p[0] - 8.0).abs()).max((p[1] - 8.0).abs())
+    });
+    let s = (34.0 / top).min(12.0 / wide).min(1.0);
+    if s < 1.0 {
         transform(&mut quads, |[x, y, z]| {
             [8.0 + (x - 8.0) * s, 8.0 + (y - 8.0) * s, z.max(0.0) * s]
         });
@@ -1679,8 +2637,8 @@ pub fn facing_towards(planet: &Planet, cell: BlockCell, towards: DVec3) -> u8 {
 /// (east, north, up) at a spot: the frame dropped items and mobs are built in.
 pub type Frame = (DVec3, DVec3, DVec3);
 
-/// The mesh of a dropped item lying at the origin: a small cube for blocks, a crossed pair
-/// of sprites for other items.
+/// The mesh of a dropped item lying at the origin: a small cube for blocks, the sprite one
+/// pixel thick for other items, standing up (drawn spinning about the origin: `Drop::spin`).
 pub fn drop_model(item: Item, frame: Frame, light: Light) -> ChunkMesh {
     item_model(item, frame, light, 1.0)
 }
@@ -1694,6 +2652,7 @@ pub fn belt_item_model(item: Item, light: Light) -> ChunkMesh {
 /// `drop_model` with its size scaled by `scale`.
 fn item_model(item: Item, (east, north, up): Frame, light: Light, scale: f64) -> ChunkMesh {
     let mut quads = Vec::new();
+    let mut edges = Vec::new();
     let (size, cutout, tint) = match item.icon() {
         Icon::Block(block) => {
             let [top, side, bottom] = block.textures();
@@ -1712,37 +2671,43 @@ fn item_model(item: Item, (east, north, up): Frame, light: Light, scale: f64) ->
             (0.25, block.is_cutout(), tint)
         }
         Icon::Sprite(tex) => {
-            // Two crossed planes, each seen from both sides.
-            let plane = |a: [f32; 3], b: [f32; 3]| [a, b, [b[0], b[1], 16.0], [a[0], a[1], 16.0]];
-            for corners in [
-                plane([0.0, 8.0, 0.0], [16.0, 8.0, 0.0]),
-                plane([16.0, 8.0, 0.0], [0.0, 8.0, 0.0]),
-                plane([8.0, 16.0, 0.0], [8.0, 0.0, 0.0]),
-                plane([8.0, 0.0, 0.0], [8.0, 16.0, 0.0]),
-            ] {
-                let horizontal = |p: [f32; 3]| if p[1] == 8.0 { p[0] } else { 16.0 - p[1] };
-                let (h0, h1) = (horizontal(corners[0]), horizontal(corners[1]));
-                let uv = corners.map(|p| {
-                    let h = horizontal(p);
-                    // Each side shows the sprite the right way round.
-                    let u = if h0 < h1 { h } else { 16.0 - h };
-                    [u, 16.0 - p[2]]
-                });
-                quads.push(Quad {
-                    corners,
-                    uv,
-                    tex,
-                    tint: 0,
+            // The sprite standing up, one pixel thick (as held: `extruded_sprite`).
+            let (faces, rim) = extruded_sprite(tex, &crate::world::textures::pixels(tex));
+            quads = faces;
+            edges = rim;
+            (0.4, true, 0xffff_ffff)
+        }
+        Icon::Picture(_) => {
+            // A machine whose picture only the interface has: its model, made small (as held,
+            // then shrunk to fit a block).
+            if let Some(block) = item.block() {
+                quads = held_model(block);
+                let (top, wide) =
+                    quads
+                        .iter()
+                        .flat_map(|q| q.corners)
+                        .fold((16.0f32, 8.0f32), |(t, w), p| {
+                            (
+                                t.max(p[2]),
+                                w.max((p[0] - 8.0).abs()).max((p[1] - 8.0).abs()),
+                            )
+                        });
+                let s = 16.0 / top.max(2.0 * wide);
+                transform(&mut quads, |[x, y, z]| {
+                    [8.0 + (x - 8.0) * s, 8.0 + (y - 8.0) * s, z * s]
                 });
             }
-            (0.4, true, 0xffff_ffff)
+            (0.32, false, 0xffff_ffff)
         }
     };
     let place = |[x, y, z]: [f32; 3]| {
         let s = size * scale / 16.0;
         east * ((x as f64 - 8.0) * s) + north * ((y as f64 - 8.0) * s) + up * (z as f64 * s)
     };
-    build(&quads, place, DVec3::ZERO, light, tint, cutout)
+    let mut mesh = build(&quads, place, DVec3::ZERO, light, tint, cutout);
+    mesh.opaque
+        .extend(build(&edges, place, DVec3::ZERO, light, tint, false).opaque);
+    mesh
 }
 
 /// A cable hanging from `a` to `b` (planet-relative): a thin dark tube sagging `sag` metres in
@@ -1837,6 +2802,8 @@ impl HeldShape {
             (Some(block), _) if block.is_model() => HeldShape::Block(block),
             (_, Icon::Block(block)) => HeldShape::Block(block),
             (_, Icon::Sprite(tex)) => HeldShape::Sprite(tex, crate::world::textures::pixels(tex)),
+            // (Only machines have pictures, and they are models, caught above.)
+            (block, Icon::Picture(_)) => HeldShape::Block(block.unwrap_or(Block::Stone)),
         }
     }
 }
@@ -1887,87 +2854,8 @@ pub fn view_model(
             }
         },
         HeldShape::Sprite(tex, pixels) => {
-            let tex = *tex;
             cutout = true;
-            let (y0, y1) = (7.5, 8.5);
-            let full = [[0.0, 16.0], [16.0, 16.0], [16.0, 0.0], [0.0, 0.0]];
-            // Front and back: the whole image, transparent pixels cut out.
-            quads.push(Quad {
-                corners: [
-                    [0.0, y0, 0.0],
-                    [16.0, y0, 0.0],
-                    [16.0, y0, 16.0],
-                    [0.0, y0, 16.0],
-                ],
-                uv: full,
-                tex,
-                tint: 0,
-            });
-            quads.push(Quad {
-                corners: [
-                    [16.0, y1, 0.0],
-                    [0.0, y1, 0.0],
-                    [0.0, y1, 16.0],
-                    [16.0, y1, 16.0],
-                ],
-                uv: [[16.0, 16.0], [0.0, 16.0], [0.0, 0.0], [16.0, 0.0]],
-                tex,
-                tint: 0,
-            });
-            // The rim: a one-pixel face wherever an opaque pixel borders a clear one,
-            // coloured by that pixel.
-            let solid = |x: i32, y: i32| {
-                (0..16).contains(&x)
-                    && (0..16).contains(&y)
-                    && pixels[(y * 16 + x) as usize][3] >= 128
-            };
-            for py in 0..16 {
-                for px in 0..16 {
-                    if !solid(px, py) {
-                        continue;
-                    }
-                    let (x0, x1) = (px as f32, px as f32 + 1.0);
-                    let (z0, z1) = (15.0 - py as f32, 16.0 - py as f32);
-                    let (u0, u1, v0, v1) = (x0, x1, py as f32, py as f32 + 1.0);
-                    let uv = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
-                    if !solid(px - 1, py) {
-                        let corners = [[x0, y1, z0], [x0, y0, z0], [x0, y0, z1], [x0, y1, z1]];
-                        edges.push(Quad {
-                            corners,
-                            uv,
-                            tex,
-                            tint: 0,
-                        });
-                    }
-                    if !solid(px + 1, py) {
-                        let corners = [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]];
-                        edges.push(Quad {
-                            corners,
-                            uv,
-                            tex,
-                            tint: 0,
-                        });
-                    }
-                    if !solid(px, py - 1) {
-                        let corners = [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]];
-                        edges.push(Quad {
-                            corners,
-                            uv,
-                            tex,
-                            tint: 0,
-                        });
-                    }
-                    if !solid(px, py + 1) {
-                        let corners = [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]];
-                        edges.push(Quad {
-                            corners,
-                            uv,
-                            tex,
-                            tint: 0,
-                        });
-                    }
-                }
-            }
+            (quads, edges) = extruded_sprite(*tex, pixels);
         }
     }
     let item = build_with_unit(&quads, &held, DVec3::ZERO, light, tint, cutout, VIEW_UNIT);
@@ -1976,6 +2864,94 @@ pub fn view_model(
     let rim = build_with_unit(&edges, &held, DVec3::ZERO, light, tint, false, VIEW_UNIT);
     mesh.opaque.extend(rim.opaque);
     mesh
+}
+
+/// A sprite extruded one pixel thick, lying in the x-z plane (x right, z up, the image's top
+/// at z = 16) between y = 7.5 and 8.5: its front and back (cut out where it is clear), and its
+/// rim, a one-texel face wherever an opaque pixel borders a clear one, coloured by that pixel
+/// (returned apart: drawn without the cutout, which mipmaps could fade out). `pixels`: the
+/// sprite's (`textures::pixels`).
+pub fn extruded_sprite(tex: Tex, pixels: &[[u8; 4]]) -> (Vec<Quad>, Vec<Quad>) {
+    let mut quads = Vec::new();
+    let mut edges = Vec::new();
+    let (y0, y1) = (7.5, 8.5);
+    let full = [[0.0, 16.0], [16.0, 16.0], [16.0, 0.0], [0.0, 0.0]];
+    // Front and back: the whole image, transparent pixels cut out.
+    quads.push(Quad {
+        corners: [
+            [0.0, y0, 0.0],
+            [16.0, y0, 0.0],
+            [16.0, y0, 16.0],
+            [0.0, y0, 16.0],
+        ],
+        uv: full,
+        tex,
+        tint: 0,
+    });
+    quads.push(Quad {
+        corners: [
+            [16.0, y1, 0.0],
+            [0.0, y1, 0.0],
+            [0.0, y1, 16.0],
+            [16.0, y1, 16.0],
+        ],
+        uv: [[16.0, 16.0], [0.0, 16.0], [0.0, 0.0], [16.0, 0.0]],
+        tex,
+        tint: 0,
+    });
+    // The rim: a one-pixel face wherever an opaque pixel borders a clear one,
+    // coloured by that pixel.
+    let solid = |x: i32, y: i32| {
+        (0..16).contains(&x) && (0..16).contains(&y) && pixels[(y * 16 + x) as usize][3] >= 128
+    };
+    for py in 0..16 {
+        for px in 0..16 {
+            if !solid(px, py) {
+                continue;
+            }
+            let (x0, x1) = (px as f32, px as f32 + 1.0);
+            let (z0, z1) = (15.0 - py as f32, 16.0 - py as f32);
+            let (u0, u1, v0, v1) = (x0, x1, py as f32, py as f32 + 1.0);
+            let uv = [[u0, v1], [u1, v1], [u1, v0], [u0, v0]];
+            if !solid(px - 1, py) {
+                let corners = [[x0, y1, z0], [x0, y0, z0], [x0, y0, z1], [x0, y1, z1]];
+                edges.push(Quad {
+                    corners,
+                    uv,
+                    tex,
+                    tint: 0,
+                });
+            }
+            if !solid(px + 1, py) {
+                let corners = [[x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [x1, y0, z1]];
+                edges.push(Quad {
+                    corners,
+                    uv,
+                    tex,
+                    tint: 0,
+                });
+            }
+            if !solid(px, py - 1) {
+                let corners = [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]];
+                edges.push(Quad {
+                    corners,
+                    uv,
+                    tex,
+                    tint: 0,
+                });
+            }
+            if !solid(px, py + 1) {
+                let corners = [[x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [x1, y0, z0]];
+                edges.push(Quad {
+                    corners,
+                    uv,
+                    tex,
+                    tint: 0,
+                });
+            }
+        }
+    }
+    (quads, edges)
 }
 
 #[cfg(test)]
@@ -2014,6 +2990,22 @@ mod tests {
             Block::Door,
             Block::SlidingDoorOpen,
             Block::BigDoor,
+            Block::Pipe,
+            Block::StorageTank,
+            Block::WaterPump,
+            Block::Electrolyzer,
+            Block::Centrifuge,
+            Block::FuelFabricator,
+            Block::Boiler,
+            Block::GeothermalWell,
+            Block::WindTurbine,
+            Block::Rtg,
+            Block::Blender,
+            Block::SteamTurbine,
+            Block::NuclearReactor,
+            Block::CoolingPool,
+            Block::ReprocessingPlant,
+            Block::ParticleAccelerator,
         ] {
             for facing in 0..4 {
                 for (i, (wall, open, bend)) in
@@ -2034,6 +3026,13 @@ mod tests {
                         } else {
                             i as u8 % 2 * 3
                         },
+                        // (A pipe joined various ways, a tank's gauge part full.)
+                        links: [0, 0b10_0101, 0b11_1111][i],
+                        ports: [0, 0b00_0100, 0b10_0000][i],
+                        axis: i as u8,
+                        fluid: i as u8,
+                        alarm: i == 1,
+                        ..Default::default()
                     };
                     let (mesh, origin, radius) =
                         block_model(&planet, cell, block, state, Light::default());
@@ -2041,10 +3040,16 @@ mod tests {
                     // (A big door's middle cells are only their moving slats.)
                     assert!(!mesh.opaque.is_empty() || block == Block::BigDoor);
                     assert!((origin - centre).length() < 1e-9);
-                    // In its cell; a pole two blocks tall, a miner's rig five.
+                    // In its cell; a pole two blocks tall, a big machine
+                    // in the cells it fills (and a water pump's intake in the one below).
+                    let (r, h) = block.structure();
                     let most = match block {
-                        Block::Miner => 4.6,
                         Block::PowerPole | Block::Refinery => 1.9,
+                        Block::WaterPump => 1.8,
+                        b if b.is_structure() => {
+                            let across = r as f64 + 0.5;
+                            (2.0 * across * across + (h as f64 - 0.5).powi(2)).sqrt() as f32 + 0.3
+                        }
                         _ => 1.3,
                     };
                     assert!(radius < most, "{block:?} reaches {radius} m");

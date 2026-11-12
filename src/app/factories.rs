@@ -1,9 +1,9 @@
-﻿//! The factory side of the game (see `factory`): turning conveyors, and the console commands,
+//! The factory side of the game (see `factory`): turning conveyors, and the console commands,
 //! including a small ready-made factory to try things on (`factory demo`).
 
 use super::Game;
 use crate::{
-    factory::{self, AHEAD},
+    factory::{self, AHEAD, fluids::Fluid},
     render::models::{self, ModelState},
     survival::{
         self,
@@ -12,6 +12,11 @@ use crate::{
     ui::screen::Screen,
     world::{block::Block, chunk::BlockCell},
 };
+
+/// The ways a pipe in a ready-made factory joins (`Game::build_ahead`): ahead, right, left.
+const PIPE_AHEAD: u8 = 1;
+const PIPE_RIGHT: u8 = 4;
+const PIPE_LEFT: u8 = 8;
 
 impl Game {
     /// R on a conveyor turns it a quarter. False if the crosshair isn't on one.
@@ -67,7 +72,8 @@ impl Game {
             Some("recipe") => {
                 // factory recipe <item>: the nearest machine that can make it makes it.
                 let Some(item) = args.get(1).and_then(|a| Item::from_id(a)) else {
-                    self.console.print("Usage: factory recipe <item> (e.g. circuit_board)");
+                    self.console
+                        .print("Usage: factory recipe <item> (e.g. circuit_board)");
                     return true;
                 };
                 let feet = self.pose().feet;
@@ -93,12 +99,60 @@ impl Game {
                             self.survival
                                 .tell(crate::net::protocol::WorldEvent::Machine { cell, machine });
                         }
-                        self.console.print(format!("Making {}", item.name().to_lowercase()));
+                        self.console
+                            .print(format!("Making {}", item.name().to_lowercase()));
                     }
                     None => self.console.print("No machine here makes that"),
                 }
             }
             Some("industry") => self.industry_demo(),
+            Some("power") => self.power_demo(),
+            Some("chemistry") => self.chemistry_demo(),
+            Some("nuclear") => self.nuclear_demo(),
+            Some("fill") => {
+                // factory fill <fluid> [litres]: what the crosshair is on (a tank, a machine
+                // that takes it, a pipe), else the nearest storage tank in reach.
+                let Some(fluid) = args.get(1).and_then(|a| Fluid::from_id(a)) else {
+                    let names: Vec<String> = Fluid::ALL.iter().map(|f| f.id()).collect();
+                    self.console.print(format!(
+                        "Usage: factory fill <{}> [litres]",
+                        names.join("|")
+                    ));
+                    return true;
+                };
+                let litres = args
+                    .get(2)
+                    .and_then(|a| a.parse::<f32>().ok())
+                    .unwrap_or(factory::fluids::TANK_HOLDS);
+                let target = self.target.as_ref().map(|h| h.cell);
+                let cell = target
+                    .filter(|&c| {
+                        self.survival.factory.machine(c).is_some()
+                            || self.survival.factory.pipes().iter().any(|p| p.cell == c)
+                    })
+                    .or_else(|| self.nearest_machine(Some("storage tank")).map(|(c, _)| c));
+                let put = cell.map_or(0.0, |c| {
+                    let c = self.survival.factory.core(c);
+                    self.survival.factory.fill_fluid(c, fluid, litres)
+                });
+                self.console
+                    .print(format!("Put in {put:.0} l of {}", fluid.name()));
+            }
+            Some("drain") => {
+                self.survival.factory.drain_all();
+                self.console.print("Every tank and pipe emptied");
+            }
+            Some("fluids") => {
+                let nets = self.survival.factory.fluid_networks();
+                if nets.is_empty() {
+                    self.console.print("No pipes");
+                }
+                for (i, (pipes, fluid, litres)) in nets.into_iter().enumerate() {
+                    let what = fluid.map_or("empty", Fluid::name);
+                    self.console
+                        .print(format!("line {i}: {pipes} pipes, {what} {litres:.0} l"));
+                }
+            }
             Some("turn") => {
                 let text = if self.turn_conveyor() {
                     "Turned the conveyor"
@@ -108,7 +162,8 @@ impl Game {
                 self.console.print(text);
             }
             _ => self.console.print(
-                "Usage: factory [status|demo|industry|stress|open [machine|power]|recipe <item>|turn]",
+                "Usage: factory [status|demo|industry|power|chemistry|nuclear|stress|open \
+                 [machine|power]|recipe <item>|fill <fluid> [l]|drain|fluids|turn]",
             ),
         }
         true
@@ -379,12 +434,13 @@ impl Game {
             (5, -4, Refinery, back),
             (6, -4, Conveyor, ahead),
             (7, -4, Chest, back),
-            // A miner onto a belt that bends round to the right into a chest.
+            // A miner (three blocks square) onto a belt that bends round to the right into a
+            // chest.
             (3, -1, Miner, back),
-            (4, -1, Conveyor, ahead),
-            (5, -1, Conveyor, right),
-            (5, 0, Conveyor, right),
-            (5, 1, Chest, back),
+            (5, -1, Conveyor, ahead),
+            (6, -1, Conveyor, right),
+            (6, 0, Conveyor, right),
+            (6, 1, Chest, back),
             // Sand and coal -> arc furnace (silicon) -> chip fab (wafers) -> chest.
             (2, 3, Chest, back),
             (3, 3, Conveyor, ahead),
@@ -415,28 +471,45 @@ impl Game {
             };
             for &(a, r, block, facing) in &parts {
                 let Some(cell) = at(a, r) else { return };
-                // Something to stand on (oil shale under the pump), and room.
-                if let Some(below) = planet.cell(cell.face, cell.u, cell.v, cell.k - 1) {
-                    let floor = if block == OilPump { OilShale } else { Stone };
-                    let solid = world.streamer.block(below).is_some_and(|b| b.is_opaque());
-                    if !solid || block == OilPump {
-                        self.survival
-                            .put(&mut world, below, floor, ModelState::default(), None);
-                    }
-                }
-                for up in 1..=2 {
-                    if let Some(above) = planet.cell(cell.face, cell.u, cell.v, cell.k + up)
-                        && world.streamer.block(above).is_some_and(|b| b.is_solid())
-                    {
-                        self.survival
-                            .put(&mut world, above, Air, ModelState::default(), None);
-                    }
-                }
-                let state = ModelState {
-                    facing,
-                    ..Default::default()
+                // (A big machine: every cell it fills.)
+                let Some(unit) = factory::footprint(&planet, cell, block) else {
+                    return;
                 };
-                self.survival.put(&mut world, cell, block, state, None);
+                let height = block.structure().1;
+                for c in unit.iter().filter(|c| c.k == cell.k) {
+                    // Something to stand on (oil shale under the pump), and room.
+                    if let Some(below) = planet.cell(c.face, c.u, c.v, c.k - 1) {
+                        let floor = if block == OilPump { OilShale } else { Stone };
+                        let solid = world.streamer.block(below).is_some_and(|b| b.is_opaque());
+                        if !solid || block == OilPump {
+                            self.survival.put(
+                                &mut world,
+                                below,
+                                floor,
+                                ModelState::default(),
+                                None,
+                            );
+                        }
+                    }
+                    for up in 0..height + 2 {
+                        if let Some(above) = planet.cell(c.face, c.u, c.v, c.k + up)
+                            && world.streamer.block(above).is_some_and(|b| b.is_solid())
+                        {
+                            self.survival
+                                .put(&mut world, above, Air, ModelState::default(), None);
+                        }
+                    }
+                }
+                if block.is_structure() {
+                    self.survival
+                        .build_structure(&mut world, &unit, block, facing);
+                } else {
+                    let state = ModelState {
+                        facing,
+                        ..Default::default()
+                    };
+                    self.survival.put(&mut world, cell, block, state, None);
+                }
                 cells.push((cell, block));
             }
         }
@@ -492,5 +565,260 @@ impl Game {
             "Industry: oil -> plastic, a miner on a bent belt, sand -> silicon -> wafers, \
              copper -> wire; 4 generators and an accumulator",
         );
+    }
+
+    /// Builds `parts` ahead of the player, each as (cells ahead, cells to the right, block,
+    /// facing as a turn from facing the player; for a pipe the ways it joins, `PIPE_*`, or 0 for
+    /// all it touches): on a stone floor, with room cleared over them (a big machine whole).
+    /// What went where, or None if something didn't fit.
+    fn build_ahead(&mut self, parts: &[(i32, i32, Block, u8)]) -> Option<Vec<(BlockCell, Block)>> {
+        let pose = self.pose();
+        let planet = self.planet.clone();
+        let here = planet.cell_at(pose.feet + pose.up() * 0.5)?;
+        let ahead = models::facing_towards(&planet, here, pose.look);
+        let (du, dv) = AHEAD[ahead as usize];
+        let (ru, rv) = (dv, -du);
+        let back = (ahead + 2) % 4;
+        let at = |a: i32, r: i32| {
+            planet.cell(
+                here.face,
+                here.u + du * a + ru * r,
+                here.v + dv * a + rv * r,
+                here.k,
+            )
+        };
+        let mut placed = Vec::new();
+        let mut world = survival::World {
+            planet: &planet,
+            streamer: &mut self.streamer,
+        };
+        for &(a, r, block, turn) in parts {
+            let cell = at(a, r)?;
+            let cells = factory::footprint(&planet, cell, block)?;
+            let height = block.structure().1;
+            for &c in cells.iter().filter(|c| c.k == cell.k) {
+                if let Some(below) = planet.cell(c.face, c.u, c.v, c.k - 1)
+                    && !world.streamer.block(below).is_some_and(|b| b.is_opaque())
+                {
+                    self.survival
+                        .put(&mut world, below, Block::Stone, ModelState::default(), None);
+                }
+                for up in 0..height + 2 {
+                    if let Some(c) = planet.cell(c.face, c.u, c.v, c.k + up)
+                        && world.streamer.block(c).is_some_and(|b| b.is_solid())
+                    {
+                        self.survival
+                            .put(&mut world, c, Block::Air, ModelState::default(), None);
+                    }
+                }
+            }
+            let facing = (back + turn) % 4;
+            if block.is_structure() {
+                self.survival
+                    .build_structure(&mut world, &cells, block, facing);
+            } else if block == Block::Pipe {
+                // (Ways ahead, back, right, left, up, down as +u, -u, +v, -v, up, down.)
+                let side = |(u, v): (i32, i32)| match (u, v) {
+                    (1, 0) => 0,
+                    (-1, 0) => 1,
+                    (0, 1) => 2,
+                    _ => 3,
+                };
+                let sides = [
+                    side((du, dv)),
+                    side((-du, -dv)),
+                    side((ru, rv)),
+                    side((-ru, -rv)),
+                    4,
+                    5,
+                ];
+                let ways = (0..6)
+                    .filter(|i| turn & (1 << i) != 0)
+                    .fold(0, |w, i| w | 1 << sides[i]);
+                let state = ModelState {
+                    links: if turn == 0 {
+                        0
+                    } else {
+                        ways | survival::BUILT_WAYS
+                    },
+                    ..Default::default()
+                };
+                self.survival.put(&mut world, cell, block, state, None);
+            } else {
+                let state = ModelState {
+                    facing,
+                    ..Default::default()
+                };
+                self.survival.put(&mut world, cell, block, state, None);
+            }
+            placed.push((cell, block));
+        }
+        Some(placed)
+    }
+
+    /// Wires every machine of `placed` that uses or makes power to the first pole in it, and
+    /// tells the others what they hold.
+    fn wire_up(&mut self, placed: &[(BlockCell, Block)]) {
+        let Some(&(pole, _)) = placed.iter().find(|(_, b)| *b == Block::PowerPole) else {
+            return;
+        };
+        for &(cell, block) in placed {
+            if block.is_machine() && self.survival.factory.is_electric(cell) {
+                self.survival.wire(pole, cell);
+            }
+        }
+        for &(cell, block) in placed {
+            if block.is_machine()
+                && let Some(machine) = self.survival.factory.machine(cell).copied()
+            {
+                self.survival
+                    .tell(crate::net::protocol::WorldEvent::Machine { cell, machine });
+            }
+        }
+    }
+
+    /// Steam and other power ahead of the player: a water tank feeding a coal boiler, its steam
+    /// into a steam turbine; a wind turbine and an RTG; an accumulator, all on one pole.
+    fn power_demo(&mut self) {
+        use Block::*;
+        let parts = [
+            (4, -6, WindTurbine, 0),
+            (4, -3, Rtg, 0),
+            (4, 1, StorageTank, 0),
+            (4, 2, Pipe, 0),
+            (4, 3, Boiler, 0),
+            (5, 3, Pipe, 0),
+            (6, 3, Pipe, 0),
+            (8, 3, SteamTurbine, 1),
+            (2, -1, Accumulator, 0),
+            (2, 1, PowerPole, 0),
+        ];
+        let Some(placed) = self.build_ahead(&parts) else {
+            self.console.print("No room here");
+            return;
+        };
+        let factory = &mut self.survival.factory;
+        factory.fill_fluid(placed[2].0, Fluid::Water, factory::fluids::TANK_HOLDS);
+        if let Some(m) = factory.machine_mut(placed[4].0) {
+            m.fuel = Some(ItemStack::new(Item::Coal, 64));
+        }
+        self.wire_up(&placed);
+        self.console.print(
+            "Power: water -> coal boiler -> steam turbine; a wind turbine, an RTG and an \
+             accumulator on one pole",
+        );
+    }
+
+    /// Chemistry ahead of the player: water from a tank into an electrolyzer (its hydrogen into
+    /// a tank, its oxygen down a line to a blender), the blender also fed water and sulfur
+    /// (from a chest) making sulfuric acid into a tank; coal generators on a pole.
+    fn chemistry_demo(&mut self) {
+        use Block::*;
+        let mut parts = vec![
+            (4, -3, StorageTank, 0),
+            (4, -2, Pipe, 0),
+            (4, -1, Pipe, 0),
+            (4, 0, Electrolyzer, 0),
+            (3, 0, Pipe, 0),
+            (2, 0, StorageTank, 0),
+            (5, 0, Pipe, 0),
+            (6, 0, Pipe, 0),
+            (8, 3, Blender, 0),
+            (11, 3, Pipe, 0),
+            (12, 3, StorageTank, 0),
+            (8, 7, Chest, 0),
+            (8, 6, Conveyor, 3),
+        ];
+        // The blender's water, round the oxygen line.
+        for (a, r) in [
+            (5, -3),
+            (6, -3),
+            (7, -3),
+            (8, -3),
+            (9, -3),
+            (9, -2),
+            (9, -1),
+            (9, 0),
+        ] {
+            parts.push((a, r, Pipe, 0));
+        }
+        for r in [-6, -7, -8] {
+            parts.push((2, r, CoalGenerator, 0));
+        }
+        parts.push((2, -4, CoalGenerator, 0));
+        parts.push((1, -2, PowerPole, 0));
+        let Some(placed) = self.build_ahead(&parts) else {
+            self.console.print("No room here");
+            return;
+        };
+        let factory = &mut self.survival.factory;
+        factory.fill_fluid(placed[0].0, Fluid::Water, factory::fluids::TANK_HOLDS);
+        if let Some(m) = factory.machine_mut(placed[3].0) {
+            m.set_recipe(Some(Item::Fluid(Fluid::Hydrogen)));
+        }
+        if let Some(m) = factory.machine_mut(placed[8].0) {
+            m.set_recipe(Some(Item::Fluid(Fluid::SulfuricAcid)));
+        }
+        for &(cell, block) in &placed {
+            if block == CoalGenerator
+                && let Some(m) = self.survival.factory.machine_mut(cell)
+            {
+                m.fuel = Some(ItemStack::new(Item::Coal, 64));
+            }
+        }
+        if let Some(chest) = self.survival.chests.get_mut(&placed[11].0) {
+            chest[0] = Some(ItemStack::new(Item::Sulfur, 64));
+        }
+        self.wire_up(&placed);
+        self.console.print(
+            "Chemistry: water -> electrolyzer (hydrogen to a tank, oxygen to the blender); \
+             sulfur, water and oxygen -> sulfuric acid into a tank",
+        );
+    }
+
+    /// A nuclear plant ahead of the player: a reactor with four fuel rods, fed water from a
+    /// tank along the line in front of it (which the first turbine's water goes back into),
+    /// its steam to two steam turbines; a coal generator and an accumulator to start it, all
+    /// on one pole.
+    fn nuclear_demo(&mut self) {
+        use Block::*;
+        let mut parts = vec![
+            (9, 0, NuclearReactor, 0),
+            (6, -4, StorageTank, 0),
+            (8, 5, SteamTurbine, 1),
+            (12, 5, SteamTurbine, 1),
+            (8, 3, Pipe, PIPE_RIGHT | PIPE_LEFT),
+            (11, 3, Pipe, PIPE_RIGHT | PIPE_LEFT),
+            (3, -6, CoalGenerator, 0),
+            (3, -7, Accumulator, 0),
+            (3, -2, PowerPole, 0),
+        ];
+        // (Past the reactor's side, into it in the middle and into the turbine at the end.)
+        for r in -3..=4 {
+            let ways = match r {
+                0 => PIPE_RIGHT | PIPE_LEFT | PIPE_AHEAD,
+                4 => PIPE_LEFT | PIPE_AHEAD,
+                _ => PIPE_RIGHT | PIPE_LEFT,
+            };
+            parts.push((6, r, Pipe, ways));
+        }
+        let Some(placed) = self.build_ahead(&parts) else {
+            self.console.print("No room here");
+            return;
+        };
+        let factory = &mut self.survival.factory;
+        factory.fill_fluid(placed[1].0, Fluid::Water, factory::fluids::TANK_HOLDS);
+        if let Some(m) = factory.machine_mut(placed[0].0) {
+            m.fuel = Some(ItemStack::new(Item::UraniumFuelRod, 4));
+        }
+        if let Some(m) = factory.machine_mut(placed[6].0) {
+            m.fuel = Some(ItemStack::new(Item::Coal, 64));
+        }
+        self.wire_up(&placed);
+        self.console.print(format!(
+            "Nuclear: a reactor ({:.0} mw of heat) on water from a tank, its steam into two \
+             turbines; keep it in water or it melts down",
+            factory::REACTOR_HEAT / 1.0e6
+        ));
     }
 }

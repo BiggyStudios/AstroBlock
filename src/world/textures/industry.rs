@@ -136,7 +136,8 @@ pub(super) fn make(t: Tex, r: &mut Rng) -> Img {
         Tex::CleanPanel => panel(r, [212, 218, 224]),
         Tex::MinerFront | Tex::MinerFrontLit => {
             // The control house's front (rows 8-13 show): a depth display, two lamps, and a
-            // stripe along the bottom. Above them (only the icon shows it) the rig's derrick.
+            // stripe along the bottom. Above them the rig's derrick, which no face shows now
+            // (the miner's icon is its own picture: `IconTex::Miner`).
             let mut img = panel(r, [96, 102, 112]);
             for y in 1..=7usize {
                 let spread = (y - 1) / 2;
@@ -839,7 +840,7 @@ pub(super) fn make(t: Tex, r: &mut Rng) -> Img {
             }
             img
         }
-        _ => noisy(r, [255, 0, 255], 0.0, 0),
+        _ => super::chemistry::make(t, r),
     }
 }
 
@@ -865,47 +866,8 @@ mod tests {
     #[test]
     #[ignore]
     fn write_industry_sprites() {
-        const ZOOM: usize = 8;
         let sprites = &Tex::ALL[Tex::CrudeOil as usize..=Tex::Computer as usize];
-        let columns = 7;
-        let rows = sprites.len().div_ceil(columns);
-        let cell = TEX_SIZE * ZOOM + 8;
-        let (w, h) = (columns * cell, rows * cell);
-        let mut rgb = vec![[96u8, 102, 116]; w * h];
-        for (i, &t) in sprites.iter().enumerate() {
-            let px = super::super::pixels(t);
-            let (ox, oy) = ((i % columns) * cell + 4, (i / columns) * cell + 4);
-            for y in 0..TEX_SIZE * ZOOM {
-                for x in 0..TEX_SIZE * ZOOM {
-                    let p = px[(y / ZOOM) * TEX_SIZE + x / ZOOM];
-                    if p[3] >= 128 {
-                        rgb[(oy + y) * w + ox + x] = [p[0], p[1], p[2]];
-                    }
-                }
-            }
-        }
-        let row = (w * 3).div_ceil(4) * 4;
-        let mut file = Vec::new();
-        let size = 54 + row * h;
-        file.extend(b"BM");
-        file.extend((size as u32).to_le_bytes());
-        file.extend([0u8; 4]);
-        file.extend(54u32.to_le_bytes());
-        file.extend(40u32.to_le_bytes());
-        file.extend((w as i32).to_le_bytes());
-        file.extend((h as i32).to_le_bytes());
-        file.extend(1u16.to_le_bytes());
-        file.extend(24u16.to_le_bytes());
-        file.extend([0u8; 24]);
-        for y in (0..h).rev() {
-            let start = file.len();
-            for x in 0..w {
-                let [r, g, b] = rgb[y * w + x];
-                file.extend([b, g, r]);
-            }
-            file.resize(start + row, 0);
-        }
-        std::fs::create_dir_all("target").unwrap();
-        std::fs::write("target/industry_sprites.bmp", file).unwrap();
+        let images: Vec<_> = sprites.iter().map(|&t| super::super::pixels(t)).collect();
+        super::super::write_sheet("target/industry_sprites.bmp", &images);
     }
 }

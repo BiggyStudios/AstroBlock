@@ -16,9 +16,10 @@ use crate::{
     },
 };
 
-/// `UiVertex::layer` for font/solid quads. Otherwise bits 0-7 are a texture array layer,
-/// bits 8-15 a brightness (0 = full) and bit 31 marks sprites (alpha = transparency rather
-/// than the biome tint mask). Must match `shaders/ui.frag`.
+/// `UiVertex::layer` for font/solid quads. Otherwise bits 0-11 are a texture array layer
+/// (past `Tex`: the interface's own pictures, `IconTex`), bits 16-23 a brightness (0 = full)
+/// and bit 31 marks sprites (alpha = transparency rather than the biome tint mask). Must
+/// match `shaders/ui.frag`.
 pub const FONT_LAYER: u32 = u32::MAX;
 const SPRITE: u32 = 1 << 31;
 
@@ -254,6 +255,12 @@ impl Ui {
                 self.block_icon(x + inset, y + inset, size - 2.0 * inset, block);
             }
             Icon::Sprite(tex) => self.sprite(x, y, size, tex, [255; 4]),
+            Icon::Picture(picture) => self.quad(
+                (x, y, size, size),
+                ([0.0; 2], [1.0; 2]),
+                [255; 4],
+                picture.layer() | SPRITE,
+            ),
         }
         let s = self.scale;
         if stack.count > 1 {

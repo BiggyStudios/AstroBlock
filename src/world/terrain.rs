@@ -1531,7 +1531,8 @@ fn trilerp(c: [[f32; 3]; 8], fu: f32, fv: f32, fk: f32) -> [f32; 3] {
 // Ores
 // ----------------------------------------------------------------------------------------
 
-const ORE_COUNT: usize = 8;
+/// (The first eight are rolled for together; oil shale and the rest after, in what is left.)
+const ORE_COUNT: usize = 12;
 
 #[derive(Clone, Copy, Debug)]
 enum Ore {
@@ -1544,11 +1545,20 @@ enum Ore {
     Uranium,
     /// Oil shale: rolled for only after all the others, so it changes none of theirs.
     Oil,
+    // Rolled for after oil shale, in what is left (so no older vein moved).
+    Sulfur,
+    Lead,
+    Fluorite,
+    Saltpeter,
 }
 
 impl Ore {
     fn block(self) -> Block {
         match self {
+            Ore::Sulfur => Block::SulfurOre,
+            Ore::Lead => Block::LeadOre,
+            Ore::Fluorite => Block::FluoriteOre,
+            Ore::Saltpeter => Block::SaltpeterOre,
             Ore::Coal => Block::CoalOre,
             Ore::Iron => Block::IronOre,
             Ore::Copper => Block::CopperOre,
@@ -1570,6 +1580,10 @@ impl Ore {
             Ore::Bauxite => (2.4, 3.2),
             Ore::Uranium => (1.2, 1.8),
             Ore::Oil => (2.6, 3.4),
+            Ore::Sulfur => (1.6, 2.6),
+            Ore::Lead => (1.5, 2.3),
+            Ore::Fluorite => (1.3, 2.0),
+            Ore::Saltpeter => (2.2, 3.2),
         };
         (min + (max - min) * t) as f32
     }
@@ -1578,6 +1592,14 @@ impl Ore {
         match self {
             Ore::Bauxite => matches!(block, Block::Stone | Block::Dirt),
             Ore::Oil => matches!(block, Block::Stone | Block::Sandstone | Block::Dirt),
+            Ore::Sulfur => matches!(
+                block,
+                Block::Stone | Block::Basalt | Block::Ash | Block::Deepstone
+            ),
+            Ore::Saltpeter => matches!(
+                block,
+                Block::Sand | Block::RedSand | Block::Sandstone | Block::Stone | Block::Dirt
+            ),
             _ => matches!(block, Block::Stone | Block::Deepstone),
         }
     }
@@ -1593,7 +1615,7 @@ fn choose_ore(roll: f64, depth: i32, biome: Biome, province: impl Fn(Ore) -> f64
     let arid = matches!(biome, Desert | Badlands);
     let in_range = |min: i32, max: i32| (min..=max).contains(&depth);
 
-    let mut chances: [(Ore, f64); ORE_COUNT - 1] = [
+    let mut chances: [(Ore, f64); 7] = [
         (
             Ore::Coal,
             if in_range(4, 120) {
@@ -1671,7 +1693,54 @@ fn choose_ore(roll: f64, depth: i32, biome: Biome, province: impl Fn(Ore) -> f64
     } else {
         0.0
     };
-    (roll < oil).then_some(Ore::Oil)
+    if roll < oil {
+        return Some(Ore::Oil);
+    }
+    roll -= oil;
+    // Then, in what is left again: sulfur round volcanoes (and a little deep down anywhere),
+    // galena (lead) and fluorite in the mountains, saltpeter crusts just under deserts.
+    let volcanic = matches!(biome, Volcanic | Caldera);
+    let later = [
+        (
+            Ore::Sulfur,
+            if volcanic && in_range(2, 80) {
+                0.3
+            } else if in_range(150, 900) {
+                0.012 * (1.0 + 2.0 * province(Ore::Sulfur))
+            } else {
+                0.0
+            },
+        ),
+        (
+            Ore::Lead,
+            if in_range(10, 240) {
+                0.03 * (1.0
+                    + 3.0 * (mountains || biome == Badlands) as u8 as f64
+                    + 2.0 * province(Ore::Lead))
+            } else {
+                0.0
+            },
+        ),
+        (
+            Ore::Fluorite,
+            if in_range(20, 320) {
+                0.012 * (1.0 + 4.0 * mountains as u8 as f64 + 2.0 * province(Ore::Fluorite))
+            } else {
+                0.0
+            },
+        ),
+        (
+            Ore::Saltpeter,
+            if arid && in_range(2, 20) { 0.18 } else { 0.0 },
+        ),
+    ];
+    for (ore, chance) in later {
+        if roll < chance {
+            return Some(ore);
+        }
+        roll -= chance;
+    }
+    None
 }
 
 // ----------------------------------------------------------------------------------------
@@ -1968,13 +2037,28 @@ mod tests {
         assert!(oil(&desert) > 50, "{} cells of 1000", oil(&desert));
         assert_eq!(oil(&picks(Biome::Forest, 30)), 0);
         assert_eq!(oil(&picks(Biome::Desert, 300)), 0);
-        // Oil only takes rolls above all the others' (ones that used to give nothing), so every
-        // cell that held another ore still does.
-        let last_other = desert
+        // Oil only takes rolls above all the older ores' (ones that used to give nothing), so
+        // every cell that held another ore still does; the newer ores (sulfur, lead, fluorite,
+        // saltpeter) take rolls above oil's in turn.
+        let newer = |b: Block| {
+            matches!(
+                b,
+                Block::SulfurOre | Block::LeadOre | Block::FluoriteOre | Block::SaltpeterOre
+            )
+        };
+        let last_older = desert
             .iter()
-            .rposition(|b| b.is_some_and(|b| b != Block::OilShale));
+            .rposition(|b| b.is_some_and(|b| b != Block::OilShale && !newer(b)));
         let first_oil = desert.iter().position(|b| *b == Some(Block::OilShale));
-        assert!(last_other < first_oil, "{last_other:?} {first_oil:?}");
+        let last_oil = desert.iter().rposition(|b| *b == Some(Block::OilShale));
+        let first_newer = desert.iter().position(|b| b.is_some_and(newer));
+        assert!(last_older < first_oil, "{last_older:?} {first_oil:?}");
+        assert!(last_oil < first_newer, "{last_oil:?} {first_newer:?}");
+        // Saltpeter just under deserts, sulfur round volcanoes.
+        let count = |p: &[Option<Block>], b: Block| p.iter().filter(|x| **x == Some(b)).count();
+        assert!(count(&picks(Biome::Desert, 8), Block::SaltpeterOre) > 50);
+        assert!(count(&picks(Biome::Volcanic, 20), Block::SulfurOre) > 100);
+        assert_eq!(count(&picks(Biome::Forest, 8), Block::SaltpeterOre), 0);
     }
 
     /// The LOD system draws trees from `tree_at`; they must be exactly the chunk's trees.

@@ -51,6 +51,13 @@ impl Drop {
         }
     }
 
+    /// How far it has turned about the up axis (radians): items lying about spin slowly,
+    /// each from its own start.
+    pub fn spin(&self) -> f32 {
+        const SPIN: f32 = 1.4;
+        self.age * SPIN + (self.id % 97) as f32 * 0.65
+    }
+
     /// Where to draw it (gently bobbing above where it lies).
     pub fn draw_position(&self) -> DVec3 {
         let up = self.position.normalize_or(DVec3::Y);

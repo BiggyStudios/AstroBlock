@@ -2889,8 +2889,12 @@ fn valid_event(planet: &Planet, event: &WorldEvent) -> bool {
                     machine.energy_total,
                     machine.power,
                     machine.supply,
+                    machine.heat,
+                    machine.level,
+                    machine.decay,
                 ]
                 .iter()
+                .chain(machine.tanks.iter().flatten().map(|t| &t.amount))
                 .all(|x| x.is_finite())
         }
         WorldEvent::Cable { a, b, .. } => valid_cell(planet, *a) && valid_cell(planet, *b),

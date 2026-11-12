@@ -546,6 +546,20 @@ fn model(rig: &mut Rig, part: Part, whole: &Whole, moving: &mut Vec<(Pivot, Vec<
             r.part([-7.0, -7.0, 2.0], [7.0, 7.0, 4.0], tex, LIGHT_METAL);
             r.part([-6.0, -6.0, 4.0], [6.0, 6.0, 4.6], Tex::IonFace, WHITE);
         }),
+        Block::AntimatterDrive => shaped(rig, part, turned_to(facing), |r| {
+            // A dark reaction chamber in magnet rings, a long narrow nozzle, its throat violet.
+            r.part([-7.0, -7.0, -8.0], [7.0, 7.0, -2.0], tex, DARK);
+            r.part([-7.5, -7.5, -6.5], [7.5, 7.5, -5.0], tex, [90, 130, 220]);
+            r.part([-7.5, -7.5, -3.5], [7.5, 7.5, -2.0], tex, [90, 130, 220]);
+            r.part([-4.0, -4.0, -2.0], [4.0, 4.0, 5.0], tex, METAL);
+            r.part([-5.5, -5.5, 5.0], [5.5, 5.5, 9.0], tex, LIGHT_METAL);
+            r.part(
+                [-4.5, -4.5, 9.0],
+                [4.5, 4.5, 9.4],
+                Tex::AntimatterFace,
+                WHITE,
+            );
+        }),
         Block::VehicleDrill => {
             // A gearbox against the body, and the cutting head turning out past the cell.
             let turn = turned_to(facing);
@@ -569,7 +583,7 @@ fn model(rig: &mut Rig, part: Part, whole: &Whole, moving: &mut Vec<(Pivot, Vec<
             r.part([-8.0, -8.0, -8.0], [8.0, 8.0, -6.5], tex, METAL);
             r.part([-7.5, -7.5, -6.5], [7.5, 7.5, -5.5], Tex::SolarCell, WHITE);
         }),
-        Block::Accumulator | Block::CoalGenerator => {
+        Block::Accumulator | Block::CoalGenerator | Block::Rtg => {
             placed(
                 rig,
                 part,

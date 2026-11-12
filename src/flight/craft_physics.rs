@@ -16,8 +16,8 @@ use glam::{DMat3, DQuat, DVec3};
 
 use super::{
     craft::{
-        At, Craft, DRILL_POWER, FUEL_ENERGY, GENERATOR_POWER, Massing, SOLAR_POWER, SPRING_REST,
-        Stats, WHEEL_RADIUS, center,
+        At, Craft, DRILL_POWER, FUEL_ENERGY, GENERATOR_POWER, Massing, RTG_POWER, SOLAR_POWER,
+        SPRING_REST, Stats, WHEEL_RADIUS, center,
     },
     vessel::{
         CRASH_SPEED, Controls, Env, Ground, HEAT_REFERENCE_MASS, Landed, REFUEL_TIME, Vessel,
@@ -130,7 +130,7 @@ impl Vessel {
             0.0
         };
         let used = draw * self.power_share;
-        let mut made = solar;
+        let mut made = solar + s.rtgs as f64 * RTG_POWER;
         let mut burned = 0.0;
         if s.generators > 0 && self.fuel > 0.0 {
             let wanted = ((s.battery - self.charge) / dt + used - solar).max(0.0);

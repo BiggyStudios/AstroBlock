@@ -103,6 +103,7 @@ fn recipes() -> &'static [Recipe] {
         ];
         all.extend(vehicle_recipes());
         all.extend(factory_recipes());
+        all.extend(power_recipes());
         for tier in Tier::ALL {
             let material = match tier {
                 Tier::Wood => Planks,
@@ -379,6 +380,168 @@ fn factory_recipes() -> Vec<Recipe> {
     ]
 }
 
+/// Fluids, power and the big machines. Each tier needs what the one before it makes: pipes and
+/// boilers are iron; tanks, pumps and blenders steel and motors (an assembler's); turbines
+/// titanium blades; the reactor concrete (a blender's), lead and a computer; the accelerator
+/// superconducting magnets and an AI chip.
+fn power_recipes() -> Vec<Recipe> {
+    use Ingredient::*;
+    let item = |c: char, i: Item| (c, Exactly(i));
+    let block = |c: char, b: Block| (c, Exactly(Item::Block(b)));
+    let iron = item('I', Item::IronIngot);
+    let steel = item('S', Item::SteelIngot);
+    let copper = item('C', Item::CopperIngot);
+    let motor = item('M', Item::ElectricMotor);
+    let board = item('B', Item::CircuitBoard);
+    let glass = block('G', Block::Glass);
+    let pipe = block('P', Block::Pipe);
+    let concrete = block('K', Block::Concrete);
+    let lead = item('L', Item::LeadIngot);
+    let computer = item('X', Item::Computer);
+    let made = |b| Item::Block(b);
+    vec![
+        recipe(&["III"], &[iron], made(Block::Pipe), 8),
+        recipe(
+            &["SGS", "S S", "SSS"],
+            &[steel, glass],
+            made(Block::StorageTank),
+            1,
+        ),
+        recipe(
+            &["IMI", "IPI"],
+            &[iron, motor, pipe],
+            made(Block::WaterPump),
+            1,
+        ),
+        recipe(
+            &["CGC", "SBS", "SSS"],
+            &[copper, glass, steel, board],
+            made(Block::Electrolyzer),
+            1,
+        ),
+        recipe(
+            &["AMA", "A A", "SSS"],
+            &[item('A', Item::AluminiumIngot), motor, steel],
+            made(Block::Centrifuge),
+            1,
+        ),
+        recipe(
+            &["SBS", "STS", "SSS"],
+            &[steel, board, block('T', Block::Assembler)],
+            made(Block::FuelFabricator),
+            1,
+        ),
+        recipe(
+            &["III", "IFI", "IPI"],
+            &[iron, block('F', Block::Furnace), pipe],
+            made(Block::Boiler),
+            1,
+        ),
+        recipe(
+            &[" P ", "SDS", " P "],
+            &[
+                pipe,
+                steel,
+                item('D', Item::Tool(ToolKind::Pickaxe, Tier::Diamond)),
+            ],
+            made(Block::GeothermalWell),
+            1,
+        ),
+        recipe(
+            &["LML", " S ", " S "],
+            &[item('L', Item::Plastic), motor, steel],
+            made(Block::WindTurbine),
+            1,
+        ),
+        recipe(
+            &["LUL", "WSW", "LLL"],
+            &[
+                lead,
+                item('U', Item::Plutonium),
+                item('W', Item::CopperWire),
+                steel,
+            ],
+            made(Block::Rtg),
+            1,
+        ),
+        recipe(
+            &["SMS", "S S", "SBS"],
+            &[steel, motor, board],
+            made(Block::Blender),
+            1,
+        ),
+        recipe(
+            &["TTT", "SMS", "SSS"],
+            &[item('T', Item::TurbineBlade), steel, motor],
+            made(Block::SteamTurbine),
+            1,
+        ),
+        recipe(
+            &["KLK", "LXL", "KZK"],
+            &[concrete, lead, computer, block('Z', Block::SteelPlating)],
+            made(Block::NuclearReactor),
+            1,
+        ),
+        recipe(
+            &["KPK", "KKK"],
+            &[concrete, pipe],
+            made(Block::CoolingPool),
+            1,
+        ),
+        recipe(
+            &["KGK", "MXM", "KLK"],
+            &[concrete, glass, motor, computer, lead],
+            made(Block::ReprocessingPlant),
+            1,
+        ),
+        recipe(
+            &["NAN", "NXN", "ZZZ"],
+            &[
+                item('N', Item::SuperconductingMagnet),
+                item('A', Item::AiChip),
+                computer,
+                block('Z', Block::SteelPlating),
+            ],
+            made(Block::ParticleAccelerator),
+            1,
+        ),
+        // Steel by the block, and back.
+        recipe(
+            &["SSS", "SSS", "SSS"],
+            &[steel],
+            made(Block::SteelPlating),
+            1,
+        ),
+        recipe(
+            &["Z"],
+            &[block('Z', Block::SteelPlating)],
+            Item::SteelIngot,
+            9,
+        ),
+        // A vehicle's antimatter drive, and the test rocket.
+        recipe(
+            &["ANA", " R "],
+            &[
+                item('A', Item::Antimatter),
+                item('N', Item::SuperconductingMagnet),
+                block('R', Block::RocketEngine),
+            ],
+            made(Block::AntimatterDrive),
+            1,
+        ),
+        recipe(
+            &[" H ", "HTH", "HRH"],
+            &[
+                block('H', Block::Hull),
+                block('T', Block::FuelTank),
+                block('R', Block::RocketEngine),
+            ],
+            Item::Rocket,
+            1,
+        ),
+    ]
+}
+
 /// The result of the items in a crafting grid `width` cells wide (row-major), if any.
 pub fn craft(grid: &[Option<Item>], width: usize) -> Option<ItemStack> {
     let height = grid.len() / width;
@@ -467,5 +630,96 @@ mod tests {
             craft(&[STICK, COBBLE, None, None, None, None, None, None, LOG], 3),
             None
         );
+    }
+
+    /// An item an ingredient takes (the first kind of planks or coal).
+    fn example(ing: Ingredient) -> Item {
+        match ing {
+            Ingredient::Exactly(item) => item,
+            Ingredient::Planks => Item::Block(Block::OakPlanks),
+            Ingredient::Coal => Item::Coal,
+        }
+    }
+
+    #[test]
+    fn every_recipe_crafts_what_it_says() {
+        // Each pattern, laid out in the top left of the workbench, gives its own result (no
+        // other recipe's pattern catches it first).
+        for r in recipes() {
+            let mut grid = [None; 9];
+            for (y, row) in r.pattern.iter().enumerate() {
+                for (x, cell) in row.iter().enumerate() {
+                    grid[y * 3 + x] = cell.map(example);
+                }
+            }
+            assert_eq!(craft(&grid, 3), Some(r.result), "{:?}", r.result.item);
+        }
+    }
+
+    #[test]
+    fn everything_can_be_made_or_found() {
+        use crate::factory::{fluids::Fluid, recipes::RECIPES};
+        use crate::survival::items::{Category, drops};
+        // Found: the ground (what each block gives to the right tool), animals, a reactor's
+        // spent rods, an oil pump's oil, a water pump's water.
+        let mut have: Vec<Item> = vec![
+            Item::RawBeef,
+            Item::RawPorkchop,
+            Item::RawMutton,
+            Item::Leather,
+            Item::Block(Block::WhiteWool),
+            Item::Stick,
+            Item::CrudeOil,
+            Item::Fluid(Fluid::Water),
+        ];
+        for &b in &Block::ALL {
+            if Item::Block(b).category() == Category::Terrain {
+                have.push(Item::Block(b));
+            }
+            for tool in [ToolKind::Pickaxe, ToolKind::Shovel, ToolKind::Axe] {
+                have.extend(drops(b, Some((tool, Tier::Diamond)), 0.0).map(|s| s.item));
+            }
+        }
+        loop {
+            let before = have.len();
+            let mut new: Vec<Item> = have.iter().filter_map(|i| i.smelted()).collect();
+            for r in recipes() {
+                let can = r
+                    .pattern
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .all(|ing| have.iter().any(|&i| ing.matches(i)));
+                if can {
+                    new.push(r.result.item);
+                }
+            }
+            for r in RECIPES {
+                let items = r.inputs.iter().all(|(i, _)| have.contains(i));
+                let fluids = r
+                    .fluids
+                    .iter()
+                    .all(|(f, _)| have.contains(&Item::Fluid(*f)));
+                if items && fluids {
+                    new.push(r.output);
+                    new.extend(r.extra.map(|(i, _)| i));
+                    new.extend(r.fluid_out.iter().map(|(f, _)| Item::Fluid(*f)));
+                }
+            }
+            if have.contains(&Item::UraniumFuelRod) || have.contains(&Item::MoxFuelRod) {
+                new.push(Item::SpentFuelRod);
+            }
+            for item in new {
+                if !have.contains(&item) {
+                    have.push(item);
+                }
+            }
+            if have.len() == before {
+                break;
+            }
+        }
+        for item in Item::all() {
+            assert!(have.contains(&item), "{} can't be made", item.name());
+        }
     }
 }

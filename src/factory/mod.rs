@@ -26,6 +26,7 @@
 //! (`changed`). Machines run everywhere, as furnaces do.
 
 mod draw;
+pub mod fluids;
 pub mod recipes;
 
 use std::time::{Duration, Instant};
@@ -34,6 +35,7 @@ use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 pub use draw::Art;
+use fluids::{EMPTY, Fluid, FluidNet, FluidStack, PIPE_HOLDS, Pipe, TANK_HOLDS, Tank};
 
 use crate::{
     render::models,
@@ -43,7 +45,7 @@ use crate::{
         items::{Item, ItemStack},
     },
     ui::screen::CHEST_SLOTS,
-    util::FastMap,
+    util::{FastMap, FastSet},
     world::{block::Block, chunk::BlockCell, planet::Planet},
 };
 
@@ -85,6 +87,101 @@ pub const MINE_REACH: i32 = 1;
 pub const HISTORY: usize = 60;
 /// The longest a cable may be (m).
 pub const CABLE_REACH: f64 = 24.0;
+
+// Steam, heat and the other power sources (gameplay numbers, kept in step with each other).
+/// Energy a litre of steam carries from what boiled it to a turbine (J).
+pub const STEAM_ENERGY: f32 = 100_000.0;
+/// What a steam turbine makes at most (W): 50 litres of steam a second. It gives back nine
+/// tenths of it as water.
+pub const TURBINE_POWER: f32 = 5_000_000.0;
+pub const CONDENSED: f32 = 0.9;
+/// Heat a boiler turns into steam (W), and how much more a fuel gives it than a generator (a
+/// boiler and turbine get more out of coal).
+pub const BOILER_HEAT: f32 = 1_200_000.0;
+pub const BOILER_GAIN: f32 = 1.5;
+/// Heat a geothermal well gives (W), and how deep under the sea it finds that anywhere (layers;
+/// else it needs lava or molten rock near it).
+pub const GEOTHERMAL_HEAT: f32 = 2_000_000.0;
+pub const GEOTHERMAL_DEPTH: i32 = 150;
+/// What a wind turbine makes at full wind (W), the wind that takes (m/s at the hub), the least
+/// that turns it, and the most it runs in (it stops in a storm).
+pub const WIND_POWER: f32 = 150_000.0;
+pub const WIND_RATED: f32 = 11.0;
+pub const WIND_CUT_IN: f32 = 2.5;
+pub const WIND_CUT_OUT: f32 = 28.0;
+/// The wind at a turbine's hub against the weather's near the ground, and the height (m over
+/// the sea) that doubles it again.
+pub const HUB_WIND: f32 = 1.6;
+pub const WIND_HEIGHT: f32 = 250.0;
+/// An RTG's power (W), day and night, for ever.
+pub const RTG_POWER: f32 = 10_000.0;
+/// Litres of water a pump brings up a second.
+pub const PUMP_RATE: f32 = 300.0;
+/// A reactor's heat at full power (W); its control rods move this share of full power a
+/// second; the share of its heat that goes on after it stops (decay heat) and how long that
+/// takes to die away (s); what it holds per degree (J/°C), where it runs (°C at full power,
+/// cooled), where it warns, and where it melts down.
+pub const REACTOR_HEAT: f32 = 25_000_000.0;
+pub const ROD_SPEED: f32 = 0.25;
+pub const DECAY_HEAT: f32 = 0.065;
+pub const DECAY_TIME: f32 = 40.0;
+pub const REACTOR_CAPACITY: f32 = 1_700_000.0;
+pub const AMBIENT: f32 = 25.0;
+pub const RUNNING: f32 = 320.0;
+pub const OVERHEATING: f32 = 800.0;
+pub const MELTDOWN: f32 = 1200.0;
+/// Heat in a fuel rod (J): 200 s at full power; a MOX rod lasts half as long again.
+pub const ROD_ENERGY: f32 = REACTOR_HEAT * 200.0;
+
+/// What a machine's input tanks hold at least (litres), and its output tanks.
+pub const INPUT_HOLDS: f32 = 500.0;
+pub const OUTPUT_HOLDS: f32 = 2_000.0;
+
+/// The cells a model block fills when its first cell is `core` (`Block::structure`): a square
+/// round it, that many up, the core first. None where it would go off the face or across a
+/// change in the grid (deep down), which it can't.
+pub fn footprint(planet: &Planet, core: BlockCell, block: Block) -> Option<Vec<BlockCell>> {
+    let (r, h) = block.structure();
+    let n = planet.res_at(core.k);
+    let mut cells = vec![core];
+    for dk in 0..h {
+        for dv in -r..=r {
+            for du in -r..=r {
+                if (du, dv, dk) == (0, 0, 0) {
+                    continue;
+                }
+                let (u, v, k) = (core.u + du, core.v + dv, core.k + dk);
+                if u < 0 || v < 0 || u >= n || v >= n {
+                    return None;
+                }
+                let cell = planet.cell(core.face, u, v, k)?;
+                if planet.res_at(k) != n {
+                    return None;
+                }
+                cells.push(cell);
+            }
+        }
+    }
+    Some(cells)
+}
+
+/// Heat in a fuel rod (J), or None if it isn't one.
+pub fn rod_energy(item: Item) -> Option<f32> {
+    match item {
+        Item::UraniumFuelRod => Some(ROD_ENERGY),
+        Item::MoxFuelRod => Some(ROD_ENERGY * 1.5),
+        _ => None,
+    }
+}
+
+/// What a wind turbine makes in a wind of `speed` (m/s at the hub).
+pub fn wind_power(speed: f32) -> f32 {
+    if !(WIND_CUT_IN..WIND_CUT_OUT).contains(&speed) {
+        return 0.0;
+    }
+    let t = ((speed - WIND_CUT_IN) / (WIND_RATED - WIND_CUT_IN)).min(1.0);
+    WIND_POWER * t * t * t.sqrt()
+}
 
 /// The way a conveyor facing 0..3 runs, in grid steps (u, v): the model's front.
 pub const AHEAD: [(i32, i32); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
@@ -261,6 +358,27 @@ fn sides(planet: &Planet, cell: BlockCell, facing: u8) -> [BlockCell; 2] {
     })
 }
 
+/// The cells next to `cell`: +u, -u, +v, -v, up, down (itself where there is none, or the grid
+/// changes there).
+fn around(planet: &Planet, cell: BlockCell) -> [BlockCell; 6] {
+    let n = planet.res_at(cell.k);
+    let at = |du: i32, dv: i32, dk: i32| {
+        let k = cell.k + dk;
+        match planet.cell(cell.face, cell.u + du, cell.v + dv, k) {
+            Some(c) if dk == 0 || planet.res_at(k) == n => c,
+            _ => cell,
+        }
+    };
+    [
+        at(1, 0, 0),
+        at(-1, 0, 0),
+        at(0, 1, 0),
+        at(0, -1, 0),
+        at(0, 0, 1),
+        at(0, 0, -1),
+    ]
+}
+
 /// The cell next to `cell` along a conveyor's facing (`sign` 1: in front, -1: behind).
 fn neighbour(planet: &Planet, cell: BlockCell, facing: u8, sign: i32) -> BlockCell {
     let (du, dv) = AHEAD[facing as usize % 4];
@@ -283,11 +401,41 @@ pub enum MachineKind {
     Solar,
     /// A big door's motor (in the bottom middle cell of the door).
     BigDoor,
+    Tank,
+    WaterPump,
+    Electrolyzer,
+    Centrifuge,
+    FuelFabricator,
+    Boiler,
+    Geothermal,
+    Wind,
+    Rtg,
+    Blender,
+    SteamTurbine,
+    Reactor,
+    CoolingPool,
+    Reprocessing,
+    Accelerator,
 }
 
 impl MachineKind {
     pub fn of(block: Block) -> Option<MachineKind> {
         Some(match block {
+            Block::StorageTank => MachineKind::Tank,
+            Block::WaterPump => MachineKind::WaterPump,
+            Block::Electrolyzer => MachineKind::Electrolyzer,
+            Block::Centrifuge => MachineKind::Centrifuge,
+            Block::FuelFabricator => MachineKind::FuelFabricator,
+            Block::Boiler => MachineKind::Boiler,
+            Block::GeothermalWell => MachineKind::Geothermal,
+            Block::WindTurbine => MachineKind::Wind,
+            Block::Rtg => MachineKind::Rtg,
+            Block::Blender => MachineKind::Blender,
+            Block::SteamTurbine => MachineKind::SteamTurbine,
+            Block::NuclearReactor => MachineKind::Reactor,
+            Block::CoolingPool => MachineKind::CoolingPool,
+            Block::ReprocessingPlant => MachineKind::Reprocessing,
+            Block::ParticleAccelerator => MachineKind::Accelerator,
             Block::SolarPanel => MachineKind::Solar,
             Block::BigDoor | Block::BigDoorOpen => MachineKind::BigDoor,
             Block::CoalGenerator => MachineKind::Generator,
@@ -317,14 +465,89 @@ impl MachineKind {
             MachineKind::Accumulator => "accumulator",
             MachineKind::Solar => "solar panel",
             MachineKind::BigDoor => "big door",
+            MachineKind::Tank => "storage tank",
+            MachineKind::WaterPump => "water pump",
+            MachineKind::Electrolyzer => "electrolyzer",
+            MachineKind::Centrifuge => "centrifuge",
+            MachineKind::FuelFabricator => "fuel fabricator",
+            MachineKind::Boiler => "boiler",
+            MachineKind::Geothermal => "geothermal well",
+            MachineKind::Wind => "wind turbine",
+            MachineKind::Rtg => "rtg",
+            MachineKind::Blender => "blender",
+            MachineKind::SteamTurbine => "steam turbine",
+            MachineKind::Reactor => "nuclear reactor",
+            MachineKind::CoolingPool => "cooling pool",
+            MachineKind::Reprocessing => "reprocessing plant",
+            MachineKind::Accelerator => "particle accelerator",
         }
+    }
+
+    /// Makes power (it doesn't use it): generators, panels, wind and steam turbines, RTGs.
+    pub fn makes_power(self) -> bool {
+        matches!(
+            self,
+            MachineKind::Generator
+                | MachineKind::Solar
+                | MachineKind::Wind
+                | MachineKind::Rtg
+                | MachineKind::SteamTurbine
+        )
+    }
+
+    /// Neither makes nor uses power (a tank, what boils water by its own heat).
+    pub fn unpowered(self) -> bool {
+        matches!(
+            self,
+            MachineKind::Tank | MachineKind::Boiler | MachineKind::Geothermal
+        )
+    }
+
+    /// Has tanks that pipes join (`Machine::tanks`).
+    pub fn has_tanks(self) -> bool {
+        matches!(
+            self,
+            MachineKind::Tank
+                | MachineKind::WaterPump
+                | MachineKind::Electrolyzer
+                | MachineKind::Centrifuge
+                | MachineKind::FuelFabricator
+                | MachineKind::Boiler
+                | MachineKind::Geothermal
+                | MachineKind::Blender
+                | MachineKind::SteamTurbine
+                | MachineKind::Reactor
+                | MachineKind::CoolingPool
+                | MachineKind::Reprocessing
+                | MachineKind::Accelerator
+                | MachineKind::Refinery
+                | MachineKind::ArcFurnace
+        )
     }
 
     /// What it uses while it works (W); 0 for what makes or stores power.
     pub fn power(self) -> f32 {
         match self {
-            MachineKind::Generator | MachineKind::Accumulator | MachineKind::Solar => 0.0,
+            MachineKind::Generator
+            | MachineKind::Accumulator
+            | MachineKind::Solar
+            | MachineKind::Wind
+            | MachineKind::Rtg
+            | MachineKind::SteamTurbine
+            | MachineKind::Tank
+            | MachineKind::Boiler
+            | MachineKind::Geothermal => 0.0,
             MachineKind::BigDoor => DOOR_POWER,
+            MachineKind::WaterPump => 30_000.0,
+            MachineKind::Electrolyzer => 300_000.0,
+            MachineKind::Centrifuge => 150_000.0,
+            MachineKind::FuelFabricator => 120_000.0,
+            MachineKind::Blender => 250_000.0,
+            // (Its pumps and controls: without them its rods drop in.)
+            MachineKind::Reactor => 150_000.0,
+            MachineKind::CoolingPool => 20_000.0,
+            MachineKind::Reprocessing => 400_000.0,
+            MachineKind::Accelerator => 2_500_000.0,
             MachineKind::ElectricFurnace => 90_000.0,
             MachineKind::Miner => 60_000.0,
             MachineKind::OilPump => 50_000.0,
@@ -343,18 +566,35 @@ impl MachineKind {
                 | MachineKind::ArcFurnace
                 | MachineKind::Assembler
                 | MachineKind::ChipFab
+                | MachineKind::Electrolyzer
+                | MachineKind::Centrifuge
+                | MachineKind::FuelFabricator
+                | MachineKind::Blender
+                | MachineKind::CoolingPool
+                | MachineKind::Reprocessing
+                | MachineKind::Accelerator
         )
     }
 
     /// Has an output slot (conveyors behind it take from there).
     pub fn has_output(self) -> bool {
-        !matches!(
-            self,
-            MachineKind::Generator
-                | MachineKind::Accumulator
-                | MachineKind::Solar
-                | MachineKind::BigDoor
-        )
+        self.has_recipes()
+            || matches!(
+                self,
+                MachineKind::ElectricFurnace
+                    | MachineKind::Miner
+                    | MachineKind::OilPump
+                    | MachineKind::Reactor
+            )
+    }
+
+    /// Takes fuel in its fuel slot: what burns (generator, boiler), fuel rods (reactor).
+    pub fn takes_fuel(self, item: Item) -> bool {
+        match self {
+            MachineKind::Generator | MachineKind::Boiler => item.fuel().is_some(),
+            MachineKind::Reactor => rod_energy(item).is_some(),
+            _ => false,
+        }
     }
 
     /// Where cables meet it (model units above the cell's floor).
@@ -365,7 +605,10 @@ impl MachineKind {
             MachineKind::Solar => 8.0,
             // (On the housing over the door.)
             MachineKind::BigDoor => 3.0 * 16.0 + 5.0,
-            _ => models::MACHINE_TOP,
+            MachineKind::Rtg => 13.0,
+            MachineKind::WaterPump | MachineKind::FuelFabricator => models::MACHINE_TOP,
+            MachineKind::Wind => 6.0,
+            _ => models::structure_top(self),
         }
     }
 }
@@ -404,10 +647,37 @@ pub struct Machine {
     /// A big door: its motor wants to run (the door is moving).
     #[serde(skip)]
     pub wanted: bool,
+    /// What it holds of fluids: two tanks for what it takes, two for what it makes (see
+    /// `fluids`; a storage tank has only the first).
+    #[serde(default)]
+    pub tanks: [Tank; 4],
+    /// A second product (a recipe's `extra`; a reactor's spent rods go to `output`).
+    #[serde(default)]
+    pub extra: Slot,
+    /// A reactor: how hot it is (°C), how far its rods are out (0..1, its power), and the heat
+    /// still coming from what it has burned (W).
+    #[serde(default)]
+    pub heat: f32,
+    #[serde(default)]
+    pub level: f32,
+    #[serde(default)]
+    pub decay: f32,
+    /// A wind turbine: the wind at its hub (m/s; the game sets it from the weather), and how
+    /// high it stands over the sea (m).
+    #[serde(skip)]
+    pub wind: f32,
+    #[serde(skip)]
+    pub altitude: f32,
 }
 
 impl Machine {
     fn new(cell: BlockCell, kind: MachineKind) -> Self {
+        // (A machine that makes only one thing is set to make it.)
+        let mut list = recipes::for_machine(kind);
+        let recipe = match (list.next(), list.next()) {
+            (Some(only), None) => Some(only.output),
+            _ => None,
+        };
         Self {
             cell,
             kind,
@@ -424,10 +694,17 @@ impl Machine {
             },
             power: 0.0,
             supply: 0.0,
-            recipe: None,
+            recipe,
             resource: None,
             up: None,
             wanted: false,
+            tanks: [None; 4],
+            extra: None,
+            heat: AMBIENT,
+            level: 0.0,
+            decay: 0.0,
+            wind: 0.0,
+            altitude: 0.0,
         }
     }
 
@@ -439,9 +716,93 @@ impl Machine {
             self.more[2],
             self.fuel,
             self.output,
+            self.extra,
         ]
         .into_iter()
         .flatten()
+    }
+
+    /// What input tank `i` (0 or 1) takes, and how much it holds; None if nothing.
+    pub fn fluid_input(&self, i: usize) -> Option<(Fluid, f32)> {
+        match self.kind {
+            MachineKind::Reactor if i == 0 => Some((Fluid::Water, 4.0 * INPUT_HOLDS)),
+            MachineKind::Boiler | MachineKind::Geothermal if i == 0 => {
+                Some((Fluid::Water, INPUT_HOLDS))
+            }
+            MachineKind::SteamTurbine if i == 0 => Some((Fluid::Steam, INPUT_HOLDS)),
+            k if k.has_recipes() => {
+                let &(fluid, n) = self.current_recipe()?.fluids.get(i)?;
+                Some((fluid, (4.0 * n as f32).max(INPUT_HOLDS)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Makes `fluid` (into an output tank), as it is set now.
+    pub fn makes(&self, fluid: Fluid) -> bool {
+        match self.kind {
+            MachineKind::WaterPump | MachineKind::SteamTurbine => fluid == Fluid::Water,
+            MachineKind::Boiler | MachineKind::Geothermal | MachineKind::Reactor => {
+                fluid == Fluid::Steam
+            }
+            k if k.has_recipes() => self
+                .current_recipe()
+                .is_some_and(|r| r.fluid_out.iter().any(|&(f, _)| f == fluid)),
+            _ => false,
+        }
+    }
+
+    /// Takes `fluid`, makes it, or holds some of it: a pipe line carrying it joins this machine.
+    /// (A storage tank: if it holds nothing else.)
+    pub fn uses(&self, fluid: Fluid) -> bool {
+        if self.kind == MachineKind::Tank {
+            return self.tanks[0].is_none_or(|s| s.fluid == fluid || s.amount <= EMPTY);
+        }
+        (0..2).any(|i| self.fluid_input(i).is_some_and(|(f, _)| f == fluid))
+            || self.makes(fluid)
+            || self.holds(fluid)
+    }
+
+    /// Has some of `fluid` in a tank.
+    fn holds(&self, fluid: Fluid) -> bool {
+        self.tanks
+            .iter()
+            .any(|t| t.is_some_and(|s| s.fluid == fluid && s.amount > EMPTY))
+    }
+
+    /// How much an output tank holds.
+    pub fn output_holds(&self) -> f32 {
+        match self.kind {
+            MachineKind::Tank => TANK_HOLDS,
+            MachineKind::Reactor => 2.0 * OUTPUT_HOLDS,
+            _ => OUTPUT_HOLDS,
+        }
+    }
+
+    /// Puts what a recipe or machine makes of `fluid` into an output tank (the one with it in,
+    /// or an empty one); returns how much went in.
+    fn put_fluid(&mut self, fluid: Fluid, amount: f32) -> f32 {
+        let room = self.output_holds();
+        let [_, _, a, b] = &mut self.tanks;
+        let i = if a.is_some_and(|s| s.fluid == fluid)
+            || (a.is_none() && !b.is_some_and(|s| s.fluid == fluid))
+        {
+            0
+        } else {
+            1
+        };
+        let tank = if i == 0 { a } else { b };
+        fluids::fill(tank, fluid, amount, room)
+    }
+
+    /// Room for `amount` more of `fluid` in its output tanks.
+    fn fluid_room(&self, fluid: Fluid, amount: f32) -> bool {
+        let room = self.output_holds();
+        self.tanks[2..].iter().any(|t| match t {
+            Some(s) if s.fluid == fluid => s.amount + amount <= room,
+            Some(s) => s.amount <= EMPTY && amount <= room,
+            None => amount <= room,
+        })
     }
 
     /// The ingredient slots, in recipe order.
@@ -460,12 +821,14 @@ impl Machine {
     }
 
     /// Making or using power right now (its lamp is lit, a furnace's window glows). An
-    /// accumulator: more than half full.
+    /// accumulator: more than half full. A reactor or boiler: making heat.
     pub fn lit(&self) -> bool {
-        if self.kind == MachineKind::Accumulator {
-            self.energy > self.energy_total * 0.5
-        } else {
-            self.power > 0.0
+        match self.kind {
+            MachineKind::Accumulator => self.energy > self.energy_total * 0.5,
+            MachineKind::Reactor => self.level > 0.02,
+            MachineKind::Boiler | MachineKind::Geothermal => self.progress > 0.0,
+            MachineKind::Tank => false,
+            _ => self.power > 0.0,
         }
     }
 
@@ -479,26 +842,69 @@ impl Machine {
         }
     }
 
-    /// What it would make next and how many, if it has everything for it and room for them.
-    fn product(&self) -> Option<(Item, u8)> {
-        let made = match self.kind {
-            MachineKind::ElectricFurnace => (self.input?.item.smelted()?, 1),
-            MachineKind::Miner | MachineKind::OilPump => (self.resource?, 1),
-            k if k.has_recipes() => {
-                let recipe = self.current_recipe()?;
-                let have = self.inputs();
-                let ready =
-                    recipe.inputs.iter().zip(have).all(|(&(item, n), slot)| {
-                        slot.is_some_and(|s| s.item == item && s.count >= n)
-                    });
-                if !ready {
-                    return None;
-                }
-                (recipe.output, recipe.count)
-            }
-            _ => return None,
+    /// Room in the second output for `count` more of `item`.
+    fn extra_room(&self, item: Item, count: u8) -> bool {
+        match self.extra {
+            None => true,
+            Some(s) => s.item == item && s.count as u32 + count as u32 <= item.max_stack() as u32,
+        }
+    }
+
+    /// Has all a recipe takes (items and fluids), whether or not there is room for what it makes.
+    fn has_ingredients(&self, recipe: &recipes::Recipe) -> bool {
+        let items = (recipe.inputs.iter().zip(self.inputs()))
+            .all(|(&(item, n), slot)| slot.is_some_and(|s| s.item == item && s.count >= n));
+        let fluids = (recipe.fluids.iter().zip(&self.tanks))
+            .all(|(&(fluid, n), tank)| fluids::level(tank, fluid) >= n as f32);
+        items && fluids
+    }
+
+    /// Room for all a recipe makes.
+    fn has_room(&self, recipe: &recipes::Recipe) -> bool {
+        let item = match recipe.output {
+            Item::Fluid(_) => true,
+            out => self.room_for(out, recipe.count),
         };
-        self.room_for(made.0, made.1).then_some(made)
+        let extra = recipe.extra.is_none_or(|(i, n)| self.extra_room(i, n));
+        // (Two fluids: each into its own tank.)
+        let fluids = match recipe.fluid_out {
+            [(a, n)] => self.fluid_room(*a, *n as f32),
+            [(a, n), (b, m)] => {
+                let room = self.output_holds();
+                let fits = |t: &Tank, f: Fluid, x: u16| match t {
+                    Some(s) if s.amount > EMPTY => s.fluid == f && s.amount + x as f32 <= room,
+                    _ => x as f32 <= room,
+                };
+                let [_, _, t, u] = &self.tanks;
+                (fits(t, *a, *n) && fits(u, *b, *m)) || (fits(t, *b, *m) && fits(u, *a, *n))
+            }
+            _ => true,
+        };
+        item && extra && fluids
+    }
+
+    /// Whether it has everything for what it makes next, and room for it.
+    fn can_make(&self) -> bool {
+        match self.kind {
+            MachineKind::ElectricFurnace => self
+                .input
+                .and_then(|s| s.item.smelted())
+                .is_some_and(|out| self.room_for(out, 1)),
+            MachineKind::Miner | MachineKind::OilPump => {
+                self.resource.is_some_and(|out| self.room_for(out, 1))
+            }
+            MachineKind::WaterPump => {
+                self.resource.is_some() && self.fluid_room(Fluid::Water, PUMP_RATE * 0.1)
+            }
+            MachineKind::Reactor => {
+                (self.energy > 0.0 || self.fuel.is_some_and(|f| rod_energy(f.item).is_some()))
+                    && self.room_for(Item::SpentFuelRod, 1)
+            }
+            k if k.has_recipes() => self
+                .current_recipe()
+                .is_some_and(|r| self.has_ingredients(r) && self.has_room(r)),
+            _ => false,
+        }
     }
 
     /// Seconds per item or batch.
@@ -516,7 +922,7 @@ impl Machine {
         if self.kind == MachineKind::BigDoor {
             return self.wanted;
         }
-        self.kind.power() > 0.0 && self.product().is_some()
+        self.kind.power() > 0.0 && self.can_make()
     }
 
     /// What a solar panel makes with the sun the way `sun` points (planet-relative, unit).
@@ -525,6 +931,98 @@ impl Machine {
             .up
             .map_or(DVec3::ZERO, |u| DVec3::from(u.map(f64::from)));
         SOLAR_POWER * (up.dot(sun) as f32).max(0.0)
+    }
+
+    /// What its screen shows of its tanks (and a reactor's heat): a line each, in the order
+    /// and number `gauge_count` says.
+    pub fn gauges(&self) -> Vec<Gauge> {
+        let tank = |i: usize, want: Option<Fluid>, holds: f32, into: bool| {
+            let held = self.tanks[i];
+            let fluid = held.map(|s| s.fluid).or(want);
+            let amount = held.map_or(0.0, |s| s.amount);
+            let name = fluid.map_or("empty", Fluid::name);
+            let way = if into { "in" } else { "out" };
+            Gauge {
+                text: format!("{way}: {name} {amount:.0} / {holds:.0} l"),
+                fill: amount / holds.max(1.0),
+                color: fluid.map_or([200, 200, 200], Fluid::color),
+            }
+        };
+        let input = |i: usize| {
+            let (f, holds) = self.fluid_input(i).unwrap_or((Fluid::Water, INPUT_HOLDS));
+            tank(i, Some(f), holds, true)
+        };
+        let output = |i: usize, f: Option<Fluid>| tank(i, f, self.output_holds(), false);
+        let mut out = Vec::new();
+        match self.kind {
+            MachineKind::Reactor => {
+                out.push(input(0));
+                out.push(output(2, Some(Fluid::Steam)));
+                out.push(Gauge {
+                    text: format!("core {:.0} °c (melts at {:.0})", self.heat, MELTDOWN),
+                    fill: self.heat / MELTDOWN,
+                    color: if self.heat >= OVERHEATING {
+                        [255, 80, 50]
+                    } else {
+                        [255, 190, 90]
+                    },
+                });
+            }
+            MachineKind::Boiler | MachineKind::Geothermal => {
+                out.push(input(0));
+                out.push(output(2, Some(Fluid::Steam)));
+            }
+            MachineKind::SteamTurbine => {
+                out.push(input(0));
+                out.push(output(2, Some(Fluid::Water)));
+            }
+            MachineKind::WaterPump => out.push(output(2, Some(Fluid::Water))),
+            MachineKind::Tank => {
+                let held = self.tanks[0];
+                let amount = held.map_or(0.0, |s| s.amount);
+                out.push(Gauge {
+                    text: match held {
+                        Some(s) => format!("{} {amount:.0} / {TANK_HOLDS:.0} l", s.fluid.name()),
+                        None => format!("empty, holds {TANK_HOLDS:.0} l"),
+                    },
+                    fill: amount / TANK_HOLDS,
+                    color: held.map_or([200, 200, 200], |s| s.fluid.color()),
+                });
+            }
+            k if k.has_recipes() => {
+                if let Some(r) = self.current_recipe() {
+                    for i in 0..r.fluids.len() {
+                        out.push(input(i));
+                    }
+                    for (j, &(f, _)) in r.fluid_out.iter().enumerate() {
+                        // (What it makes goes into whichever output tank has it.)
+                        let i = if self.tanks[3].is_some_and(|s| s.fluid == f) {
+                            3
+                        } else if self.tanks[2].is_some_and(|s| s.fluid == f) {
+                            2
+                        } else {
+                            2 + j
+                        };
+                        out.push(output(i, Some(f)));
+                    }
+                }
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// What a wind turbine, RTG or steam turbine makes this tick (W).
+    fn made_power(&self, dt: f32) -> f32 {
+        match self.kind {
+            MachineKind::Wind => wind_power(self.wind),
+            MachineKind::Rtg => RTG_POWER,
+            MachineKind::SteamTurbine => {
+                let steam = fluids::level(&self.tanks[0], Fluid::Steam);
+                TURBINE_POWER.min(steam * STEAM_ENERGY / dt)
+            }
+            _ => 0.0,
+        }
     }
 
     /// How far through the current item or batch (0..1).
@@ -557,12 +1055,26 @@ impl Machine {
         given
     }
 
-    /// Works for `dt` seconds' worth of full power: smelts, mines, pumps or makes.
+    /// Puts `count` of `item` into the output.
+    fn give(&mut self, item: Item, count: u8) {
+        match &mut self.output {
+            Some(out) => out.count += count,
+            None => self.output = Some(ItemStack::new(item, count)),
+        }
+    }
+
+    /// Works for `dt` seconds' worth of full power: smelts, mines, pumps or makes. (A reactor
+    /// works in `Factory::step_heat`.)
     fn work(&mut self, dt: f32) {
-        let Some((item, count)) = self.product() else {
+        if !self.can_make() || self.kind == MachineKind::Reactor {
             self.progress = 0.0;
             return;
-        };
+        }
+        if self.kind == MachineKind::WaterPump {
+            self.put_fluid(Fluid::Water, PUMP_RATE * dt);
+            self.progress = 1.0;
+            return;
+        }
         self.progress += dt;
         if self.progress < self.work_time() {
             return;
@@ -570,20 +1082,40 @@ impl Machine {
         self.progress = 0.0;
         match self.kind {
             MachineKind::ElectricFurnace => {
-                inventory::take(&mut self.input, 1);
+                if let Some(out) = self.input.and_then(|s| s.item.smelted()) {
+                    inventory::take(&mut self.input, 1);
+                    self.give(out, 1);
+                }
+            }
+            MachineKind::Miner | MachineKind::OilPump => {
+                if let Some(out) = self.resource {
+                    self.give(out, 1);
+                }
             }
             k if k.has_recipes() => {
-                if let Some(recipe) = self.current_recipe() {
-                    for (slot, &(_, n)) in self.inputs_mut().into_iter().zip(recipe.inputs) {
-                        inventory::take(slot, n);
+                let Some(recipe) = self.current_recipe() else {
+                    return;
+                };
+                for (slot, &(_, n)) in self.inputs_mut().into_iter().zip(recipe.inputs) {
+                    inventory::take(slot, n);
+                }
+                for (i, &(fluid, n)) in recipe.fluids.iter().enumerate() {
+                    fluids::drain(&mut self.tanks[i], fluid, n as f32);
+                }
+                if !matches!(recipe.output, Item::Fluid(_)) {
+                    self.give(recipe.output, recipe.count);
+                }
+                if let Some((item, n)) = recipe.extra {
+                    match &mut self.extra {
+                        Some(s) => s.count += n,
+                        None => self.extra = Some(ItemStack::new(item, n)),
                     }
+                }
+                for &(fluid, n) in recipe.fluid_out {
+                    self.put_fluid(fluid, n as f32);
                 }
             }
             _ => {}
-        }
-        match &mut self.output {
-            Some(out) => out.count += count,
-            None => self.output = Some(ItemStack::new(item, count)),
         }
     }
 
@@ -615,8 +1147,14 @@ impl Machine {
             slot.is_none_or(|s| s.item == item)
                 && slot.map_or(0, |s| s.count as usize) + coming < most as usize
         };
-        if self.kind == MachineKind::Generator {
-            return item.fuel().is_some() && fits(self.fuel, item.max_stack());
+        if self.kind.takes_fuel(item) {
+            // (A reactor a few rods at a time.)
+            let most = if self.kind == MachineKind::Reactor {
+                4
+            } else {
+                item.max_stack()
+            };
+            return fits(self.fuel, most);
         }
         self.slot_for(item)
             .is_some_and(|(i, most)| fits(self.inputs()[i], most))
@@ -627,7 +1165,7 @@ impl Machine {
         if !self.wants(stack.item) {
             return false;
         }
-        if self.kind == MachineKind::Generator {
+        if self.kind.takes_fuel(stack.item) {
             return put_one(&mut self.fuel, stack);
         }
         match self.slot_for(stack.item) {
@@ -654,12 +1192,25 @@ impl Machine {
                 out.extend(slot.take());
             }
         }
+        // (Fluids the new recipe doesn't take are let out.)
+        for i in 0..2 {
+            let want = self.fluid_input(i).map(|(f, _)| f);
+            if self.tanks[i].is_some_and(|s| Some(s.fluid) != want) {
+                self.tanks[i] = None;
+            }
+        }
         out
     }
 
     /// A few words on what it is doing (the HUD, its screen).
     pub fn status(&self) -> String {
-        let kw = |w: f32| format!("{:.0} kw", w / 1000.0);
+        let kw = |w: f32| {
+            if w >= 1.0e6 {
+                format!("{:.1} mw", w / 1.0e6)
+            } else {
+                format!("{:.0} kw", w / 1000.0)
+            }
+        };
         let percent = |x: f32| format!("{:.0}%", x * 100.0);
         match self.kind {
             MachineKind::Generator if self.power > 0.0 => format!("making {}", kw(self.power)),
@@ -681,10 +1232,62 @@ impl Machine {
             }
             MachineKind::Miner if self.resource.is_none() => "nothing to dig under it".to_string(),
             MachineKind::OilPump if self.resource.is_none() => "no oil shale under it".to_string(),
+            MachineKind::WaterPump if self.resource.is_none() => "no water next to it".to_string(),
+            MachineKind::Geothermal if self.resource.is_none() => {
+                "no heat down here: put it near lava, or deep".to_string()
+            }
+            MachineKind::Wind if self.power > 0.0 => {
+                format!("making {}, wind {:.0} m/s", kw(self.power), self.wind)
+            }
+            MachineKind::Wind if self.wind >= WIND_CUT_OUT => {
+                format!("stopped: wind {:.0} m/s is too strong", self.wind)
+            }
+            MachineKind::Wind => format!("no wind ({:.0} m/s)", self.wind),
+            MachineKind::Rtg => format!("making {}", kw(self.power)),
+            MachineKind::SteamTurbine if self.power > 0.0 => format!("making {}", kw(self.power)),
+            MachineKind::SteamTurbine => "no steam".to_string(),
+            MachineKind::Tank => match self.tanks[0] {
+                Some(s) => format!("{:.0} l of {}", s.amount, s.fluid.name()),
+                None => "empty".to_string(),
+            },
+            MachineKind::Boiler | MachineKind::Geothermal => {
+                let water = fluids::level(&self.tanks[0], Fluid::Water);
+                if self.progress > 0.0 {
+                    format!("boiling, {}", kw(self.progress))
+                } else if water <= EMPTY {
+                    "no water".to_string()
+                } else if self.kind == MachineKind::Boiler {
+                    "no fuel".to_string()
+                } else {
+                    "steam has nowhere to go".to_string()
+                }
+            }
+            MachineKind::Reactor => {
+                let water = fluids::level(&self.tanks[0], Fluid::Water);
+                let heat = format!("{:.0} °c", self.heat);
+                if self.heat >= OVERHEATING {
+                    if water <= EMPTY {
+                        format!("overheating! {heat}: no water")
+                    } else {
+                        format!("overheating! {heat}")
+                    }
+                } else if self.level > 0.02 {
+                    format!(
+                        "{} heat, {heat}",
+                        kw(self.level * REACTOR_HEAT + self.decay)
+                    )
+                } else if !self.can_make() {
+                    format!("no fuel rods, {heat}")
+                } else if self.supply <= 0.0 {
+                    format!("no power for its pumps, {heat}")
+                } else {
+                    format!("idle: steam has nowhere to go, {heat}")
+                }
+            }
             k if k.has_recipes() && self.recipe.is_none() => "pick what to make".to_string(),
             _ if !self.working() => {
                 let full = self.output.is_some_and(|s| s.count >= s.item.max_stack())
-                    || (self.output.is_some() && self.product().is_none() && self.has_inputs());
+                    || (self.has_inputs() && !self.can_make());
                 if full {
                     "output full".to_string()
                 } else if self.kind.has_recipes() || self.kind == MachineKind::ElectricFurnace {
@@ -701,11 +1304,7 @@ impl Machine {
     /// Has everything its recipe (or smelting) takes, whether or not there is room for it.
     fn has_inputs(&self) -> bool {
         match self.current_recipe() {
-            Some(r) => r
-                .inputs
-                .iter()
-                .zip(self.inputs())
-                .all(|(&(item, n), s)| s.is_some_and(|s| s.item == item && s.count >= n)),
+            Some(r) => self.has_ingredients(r),
             None => self.input.is_some(),
         }
     }
@@ -723,6 +1322,26 @@ impl Machine {
     }
 }
 
+/// A line on a machine's screen about one of its tanks: what it says, how full, its colour.
+pub struct Gauge {
+    pub text: String,
+    pub fill: f32,
+    pub color: [u8; 3],
+}
+
+/// How many gauges a machine's screen shows (`Machine::gauges`), set to make `recipe`.
+pub fn gauge_count(kind: MachineKind, recipe: Option<Item>) -> usize {
+    match kind {
+        MachineKind::Reactor => 3,
+        MachineKind::Boiler | MachineKind::Geothermal | MachineKind::SteamTurbine => 2,
+        MachineKind::WaterPump | MachineKind::Tank => 1,
+        k if k.has_recipes() => recipe
+            .and_then(|r| recipes::find(kind, r))
+            .map_or(0, |r| r.fluids.len() + r.fluid_out.len()),
+        _ => 0,
+    }
+}
+
 /// What a miner over `block` brings up (None: nothing it can dig).
 pub fn mined_from(block: Block) -> Option<Item> {
     use crate::survival::items::{Tier, ToolKind, drops};
@@ -737,15 +1356,24 @@ pub fn mined_from(block: Block) -> Option<Item> {
 /// How much a miner prefers an ore (higher first); 0 for ordinary ground.
 pub fn ore_rank(block: Block) -> u8 {
     match block {
-        Block::DiamondOre => 7,
-        Block::GoldOre => 6,
-        Block::UraniumOre => 5,
-        Block::CopperOre => 4,
-        Block::IronOre => 3,
+        Block::DiamondOre => 11,
+        Block::GoldOre => 10,
+        Block::UraniumOre => 9,
+        Block::FluoriteOre => 8,
+        Block::LeadOre => 7,
+        Block::CopperOre => 6,
+        Block::SulfurOre => 5,
+        Block::IronOre => 4,
+        Block::SaltpeterOre => 3,
         Block::BauxiteOre => 2,
         Block::CoalOre => 1,
         _ => 0,
     }
+}
+
+/// A storage tank that takes part in a network carrying `fluid` (empty, or holding it).
+fn machines_pooled(m: &Machine, fluid: Option<Fluid>) -> bool {
+    m.tanks[0].is_none_or(|s| Some(s.fluid) == fluid || s.amount <= EMPTY)
 }
 
 /// Puts one of `stack` into `slot` if it is empty or holds the same with room to spare.
@@ -797,8 +1425,10 @@ impl Want {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Node {
     Conveyor(u32),
+    /// (Every cell of a big machine.)
     Machine(u32),
     Pole(u32),
+    Pipe(u32),
 }
 
 /// Machines joined by cables, and how its power went in the last tick (W).
@@ -879,6 +1509,7 @@ pub struct SavedFactory {
     machines: Vec<Machine>,
     poles: Vec<BlockCell>,
     cables: Vec<(BlockCell, BlockCell)>,
+    pipes: Vec<Pipe>,
 }
 
 /// What came off a part of a factory that was taken away.
@@ -894,6 +1525,22 @@ pub struct Factory {
     machines: Vec<Machine>,
     poles: Vec<BlockCell>,
     cables: Vec<(BlockCell, BlockCell)>,
+    pipes: Vec<Pipe>,
+    /// The cells of big machines, each to the machine's own (its first) cell.
+    parts: FastMap<BlockCell, BlockCell>,
+    /// Every machine's cells are in `parts` (worked out once placed in space: `locate`).
+    parts_known: bool,
+    /// Pipes joined together, and the network of each pipe.
+    fluid_nets: Vec<FluidNet>,
+    pipe_net: Vec<u32>,
+    /// Pipes' joins, which of them are machines, and their line's fluid (`ModelState::links`,
+    /// `ports`, `fluid`), for their models, after every relink.
+    pub pipes_changed: Vec<(BlockCell, u8, u8, u8)>,
+    /// Each machine's recipe when the pipes were last joined up: a change rejoins them (a
+    /// pipe line joins only machines that use its fluid).
+    piped_recipes: Vec<Option<Item>>,
+    /// Reactors that melted down (their first cells), for the game to wreck.
+    pub meltdowns: Vec<BlockCell>,
     /// Where each part is in the arrays above.
     index: FastMap<BlockCell, Node>,
     indexed: bool,
@@ -935,6 +1582,7 @@ impl Factory {
             machines: self.machines.clone(),
             poles: self.poles.clone(),
             cables: self.cables.clone(),
+            pipes: self.pipes.clone(),
         }
     }
 
@@ -944,13 +1592,26 @@ impl Factory {
             machines: saved.machines,
             poles: saved.poles,
             cables: saved.cables,
+            pipes: saved.pipes,
             unlocated: true,
             ..Default::default()
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.conveyors.is_empty() && self.machines.is_empty() && self.poles.is_empty()
+        self.conveyors.is_empty()
+            && self.machines.is_empty()
+            && self.poles.is_empty()
+            && self.pipes.is_empty()
+    }
+
+    pub fn pipes(&self) -> &[Pipe] {
+        &self.pipes
+    }
+
+    /// The first cell of the machine `cell` is a cell of (a big machine's), else `cell`.
+    pub fn core(&self, cell: BlockCell) -> BlockCell {
+        self.parts.get(&cell).copied().unwrap_or(cell)
     }
 
     /// (conveyors, machines, poles, cables, networks)
@@ -1006,7 +1667,36 @@ impl Factory {
         for (i, p) in self.poles.iter().enumerate() {
             self.index.insert(*p, Node::Pole(i as u32));
         }
+        for (i, p) in self.pipes.iter().enumerate() {
+            self.index.insert(p.cell, Node::Pipe(i as u32));
+        }
+        for (&part, core) in &self.parts {
+            if let Some(&node @ Node::Machine(_)) = self.index.get(core) {
+                self.index.insert(part, node);
+            }
+        }
         self.indexed = true;
+    }
+
+    /// Notes the cells of a big machine (`footprint`).
+    fn add_parts(&mut self, planet: &Planet, cell: BlockCell, kind: MachineKind) {
+        let Some(block) = Block::ALL
+            .iter()
+            .copied()
+            .find(|b| MachineKind::of(*b) == Some(kind))
+        else {
+            return;
+        };
+        if !block.is_structure() {
+            return;
+        }
+        for part in footprint(planet, cell, block)
+            .unwrap_or_default()
+            .into_iter()
+            .skip(1)
+        {
+            self.parts.insert(part, cell);
+        }
     }
 
     /// Something next to the factory changed (a chest or furnace came or went).
@@ -1030,11 +1720,43 @@ impl Factory {
                 self.poles.push(cell);
                 Node::Pole(self.poles.len() as u32 - 1)
             }
+            Block::Pipe => {
+                // (Joining all it touches until told otherwise: `set_pipe_ways`.)
+                self.pipes.push(Pipe {
+                    cell,
+                    held: None,
+                    ways: None,
+                    axis: 0,
+                    around: Some(around(planet, cell)),
+                    links: 0,
+                });
+                Node::Pipe(self.pipes.len() as u32 - 1)
+            }
             _ => {
                 let Some(kind) = MachineKind::of(block) else {
                     return;
                 };
                 self.machines.push(Machine::new(cell, kind));
+                self.add_parts(planet, cell, kind);
+                self.indexed = false;
+                if kind.has_tanks() {
+                    // Pipe ends pointing into any of its cells join it.
+                    let cells: FastSet<BlockCell> = std::iter::once(cell)
+                        .chain(self.parts.iter().filter(|p| *p.1 == cell).map(|p| *p.0))
+                        .collect();
+                    for p in &mut self.pipes {
+                        let (Some(around), Some(mut ways)) = (p.around, p.ways) else {
+                            continue;
+                        };
+                        let open = p.open_ends();
+                        for (side, c) in around.iter().enumerate() {
+                            if open & (1 << side) != 0 && cells.contains(c) {
+                                ways |= 1 << side;
+                            }
+                        }
+                        p.ways = Some(ways);
+                    }
+                }
                 Node::Machine(self.machines.len() as u32 - 1)
             }
         };
@@ -1058,14 +1780,26 @@ impl Factory {
             Node::Machine(i) => {
                 let m = self.machines.swap_remove(i as usize);
                 contents.extend(m.contents());
-                if let Some(moved) = self.machines.get(i as usize) {
-                    self.index.insert(moved.cell, Node::Machine(i));
-                }
+                // (A big machine: all its cells go, and the index is worked out again.)
+                let core = m.cell;
+                self.parts.retain(|_, c| *c != core);
+                self.indexed = false;
+                let before = self.cables.len();
+                self.cables.retain(|&(a, b)| a != core && b != core);
+                self.linked = false;
+                let cables = (before - self.cables.len()) as u32;
+                return Some(Removed { contents, cables });
             }
             Node::Pole(i) => {
                 self.poles.swap_remove(i as usize);
                 if let Some(&moved) = self.poles.get(i as usize) {
                     self.index.insert(moved, Node::Pole(i));
+                }
+            }
+            Node::Pipe(i) => {
+                self.pipes.swap_remove(i as usize);
+                if let Some(moved) = self.pipes.get(i as usize) {
+                    self.index.insert(moved.cell, Node::Pipe(i));
                 }
             }
         }
@@ -1118,7 +1852,11 @@ impl Factory {
         if self.indexed {
             return self.index.get(&cell).copied();
         }
-        // (Before the index is built: a saved game just loaded.)
+        // (Before the index is built: a saved game just loaded, a machine just placed.)
+        let cell = self.core(cell);
+        if let Some(i) = self.pipes.iter().position(|p| p.cell == cell) {
+            return Some(Node::Pipe(i as u32));
+        }
         if let Some(i) = self.conveyors.iter().position(|c| c.cell == cell) {
             return Some(Node::Conveyor(i as u32));
         }
@@ -1135,17 +1873,25 @@ impl Factory {
 
     /// Whether cables can run to `cell` (a pole or a machine).
     pub fn is_electric(&self, cell: BlockCell) -> bool {
-        matches!(self.node(cell), Some(Node::Machine(_) | Node::Pole(_)))
+        match self.node(cell) {
+            Some(Node::Pole(_)) => true,
+            Some(Node::Machine(i)) => self
+                .machines
+                .get(i as usize)
+                .is_some_and(|m| !m.kind.unpowered()),
+            _ => false,
+        }
     }
 
     pub fn connected(&self, a: BlockCell, b: BlockCell) -> bool {
-        let pair = ordered(a, b);
+        let pair = ordered(self.core(a), self.core(b));
         self.cables.contains(&pair)
     }
 
     /// Runs a cable between two poles or machines; false if there already is one (or they
-    /// can't take one).
+    /// can't take one). (A big machine's goes to its first cell.)
     pub fn connect(&mut self, a: BlockCell, b: BlockCell) -> bool {
+        let (a, b) = (self.core(a), self.core(b));
         if a == b || self.connected(a, b) || !self.is_electric(a) || !self.is_electric(b) {
             return false;
         }
@@ -1155,7 +1901,7 @@ impl Factory {
     }
 
     pub fn disconnect(&mut self, a: BlockCell, b: BlockCell) -> bool {
-        let pair = ordered(a, b);
+        let pair = ordered(self.core(a), self.core(b));
         let before = self.cables.len();
         self.cables.retain(|c| *c != pair);
         self.linked = false;
@@ -1348,18 +2094,213 @@ impl Factory {
         }
         let keys: Vec<BlockCell> = self.networks.iter().filter_map(|n| n.key).collect();
         self.history.retain(|k, _| keys.contains(k));
+        self.relink_pipes();
         self.linked = true;
+    }
+
+    /// Pipe networks: pipes joined (`Pipe::ways`, either one's) that carry the same fluid or
+    /// both nothing yet; a line that carries nothing joins one carrying something (and then
+    /// carries it too) if all it is joined to carry the same. Then the machines with tanks they
+    /// join that use their fluid (any, for a line that carries nothing yet). Each pipe's joins
+    /// (for its model). Where networks with different fluids were joined (only an old save
+    /// could), the one most of it holds wins and the rest is lost.
+    fn relink_pipes(&mut self) {
+        let n = self.pipes.len();
+        let mut parent: Vec<usize> = (0..n).collect();
+        fn root(parent: &mut [usize], mut i: usize) -> usize {
+            while parent[i] != i {
+                parent[i] = parent[parent[i]];
+                i = parent[i];
+            }
+            i
+        }
+        self.piped_recipes = self.machines.iter().map(|m| m.recipe).collect();
+        // (Pipes from an old save, or put down whole: they join all they touch.)
+        for i in 0..n {
+            let Some(around) = self.pipes[i]
+                .around
+                .filter(|_| self.pipes[i].ways.is_none())
+            else {
+                continue;
+            };
+            let own = self.pipes[i].cell;
+            let mut ways = 0;
+            for (side, c) in around.iter().enumerate() {
+                let joins = match self.index.get(c) {
+                    Some(Node::Pipe(_)) => true,
+                    Some(Node::Machine(m)) => self.machines[*m as usize].kind.has_tanks(),
+                    _ => false,
+                };
+                if *c != own && joins {
+                    ways |= 1 << side;
+                }
+            }
+            self.pipes[i].ways = Some(ways);
+        }
+        // Which pipes are joined: (i, its side, j).
+        let mut joins: Vec<(usize, usize, usize)> = Vec::new();
+        for i in 0..n {
+            let Some(around) = self.pipes[i].around else {
+                continue;
+            };
+            let own = self.pipes[i].cell;
+            let ways = self.pipes[i].ways.unwrap_or(0);
+            for (side, c) in around.iter().enumerate() {
+                let Some(&Node::Pipe(j)) = self.index.get(c).filter(|_| *c != own) else {
+                    continue;
+                };
+                let j = j as usize;
+                let back = self.pipes[j]
+                    .around
+                    .and_then(|a| a.iter().position(|x| *x == own));
+                let theirs = back.is_some_and(|b| self.pipes[j].ways.unwrap_or(0) & (1 << b) != 0);
+                if ways & (1 << side) != 0 || theirs {
+                    joins.push((i, side, j));
+                }
+            }
+        }
+        for &(i, _, j) in &joins {
+            if self.pipes[i].carries() == self.pipes[j].carries() {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+        // Lines that carry nothing yet, joined to lines that do: with the one fluid there.
+        let mut found: FastMap<usize, Option<Fluid>> = FastMap::default();
+        for &(i, _, j) in &joins {
+            if self.pipes[i].carries().is_none()
+                && let Some(f) = self.pipes[j].carries()
+            {
+                let r = root(&mut parent, i);
+                let seen = found.entry(r).or_insert(Some(f));
+                if *seen != Some(f) {
+                    *seen = None;
+                }
+            }
+        }
+        for i in 0..n {
+            let r = root(&mut parent, i);
+            if let Some(Some(f)) = found.get(&r) {
+                self.pipes[i].held = Some(FluidStack {
+                    fluid: *f,
+                    amount: 0.0,
+                });
+            }
+        }
+        for &(i, _, j) in &joins {
+            if self.pipes[i].carries() == self.pipes[j].carries() {
+                let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                parent[a] = b;
+            }
+        }
+        let mut links = vec![0u8; n];
+        for &(i, side, j) in &joins {
+            if root(&mut parent, i) == root(&mut parent, j) {
+                links[i] |= 1 << side;
+            }
+        }
+        // The machines they join.
+        let mut touching: Vec<(usize, u32)> = Vec::new();
+        for (i, mut links) in links.into_iter().enumerate() {
+            let pipe = &self.pipes[i];
+            let Some(around) = pipe.around else {
+                continue;
+            };
+            let mut ports = 0u8;
+            let (own, carries) = (pipe.cell, pipe.carries());
+            let ways = pipe.ways.unwrap_or(0);
+            for (side, c) in around.iter().enumerate() {
+                if *c == own || ways & (1 << side) == 0 {
+                    continue;
+                }
+                if let Some(&Node::Machine(m)) = self.index.get(c) {
+                    let machine = &self.machines[m as usize];
+                    if machine.kind.has_tanks() && carries.is_none_or(|f| machine.uses(f)) {
+                        links |= 1 << side;
+                        ports |= 1 << side;
+                        touching.push((i, m));
+                    }
+                }
+            }
+            self.pipes[i].links = links;
+            let fluid = carries.map_or(0, |f| f as u8 + 1);
+            self.pipes_changed.push((own, links, ports, fluid));
+        }
+        self.fluid_nets.clear();
+        let mut net_of: FastMap<usize, u32> = FastMap::default();
+        self.pipe_net = (0..n)
+            .map(|i| {
+                let r = root(&mut parent, i);
+                *net_of.entry(r).or_insert_with(|| {
+                    self.fluid_nets.push(FluidNet::default());
+                    self.fluid_nets.len() as u32 - 1
+                })
+            })
+            .collect();
+        for (i, &net) in self.pipe_net.iter().enumerate() {
+            self.fluid_nets[net as usize].pipes.push(i as u32);
+        }
+        for (pipe, m) in touching {
+            let net = &mut self.fluid_nets[self.pipe_net[pipe] as usize];
+            if !net.machines.contains(&m) {
+                net.machines.push(m);
+            }
+        }
+        // One fluid to a network.
+        for net in &self.fluid_nets {
+            let mut most: Option<(Fluid, f32)> = None;
+            let mut totals: Vec<(Fluid, f32)> = Vec::new();
+            for &p in &net.pipes {
+                if let Some(s) = self.pipes[p as usize].held {
+                    match totals.iter_mut().find(|(f, _)| *f == s.fluid) {
+                        Some((_, a)) => *a += s.amount,
+                        None => totals.push((s.fluid, s.amount)),
+                    }
+                }
+            }
+            for &(f, a) in &totals {
+                if most.is_none_or(|(_, m)| a > m) {
+                    most = Some((f, a));
+                }
+            }
+            for &p in &net.pipes {
+                let pipe = &mut self.pipes[p as usize];
+                if pipe
+                    .held
+                    .is_some_and(|s| Some(s.fluid) != most.map(|m| m.0))
+                {
+                    pipe.held = None;
+                }
+            }
+        }
     }
 
     /// Places conveyors in space (for drawing and the network), those that aren't yet, and
     /// finds which way is up at solar panels.
     pub fn locate(&mut self, planet: &Planet) {
         for m in &mut self.machines {
-            if m.kind == MachineKind::Solar && m.up.is_none() {
+            if matches!(m.kind, MachineKind::Solar | MachineKind::Wind) && m.up.is_none() {
                 let up = models::cell_point(planet, m.cell, [8.0, 8.0, 16.0])
                     - models::cell_point(planet, m.cell, [8.0, 8.0, 0.0]);
                 m.up = Some(up.normalize_or(DVec3::Y).as_vec3().to_array());
+                m.altitude = (m.cell.k - planet.sea_layer) as f32;
             }
+        }
+        if !self.parts_known {
+            // (A saved game: where its big machines' cells are.)
+            let machines: Vec<(BlockCell, MachineKind)> =
+                self.machines.iter().map(|m| (m.cell, m.kind)).collect();
+            for (cell, kind) in machines {
+                self.add_parts(planet, cell, kind);
+            }
+            for p in &mut self.pipes {
+                if p.around.is_none() {
+                    p.around = Some(around(planet, p.cell));
+                }
+            }
+            self.parts_known = true;
+            self.indexed = false;
+            self.linked = false;
         }
         if !self.unlocated {
             return;
@@ -1416,8 +2357,278 @@ impl Factory {
     }
 
     fn tick(&mut self, dt: f32, stores: &mut Stores) {
+        self.step_fluids();
         self.step_power(dt);
+        self.step_heat(dt);
         self.step_conveyors(dt, stores);
+    }
+
+    /// Each pipe network: what is in its pipes and storage tanks is one pool. The machines on it
+    /// that want its fluid take theirs (shared alike when there isn't enough), then what
+    /// machines have made of it (or anything, into an empty network) goes in, as far as there is
+    /// room, and the pool is spread back over the pipes and tanks.
+    fn step_fluids(&mut self) {
+        // (Pipes join only what uses their fluid: a recipe changed, they join up again.)
+        if !self.pipes.is_empty()
+            && self
+                .machines
+                .iter()
+                .map(|m| m.recipe)
+                .ne(self.piped_recipes.iter().copied())
+        {
+            self.linked = false;
+        }
+        let mut rejoin = false;
+        for net in &self.fluid_nets {
+            let pipes = &mut self.pipes;
+            let machines = &mut self.machines;
+            // The pool: its fluid, how much, and how much room.
+            let mut fluid: Option<Fluid> = None;
+            let mut amount = 0.0;
+            for &p in &net.pipes {
+                if let Some(s) = pipes[p as usize].held {
+                    fluid = Some(s.fluid);
+                    amount += s.amount;
+                }
+            }
+            let carried = fluid;
+            let tanks: Vec<u32> = net
+                .machines
+                .iter()
+                .copied()
+                .filter(|&m| machines[m as usize].kind == MachineKind::Tank)
+                .collect();
+            for &t in &tanks {
+                if let Some(s) = machines[t as usize].tanks[0]
+                    && fluid.is_none()
+                    && s.amount > EMPTY
+                {
+                    fluid = Some(s.fluid);
+                }
+            }
+            let mut capacity = net.pipes.len() as f32 * PIPE_HOLDS;
+            for &t in &tanks {
+                let m = &machines[t as usize];
+                if machines_pooled(m, fluid) {
+                    capacity += TANK_HOLDS;
+                    amount += m.tanks[0].map_or(0.0, |s| s.amount);
+                }
+            }
+
+            // Out to what wants it.
+            if let Some(f) = fluid {
+                let wants = |m: &Machine| -> Option<(usize, f32)> {
+                    (0..2).find_map(|i| {
+                        let (want, holds) = m.fluid_input(i)?;
+                        (want == f).then(|| (i, (holds - fluids::level(&m.tanks[i], f)).max(0.0)))
+                    })
+                };
+                let demand: f32 = net
+                    .machines
+                    .iter()
+                    .filter_map(|&m| wants(&machines[m as usize]))
+                    .map(|(_, room)| room)
+                    .sum();
+                if demand > 0.0 && amount > 0.0 {
+                    let share = (amount / demand).min(1.0);
+                    for &m in &net.machines {
+                        let machine = &mut machines[m as usize];
+                        if let Some((i, room)) = wants(machine) {
+                            let put =
+                                fluids::fill(&mut machine.tanks[i], f, room * share, f32::MAX);
+                            amount -= put;
+                        }
+                    }
+                }
+            }
+
+            // In from what made it.
+            for &m in &net.machines {
+                if machines[m as usize].kind == MachineKind::Tank {
+                    continue;
+                }
+                for i in 2..4 {
+                    let Some(s) = machines[m as usize].tanks[i] else {
+                        continue;
+                    };
+                    if fluid.is_some_and(|f| f != s.fluid) {
+                        continue;
+                    }
+                    // (Into an empty line only what something on it takes, or a tank keeps:
+                    // an electrolyzer's oxygen goes down the line to what wants oxygen.)
+                    let wanted = !tanks.is_empty()
+                        || net.machines.iter().any(|&o| {
+                            (0..2).any(|t| {
+                                machines[o as usize].fluid_input(t).map(|x| x.0) == Some(s.fluid)
+                            })
+                        });
+                    if fluid.is_none() && !wanted {
+                        continue;
+                    }
+                    if fluid.is_none() {
+                        fluid = Some(s.fluid);
+                        // (Tanks holding something else stay out of it.)
+                        capacity = net.pipes.len() as f32 * PIPE_HOLDS;
+                        for &t in &tanks {
+                            if machines_pooled(&machines[t as usize], fluid) {
+                                capacity += TANK_HOLDS;
+                            }
+                        }
+                    }
+                    let machine = &mut machines[m as usize];
+                    let put = s.amount.min(capacity - amount).max(0.0);
+                    fluids::drain(&mut machine.tanks[i], s.fluid, put);
+                    amount += put;
+                }
+            }
+
+            // Spread back over the pool. (An empty line keeps to what it carried while
+            // something on it takes or makes that; else it is free for anything again.)
+            let Some(f) = fluid.filter(|_| amount > EMPTY) else {
+                let keep = fluid.filter(|&f| {
+                    net.machines.iter().any(|&m| {
+                        let m = &machines[m as usize];
+                        if m.kind == MachineKind::Tank {
+                            m.holds(f)
+                        } else {
+                            m.uses(f)
+                        }
+                    })
+                });
+                rejoin |= keep != carried;
+                for &p in &net.pipes {
+                    pipes[p as usize].held = keep.map(|fluid| FluidStack { fluid, amount: 0.0 });
+                }
+                for &t in &tanks {
+                    let m = &mut machines[t as usize];
+                    if m.tanks[0].is_some_and(|s| s.amount <= EMPTY) {
+                        m.tanks[0] = None;
+                    }
+                }
+                continue;
+            };
+            // (A line that carried nothing now carries this: it joins only what uses it.)
+            rejoin |= carried.is_none();
+            let full = (amount / capacity.max(1.0)).clamp(0.0, 1.0);
+            for &p in &net.pipes {
+                pipes[p as usize].held = Some(FluidStack {
+                    fluid: f,
+                    amount: PIPE_HOLDS * full,
+                });
+            }
+            for &t in &tanks {
+                let m = &mut machines[t as usize];
+                if machines_pooled(m, Some(f)) {
+                    m.tanks[0] = Some(FluidStack {
+                        fluid: f,
+                        amount: TANK_HOLDS * full,
+                    });
+                }
+            }
+        }
+        if rejoin {
+            self.linked = false;
+        }
+    }
+
+    /// Heat into steam: boilers burn their fuel, geothermal wells take the heat under them, and
+    /// reactors burn their rods (moving their rods towards full power while they have power,
+    /// fuel and room for steam). What heat the water can't carry off heats a reactor up: dry, it
+    /// melts down.
+    fn step_heat(&mut self, dt: f32) {
+        let authority = self.authority;
+        for m in &mut self.machines {
+            match m.kind {
+                MachineKind::Boiler | MachineKind::Geothermal => {
+                    let water = fluids::level(&m.tanks[0], Fluid::Water);
+                    let steam_room = m.fluid_room(Fluid::Steam, 1.0);
+                    let heat = if m.kind == MachineKind::Boiler {
+                        BOILER_HEAT
+                    } else if m.resource.is_some() {
+                        GEOTHERMAL_HEAT
+                    } else {
+                        0.0
+                    };
+                    // As much as the water allows.
+                    let wanted = (heat * dt / STEAM_ENERGY).min(water);
+                    let mut litres = if steam_room { wanted } else { 0.0 };
+                    if m.kind == MachineKind::Boiler && litres > 0.0 {
+                        // Fuel for it, a generator's worth and half again.
+                        let need = litres * STEAM_ENERGY / BOILER_GAIN;
+                        let got = m.burn(need);
+                        litres *= got / need;
+                    }
+                    let was = m.lit();
+                    fluids::drain(&mut m.tanks[0], Fluid::Water, litres);
+                    m.put_fluid(Fluid::Steam, litres);
+                    m.progress = litres * STEAM_ENERGY / dt;
+                    if m.lit() != was {
+                        self.lit_changed.push((m.cell, m.lit()));
+                    }
+                }
+                MachineKind::Reactor => {
+                    let was = m.lit();
+                    let fuelled = m.can_make();
+                    let powered = m.supply > 0.5 || self.infinite;
+                    let steam = fluids::level(&m.tanks[2], Fluid::Steam)
+                        .max(fluids::level(&m.tanks[3], Fluid::Steam));
+                    let room = steam < 0.9 * m.output_holds();
+                    let target = if fuelled && powered && room { 1.0 } else { 0.0 };
+                    m.level += (target - m.level).clamp(-ROD_SPEED * dt, ROD_SPEED * dt);
+                    // Fission, from the rod in it (the next one goes in when it is spent).
+                    let mut fission = m.level * REACTOR_HEAT;
+                    let mut need = fission * dt;
+                    while need > 0.0 {
+                        if m.energy <= 0.0 {
+                            if m.energy_total > 0.0 {
+                                m.give(Item::SpentFuelRod, 1);
+                                m.energy_total = 0.0;
+                            }
+                            let Some(e) = m.fuel.and_then(|f| rod_energy(f.item)) else {
+                                break;
+                            };
+                            if !m.room_for(Item::SpentFuelRod, 1) {
+                                break;
+                            }
+                            inventory::take(&mut m.fuel, 1);
+                            m.energy = e;
+                            m.energy_total = e;
+                        }
+                        let e = need.min(m.energy);
+                        m.energy -= e;
+                        need -= e;
+                    }
+                    if need > 0.0 {
+                        fission -= need / dt;
+                        m.level = (fission / REACTOR_HEAT).max(0.0);
+                    }
+                    m.decay += (DECAY_HEAT * fission - m.decay) * (dt / DECAY_TIME).min(1.0);
+                    let heat = fission + m.decay;
+                    // Water carries it off as steam (what has no room is let off).
+                    let wanted = heat * dt / STEAM_ENERGY;
+                    let took = fluids::drain(&mut m.tanks[0], Fluid::Water, wanted);
+                    m.put_fluid(Fluid::Steam, took);
+                    let cooled = if wanted > 0.0 { took / wanted } else { 1.0 };
+                    let excess = heat * (1.0 - cooled);
+                    if excess > 1.0 {
+                        m.heat += excess * dt / REACTOR_CAPACITY;
+                    } else {
+                        let settle = AMBIENT + (RUNNING - AMBIENT) * (heat / REACTOR_HEAT);
+                        m.heat += (settle - m.heat) * (dt / 8.0).min(1.0);
+                    }
+                    if m.heat >= MELTDOWN {
+                        m.heat = MELTDOWN;
+                        if authority && !self.meltdowns.contains(&m.cell) {
+                            self.meltdowns.push(m.cell);
+                        }
+                    }
+                    if m.lit() != was {
+                        self.lit_changed.push((m.cell, m.lit()));
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Each network: its generators make power whenever they have fuel, used or not. Machines
@@ -1463,6 +2674,14 @@ impl Factory {
                             capacity += made;
                         }
                     }
+                    k if k.makes_power() => {
+                        gens += 1;
+                        let made = m.made_power(dt);
+                        if made > 0.0 {
+                            fuelled += 1;
+                            capacity += made;
+                        }
+                    }
                     MachineKind::Accumulator => {
                         accumulators += 1;
                         stored += m.energy;
@@ -1470,6 +2689,7 @@ impl Factory {
                         can_take += ACCUMULATOR_POWER.min((m.energy_total - m.energy) / dt);
                         can_give += ACCUMULATOR_POWER.min(m.energy / dt);
                     }
+                    k if k.unpowered() => {}
                     kind => {
                         users += 1;
                         if m.working() {
@@ -1512,6 +2732,22 @@ impl Factory {
                             0.0
                         };
                     }
+                    k if k.makes_power() => {
+                        m.power = m.made_power(dt);
+                        if k == MachineKind::SteamTurbine {
+                            // The steam it used, and its water back (let off if there is
+                            // nowhere for it).
+                            let used = m.power * dt / STEAM_ENERGY;
+                            fluids::drain(&mut m.tanks[0], Fluid::Steam, used);
+                            m.put_fluid(Fluid::Water, used * CONDENSED);
+                        }
+                        m.supply = if capacity > 0.0 {
+                            (used + charge) / capacity
+                        } else {
+                            0.0
+                        };
+                    }
+                    k if k.unpowered() => {}
                     MachineKind::Accumulator => {
                         // Shared out by how much each could take or give.
                         let room = ACCUMULATOR_POWER.min((m.energy_total - m.energy) / dt);
@@ -1730,6 +2966,42 @@ impl Factory {
                 (n > 0).then(|| format!("carrying {n}"))
             }
             Node::Machine(i) => Some(self.machines[i as usize].status()),
+            Node::Pipe(i) => {
+                let net = self
+                    .pipe_net
+                    .get(i as usize)
+                    .and_then(|&n| self.fluid_nets.get(n as usize));
+                let held = self.pipes[i as usize].held;
+                let (pipes, machines) = net.map_or((1, 0), |n| (n.pipes.len(), n.machines.len()));
+                let on = match machines {
+                    0 => "nothing on it".to_string(),
+                    1 => "1 machine".to_string(),
+                    n => format!("{n} machines"),
+                };
+                // (What its storage tanks hold is the line's too: one pool.)
+                let mut litres = held.map_or(0.0, |s| s.amount) * pipes as f32;
+                let mut capacity = PIPE_HOLDS * pipes as f32;
+                for &m in net.map_or(&[][..], |n| &n.machines[..]) {
+                    let m = &self.machines[m as usize];
+                    if m.kind == MachineKind::Tank
+                        && let Some(s) =
+                            m.tanks[0].filter(|s| Some(s.fluid) == held.map(|h| h.fluid))
+                    {
+                        litres += s.amount;
+                        capacity += TANK_HOLDS;
+                    }
+                }
+                Some(match held {
+                    Some(s) if litres > 0.5 => format!(
+                        "{}: {:.0} of {:.0} l, {on}",
+                        s.fluid.name(),
+                        litres,
+                        capacity
+                    ),
+                    Some(s) => format!("{} line, empty, {on}", s.fluid.name()),
+                    None => format!("empty: takes what is sent in, {on}"),
+                })
+            }
             Node::Pole(i) => {
                 let net = network(self.pole_network.get(i as usize))?;
                 let wired = self.cables.iter().any(|&(a, b)| a == cell || b == cell);
@@ -1749,7 +3021,7 @@ impl Factory {
         let net = match self.node(cell)? {
             Node::Machine(i) => self.machine_network.get(i as usize),
             Node::Pole(i) => self.pole_network.get(i as usize),
-            Node::Conveyor(_) => None,
+            Node::Conveyor(_) | Node::Pipe(_) => None,
         }?;
         let network = self.networks.get(*net as usize)?.clone();
         let history = (network.key)
@@ -1764,6 +3036,162 @@ impl Factory {
         if let Some(m) = self.machine_mut(cell) {
             m.resource = resource;
         }
+    }
+
+    /// Sets the wind at every wind turbine: `wind(up, altitude)` is the wind (m/s) at the hub
+    /// of one standing at `up` (unit, planet-relative) that high over the sea.
+    pub fn set_wind(&mut self, wind: impl Fn(DVec3, f32) -> f32) {
+        for m in &mut self.machines {
+            if m.kind == MachineKind::Wind
+                && let Some(up) = m.up
+            {
+                m.wind = wind(DVec3::from(up.map(f64::from)), m.altitude);
+            }
+        }
+    }
+
+    /// Fills what `cell` is (a storage tank, a machine's first input tank that takes it, or a
+    /// pipe's network) with `amount` of `fluid` (the console, tests). How much went in.
+    pub fn fill_fluid(&mut self, cell: BlockCell, fluid: Fluid, amount: f32) -> f32 {
+        self.ensure_index();
+        match self.index.get(&cell).copied() {
+            Some(Node::Machine(i)) => {
+                let m = &mut self.machines[i as usize];
+                if m.kind == MachineKind::Tank {
+                    return fluids::fill(&mut m.tanks[0], fluid, amount, TANK_HOLDS);
+                }
+                for t in 0..2 {
+                    if let Some((want, holds)) = m.fluid_input(t)
+                        && want == fluid
+                    {
+                        return fluids::fill(&mut m.tanks[t], fluid, amount, holds);
+                    }
+                }
+                0.0
+            }
+            Some(Node::Pipe(i)) => {
+                let p = &mut self.pipes[i as usize];
+                let carried = p.carries();
+                let put = fluids::fill(&mut p.held, fluid, amount, PIPE_HOLDS);
+                if p.carries() != carried {
+                    self.linked = false;
+                }
+                put
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// The ways a pipe put in `cell` joins (bits as `Pipe::ways`): what it was put against (a
+    /// pipe, or a machine with tanks), what is in front of its open ends (straight on from that,
+    /// or along `axis` both ways), and pipes whose open ends or sockets point at it. So a line
+    /// goes where it is built: one beside another doesn't join it.
+    pub fn pipe_ways(
+        &mut self,
+        planet: &Planet,
+        cell: BlockCell,
+        support: BlockCell,
+        axis: u8,
+    ) -> u8 {
+        self.ensure_index();
+        let next = around(planet, cell);
+        let joinable = |c: BlockCell| match self.index.get(&c) {
+            Some(Node::Pipe(_)) => true,
+            Some(Node::Machine(m)) => self.machines[*m as usize].kind.has_tanks(),
+            _ => false,
+        };
+        let mut ways = 0u8;
+        for (side, &c) in next.iter().enumerate() {
+            if c != cell && c == support && joinable(c) {
+                ways |= 1 << side;
+            }
+        }
+        let open = Pipe {
+            cell,
+            held: None,
+            ways: Some(ways),
+            axis,
+            around: None,
+            links: 0,
+        }
+        .open_ends();
+        for (side, &c) in next.iter().enumerate() {
+            if c == cell {
+                continue;
+            }
+            if open & (1 << side) != 0 && joinable(c) {
+                ways |= 1 << side;
+            }
+            if let Some(Node::Pipe(j)) = self.index.get(&c) {
+                let p = &self.pipes[*j as usize];
+                let back = p.around.and_then(|a| a.iter().position(|&x| x == cell));
+                if let Some(back) = back
+                    && (p.ways.is_some_and(|w| w & (1 << back) != 0)
+                        || p.open_ends() & (1 << back) != 0)
+                {
+                    ways |= 1 << side;
+                }
+            }
+        }
+        ways
+    }
+
+    /// The pipe in `cell` joins `ways` (None: all it touches, worked out when the pipes are
+    /// next joined up) and runs along `axis` while it joins nothing. The pipes it joins join it
+    /// back.
+    pub fn set_pipe_ways(&mut self, cell: BlockCell, ways: Option<u8>, axis: u8) {
+        self.ensure_index();
+        let Some(&Node::Pipe(i)) = self.index.get(&cell) else {
+            return;
+        };
+        let pipe = &mut self.pipes[i as usize];
+        pipe.ways = ways;
+        pipe.axis = axis.min(2);
+        self.linked = false;
+        let (Some(ways), Some(next)) = (ways, pipe.around) else {
+            return;
+        };
+        for (side, &c) in next.iter().enumerate() {
+            if ways & (1 << side) == 0 || c == cell {
+                continue;
+            }
+            if let Some(&Node::Pipe(j)) = self.index.get(&c) {
+                let p = &mut self.pipes[j as usize];
+                let back = p.around.and_then(|a| a.iter().position(|&x| x == cell));
+                if let (Some(back), Some(w)) = (back, p.ways) {
+                    p.ways = Some(w | 1 << back);
+                }
+            }
+        }
+    }
+
+    /// Empties every tank and pipe (the console's `factory drain`, to try what running dry does).
+    pub fn drain_all(&mut self) {
+        for m in &mut self.machines {
+            m.tanks = [None; 4];
+        }
+        for p in &mut self.pipes {
+            p.held = None;
+        }
+        self.linked = false;
+    }
+
+    /// Pipe networks: (pipes, fluid, litres) each.
+    pub fn fluid_networks(&self) -> Vec<(usize, Option<Fluid>, f32)> {
+        self.fluid_nets
+            .iter()
+            .map(|net| {
+                let mut fluid = None;
+                let mut amount = 0.0;
+                for &p in &net.pipes {
+                    if let Some(s) = self.pipes[p as usize].held {
+                        fluid = Some(s.fluid);
+                        amount += s.amount;
+                    }
+                }
+                (net.pipes.len(), fluid, amount)
+            })
+            .collect()
     }
 
     // ---- Other players ---------------------------------------------------------------------

@@ -340,9 +340,10 @@ fn an_assembler_makes_its_recipe_from_what_a_line_brings() {
 fn a_miner_brings_up_what_is_under_it_on_power() {
     let p = planet();
     let mut w = World::new();
-    let (miner, to) = (at(&p, 0, 0), at(&p, 2, 0));
+    // (Three blocks square: the belt starts by its back, from the cell at u = 1.)
+    let (miner, to) = (at(&p, 0, 0), at(&p, 3, 0));
     w.factory.add(&p, miner, Block::Miner, 3); // its back towards +u
-    w.factory.add(&p, at(&p, 1, 0), Block::Conveyor, EAST);
+    w.factory.add(&p, at(&p, 2, 0), Block::Conveyor, EAST);
     w.chests.insert(to, [None; CHEST_SLOTS]);
     w.run(5.0);
     assert!(
@@ -403,31 +404,69 @@ fn a_conveyor_fed_from_one_side_bends_round() {
 fn every_ingredient_can_be_made() {
     use crate::world::block::Block::*;
     // What comes out of the ground, furnaces and pumps.
+    // What comes out of the ground (by hand or a miner), furnaces and pumps.
     let mut made: Vec<Item> = [
-        Sand, Stone, IronOre, CopperOre, GoldOre, DiamondOre, CoalOre,
+        Sand,
+        Stone,
+        IronOre,
+        CopperOre,
+        GoldOre,
+        DiamondOre,
+        CoalOre,
+        LeadOre,
+        FluoriteOre,
+        SulfurOre,
+        SaltpeterOre,
     ]
     .iter()
     .filter_map(|&b| mined_from(b))
-    .chain([Item::CrudeOil, Item::Block(Sand)])
+    .chain([
+        Item::CrudeOil,
+        Item::Block(Sand),
+        Item::Block(Glass),
+        Item::Block(Cobblestone),
+        Item::Block(UraniumOre),
+        Item::Block(BauxiteOre),
+        Item::Block(IlmeniteSand),
+        // (A water pump's.)
+        Item::Fluid(Fluid::Water),
+    ])
     .collect();
     let smelted: Vec<Item> = made.iter().filter_map(|i| i.smelted()).collect();
     made.extend(smelted);
-    // Then whatever recipes make from those, until nothing new comes.
+    // Then whatever recipes make from those (and a reactor from its rods), until nothing new
+    // comes.
     loop {
         let before = made.len();
-        for r in &recipes::RECIPES {
-            if r.inputs.iter().all(|(i, _)| made.contains(i)) && !made.contains(&r.output) {
-                made.push(r.output);
+        for r in recipes::RECIPES {
+            let fluids = r
+                .fluids
+                .iter()
+                .all(|(f, _)| made.contains(&Item::Fluid(*f)));
+            if !(r.inputs.iter().all(|(i, _)| made.contains(i)) && fluids) {
+                continue;
             }
+            let products = std::iter::once(r.output)
+                .chain(r.extra.map(|(i, _)| i))
+                .chain(r.fluid_out.iter().map(|(f, _)| Item::Fluid(*f)));
+            for p in products {
+                if !made.contains(&p) {
+                    made.push(p);
+                }
+            }
+        }
+        if made.contains(&Item::UraniumFuelRod) && !made.contains(&Item::SpentFuelRod) {
+            made.push(Item::SpentFuelRod);
         }
         if made.len() == before {
             break;
         }
     }
-    for r in &recipes::RECIPES {
+    for r in recipes::RECIPES {
         assert!(made.contains(&r.output), "{:?} can't be made", r.output);
         assert!(r.inputs.len() <= 4 && r.count >= 1 && r.time > 0.0);
-        assert!(r.machine.has_recipes());
+        assert!(r.fluids.len() <= 2 && r.fluid_out.len() <= 2);
+        assert!(r.machine.has_recipes() && r.machine.has_tanks() || r.fluids.is_empty());
     }
     for item in [
         Item::Computer,
@@ -435,8 +474,24 @@ fn every_ingredient_can_be_made() {
         Item::Screen,
         Item::Fuel,
         Item::Rubber,
+        Item::Plutonium,
+        Item::MoxFuelRod,
+        Item::Antimatter,
+        Item::Block(VitrifiedWaste),
+        Item::AluminiumIngot,
+        Item::SuperconductingMagnet,
     ] {
         assert!(made.contains(&item), "{item:?}");
+    }
+    // A machine makes each thing one way (a recipe is known by what it makes).
+    for (i, a) in recipes::RECIPES.iter().enumerate() {
+        for b in &recipes::RECIPES[i + 1..] {
+            assert!(
+                a.machine != b.machine || a.output != b.output,
+                "two ways to make {:?}",
+                a.output
+            );
+        }
     }
 }
 
@@ -648,4 +703,357 @@ fn one_line_brings_a_machine_all_its_ingredients() {
     // 4 s a batch: about 14 in a minute, less the time the first ingredients take to arrive.
     let n = w.count(to, Item::Silicon);
     assert!(n >= 10, "{n} silicon");
+}
+
+// ---- Fluids, power and the big machines --------------------------------------------------
+
+/// Generators enough for `watts`, from (0, 12) on, each cabled to `machines`.
+fn generators(w: &mut World, p: &Planet, watts: f32, machines: &[BlockCell]) {
+    let n = (watts / GENERATOR_POWER).ceil() as i32;
+    for i in 0..n {
+        let g = at(p, i * 2, 12);
+        w.factory.add(p, g, Block::CoalGenerator, 0);
+        w.factory.machine_mut(g).unwrap().fuel = stack(Item::Coal, 64);
+        for &m in machines {
+            assert!(w.factory.connect(g, m));
+        }
+    }
+}
+
+fn level(w: &World, cell: BlockCell, i: usize, fluid: Fluid) -> f32 {
+    fluids::level(&w.factory.machine(cell).unwrap().tanks[i], fluid)
+}
+
+#[test]
+fn a_boiler_and_a_turbine_make_power_from_water_and_coal() {
+    // A tank's water down a pipe into a boiler; its steam down another into a steam turbine
+    // (three by three: the pipe meets one of its outer cells), which runs an electric furnace.
+    let p = planet();
+    let mut w = World::new();
+    let (tank, boiler, turbine, furnace) = (at(&p, 0, 0), at(&p, 2, 0), at(&p, 5, 0), at(&p, 5, 5));
+    w.factory.add(&p, tank, Block::StorageTank, 0);
+    w.factory.add(&p, at(&p, 1, 0), Block::Pipe, 0);
+    w.factory.add(&p, boiler, Block::Boiler, 0);
+    w.factory.add(&p, at(&p, 3, 0), Block::Pipe, 0);
+    w.factory.add(&p, turbine, Block::SteamTurbine, 0);
+    w.factory.add(&p, furnace, Block::ElectricFurnace, 0);
+    assert!(w.factory.connect(turbine, furnace));
+    assert_eq!(w.factory.fill_fluid(tank, Fluid::Water, 5000.0), 5000.0);
+    w.factory.machine_mut(boiler).unwrap().fuel = stack(Item::Coal, 10);
+    w.factory.machine_mut(furnace).unwrap().input = stack(Item::RawIron, 10);
+    w.run(25.0);
+    let t = w.factory.machine(turbine).unwrap();
+    assert!(
+        (t.power - BOILER_HEAT).abs() < BOILER_HEAT * 0.1,
+        "the turbine makes {} w",
+        t.power
+    );
+    assert!(level(&w, tank, 0, Fluid::Water) < 5000.0 - 100.0);
+    let made = w
+        .factory
+        .machine(furnace)
+        .unwrap()
+        .output
+        .map_or(0, |s| s.count);
+    assert!(made >= 2, "{made} ingots");
+    // The two lines kept apart: water in one, steam in the other.
+    let lines = w.factory.fluid_networks();
+    assert_eq!(lines.len(), 2);
+    assert!(lines.iter().any(|l| l.1 == Some(Fluid::Water)));
+    assert!(lines.iter().any(|l| l.1 == Some(Fluid::Steam)));
+}
+
+/// A reactor (and a turbine for its steam) with its own generator for its pumps; its water
+/// from a tank, down a pipe.
+fn reactor_plant(w: &mut World, p: &Planet) -> (BlockCell, BlockCell, BlockCell) {
+    let (reactor, tank, turbine) = (at(p, 0, 0), at(p, -4, 0), at(p, 5, 0));
+    w.factory.add(p, reactor, Block::NuclearReactor, 0);
+    w.factory.add(p, tank, Block::StorageTank, 0);
+    w.factory.add(p, at(p, -3, 0), Block::Pipe, 0);
+    w.factory.add(p, at(p, 3, 0), Block::Pipe, 0);
+    w.factory.add(p, turbine, Block::SteamTurbine, 0);
+    generators(w, p, 150_000.0, &[reactor]);
+    w.factory.fill_fluid(tank, Fluid::Water, fluids::TANK_HOLDS);
+    w.factory.machine_mut(reactor).unwrap().fuel = stack(Item::UraniumFuelRod, 2);
+    (reactor, tank, turbine)
+}
+
+#[test]
+fn a_reactor_boils_water_for_its_turbines() {
+    let p = planet();
+    let mut w = World::new();
+    let (reactor, _, turbine) = reactor_plant(&mut w, &p);
+    // (Its steam fills its tank first, at full power.)
+    w.run(45.0);
+    let r = *w.factory.machine(reactor).unwrap();
+    assert!(r.level > 0.1 && r.heat < OVERHEATING, "{r:?}");
+    assert!(r.heat > AMBIENT + 20.0, "it warms up: {}", r.heat);
+    assert_eq!(r.fuel.map(|s| s.count), Some(1), "a rod went in");
+    // The turbine runs flat out on its steam, and the reactor keeps to what is taken.
+    let made = w.factory.machine(turbine).unwrap().power;
+    assert!(made > TURBINE_POWER * 0.95, "{made} w");
+    assert!(
+        r.level < 0.8,
+        "it eases off with nowhere for its steam: {}",
+        r.level
+    );
+    // Without power for its pumps its rods go in.
+    let cables: Vec<_> = w.factory.cables().to_vec();
+    for (a, b) in cables {
+        w.factory.disconnect(a, b);
+    }
+    w.run(6.0);
+    assert!(w.factory.machine(reactor).unwrap().level < 0.01);
+}
+
+#[test]
+fn a_reactor_without_water_melts_down() {
+    let p = planet();
+    let mut w = World::new();
+    let (reactor, tank, _) = reactor_plant(&mut w, &p);
+    w.run(10.0);
+    assert!(w.factory.meltdowns.is_empty());
+    // The water runs out.
+    w.factory.machine_mut(tank).unwrap().tanks[0] = None;
+    w.factory.machine_mut(reactor).unwrap().tanks[0] = None;
+    for pipe in &mut w.factory.pipes {
+        pipe.held = None;
+    }
+    let mut warned = false;
+    for _ in 0..60 {
+        w.run(5.0);
+        let m = w.factory.machine(reactor).unwrap();
+        warned |= m.status().contains("overheating");
+        if !w.factory.meltdowns.is_empty() {
+            break;
+        }
+    }
+    assert!(warned, "it said it was overheating first");
+    assert_eq!(w.factory.meltdowns, vec![reactor]);
+}
+
+#[test]
+fn an_electrolyzer_sends_each_gas_down_the_line_that_wants_it() {
+    // Water into an electrolyzer; one line on to a blender making sulfuric acid (it wants
+    // oxygen), one to an empty tank. The oxygen goes to the blender, the hydrogen to the tank.
+    let p = planet();
+    let mut w = World::new();
+    let (water, cell, blender, gas, acid) = (
+        at(&p, 0, 0),
+        at(&p, 2, 0),
+        at(&p, 6, 0),
+        at(&p, 2, 2),
+        at(&p, 10, 0),
+    );
+    w.factory.add(&p, water, Block::StorageTank, 0);
+    w.factory.add(&p, at(&p, 1, 0), Block::Pipe, 0);
+    w.factory.add(&p, cell, Block::Electrolyzer, 0);
+    w.factory.add(&p, at(&p, 3, 0), Block::Pipe, 0);
+    w.factory.add(&p, blender, Block::Blender, 0);
+    w.factory.add(&p, at(&p, 2, 1), Block::Pipe, 0);
+    w.factory.add(&p, gas, Block::StorageTank, 0);
+    w.factory.add(&p, at(&p, 9, 0), Block::Pipe, 0);
+    w.factory.add(&p, acid, Block::StorageTank, 0);
+    w.factory.fill_fluid(water, Fluid::Water, 10_000.0);
+    w.factory
+        .machine_mut(cell)
+        .unwrap()
+        .set_recipe(Some(Item::Fluid(Fluid::Hydrogen)));
+    let b = w.factory.machine_mut(blender).unwrap();
+    b.set_recipe(Some(Item::Fluid(Fluid::SulfuricAcid)));
+    b.input = stack(Item::Sulfur, 20);
+    w.factory.fill_fluid(blender, Fluid::Water, 2000.0);
+    generators(&mut w, &p, 600_000.0, &[cell, blender]);
+    w.run(40.0);
+    assert!(level(&w, gas, 0, Fluid::Hydrogen) > 100.0);
+    assert!(level(&w, acid, 0, Fluid::SulfuricAcid) >= 200.0);
+    let b = w.factory.machine(blender).unwrap();
+    assert!(b.input.map_or(0, |s| s.count) < 20, "it used sulfur");
+    assert_eq!(level(&w, blender, 1, Fluid::Hydrogen), 0.0);
+}
+
+#[test]
+fn wind_turbines_and_rtgs_make_power() {
+    assert_eq!(wind_power(1.0), 0.0);
+    assert_eq!(wind_power(WIND_RATED + 2.0), WIND_POWER);
+    assert_eq!(wind_power(WIND_CUT_OUT + 1.0), 0.0);
+    assert!(wind_power(6.0) > 0.0 && wind_power(6.0) < wind_power(9.0));
+    let p = planet();
+    let mut w = World::new();
+    let (wind, rtg, furnace) = (at(&p, 0, 0), at(&p, 2, 0), at(&p, 4, 0));
+    w.factory.add(&p, wind, Block::WindTurbine, 0);
+    w.factory.add(&p, rtg, Block::Rtg, 0);
+    w.factory.add(&p, furnace, Block::ElectricFurnace, 0);
+    w.factory.locate(&p);
+    w.factory.set_wind(|_, _| WIND_RATED);
+    assert!(w.factory.connect(wind, furnace) && w.factory.connect(rtg, furnace));
+    w.run(1.0);
+    let net = &w.factory.networks()[0];
+    assert!(
+        (net.capacity - WIND_POWER - RTG_POWER).abs() < 1.0,
+        "{}",
+        net.capacity
+    );
+    w.factory.set_wind(|_, _| 0.0);
+    w.run(1.0);
+    assert!((w.factory.networks()[0].capacity - RTG_POWER).abs() < 1.0);
+}
+
+#[test]
+fn a_big_machine_is_one_from_any_of_its_cells() {
+    // Spent rods along a conveyor into the side of a cooling pool (three by three), which cools
+    // them under water; its cells are all the one machine, and taking any away takes it.
+    let p = planet();
+    let mut w = World::new();
+    let (chest, pool) = (at(&p, -1, 0), at(&p, 2, 0));
+    let mut slots = [None; CHEST_SLOTS];
+    slots[0] = stack(Item::SpentFuelRod, 2);
+    w.chests.insert(chest, slots);
+    w.factory.add(&p, at(&p, 0, 0), Block::Conveyor, EAST);
+    w.factory.add(&p, pool, Block::CoolingPool, 0);
+    let side = at(&p, 1, 1);
+    assert_eq!(w.factory.core(side), pool);
+    assert_eq!(w.factory.machine(side).unwrap().cell, pool);
+    // (It makes only one thing, so it is set to make it.)
+    assert_eq!(
+        w.factory.machine(pool).unwrap().recipe,
+        Some(Item::CooledSpentFuel)
+    );
+    w.factory.fill_fluid(pool, Fluid::Water, 500.0);
+    generators(&mut w, &p, 20_000.0, &[side]);
+    w.run(100.0);
+    let m = w.factory.machine(pool).unwrap();
+    assert_eq!(
+        m.output.map(|s| (s.item, s.count)),
+        Some((Item::CooledSpentFuel, 1))
+    );
+    assert!(w.factory.remove(at(&p, 3, -1)).is_some());
+    assert!(w.factory.machine(pool).is_none() && w.factory.machine(side).is_none());
+}
+
+#[test]
+fn pipes_keep_what_they_hold_when_saved() {
+    let p = planet();
+    let mut w = World::new();
+    let tank = at(&p, 0, 0);
+    w.factory.add(&p, tank, Block::StorageTank, 0);
+    for u in 1..=3 {
+        w.factory.add(&p, at(&p, u, 0), Block::Pipe, 0);
+    }
+    w.factory.fill_fluid(tank, Fluid::NitricAcid, 1000.0);
+    w.run(0.5);
+    let before = w.factory.fluid_networks();
+    let json = serde_json::to_string(&w.factory.saved()).unwrap();
+    let mut restored = Factory::restored(serde_json::from_str(&json).unwrap());
+    restored.locate(&p);
+    restored.authority = true;
+    let mut w2 = World {
+        factory: restored,
+        ..World::new()
+    };
+    w2.run(0.5);
+    let after = w2.factory.fluid_networks();
+    assert_eq!(before.len(), 1);
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].1, Some(Fluid::NitricAcid));
+    assert!(
+        (before[0].2 - after[0].2).abs() < 1.0,
+        "{before:?} {after:?}"
+    );
+}
+
+/// Puts a pipe in `cell` as a player would: clicked against `support`, looking along `axis`
+/// (0 u, 1 v, 2 up).
+fn build_pipe(w: &mut World, p: &Planet, cell: BlockCell, support: BlockCell, axis: u8) {
+    let ways = w.factory.pipe_ways(p, cell, support, axis);
+    w.factory.add(p, cell, Block::Pipe, 0);
+    w.factory.set_pipe_ways(cell, Some(ways), axis);
+}
+
+/// The cell under `cell` (the ground a pipe is put on).
+fn under(p: &Planet, cell: BlockCell) -> BlockCell {
+    p.cell(cell.face, cell.u, cell.v, cell.k - 1).unwrap()
+}
+
+#[test]
+fn pipe_lines_side_by_side_keep_apart() {
+    // Two lines, touching all along: one built pipe on pipe from a tank of water, the other
+    // put on the ground looking along it from a tank of oxygen. Each reaches its own tank.
+    let p = planet();
+    let mut w = World::new();
+    let (water, oxygen) = (at(&p, 0, 0), at(&p, 0, 1));
+    let (water_out, oxygen_out) = (at(&p, 5, 0), at(&p, 5, 1));
+    for tank in [water, oxygen, water_out, oxygen_out] {
+        w.factory.add(&p, tank, Block::StorageTank, 0);
+    }
+    let mut support = water;
+    for u in 1..=4 {
+        build_pipe(&mut w, &p, at(&p, u, 0), support, 1);
+        support = at(&p, u, 0);
+    }
+    for u in 1..=4 {
+        build_pipe(&mut w, &p, at(&p, u, 1), under(&p, at(&p, u, 1)), 0);
+    }
+    w.factory.fill_fluid(water, Fluid::Water, 5000.0);
+    w.factory.fill_fluid(oxygen, Fluid::Oxygen, 5000.0);
+    w.run(2.0);
+    let lines = w.factory.fluid_networks();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(level(&w, water_out, 0, Fluid::Water) > 1000.0);
+    assert!(level(&w, oxygen_out, 0, Fluid::Oxygen) > 1000.0);
+    assert_eq!(level(&w, water_out, 0, Fluid::Oxygen), 0.0);
+}
+
+#[test]
+fn pipes_turn_corners_and_join_what_their_ends_point_at() {
+    // From a tank: on along u, round a corner by clicking the last pipe's side, on along v on
+    // the ground; a tank put afterwards in front of the open end joins it.
+    let p = planet();
+    let mut w = World::new();
+    let (from, to) = (at(&p, 0, 0), at(&p, 2, 3));
+    w.factory.add(&p, from, Block::StorageTank, 0);
+    build_pipe(&mut w, &p, at(&p, 1, 0), from, 0);
+    build_pipe(&mut w, &p, at(&p, 2, 0), at(&p, 1, 0), 0);
+    build_pipe(&mut w, &p, at(&p, 2, 1), at(&p, 2, 0), 1);
+    build_pipe(&mut w, &p, at(&p, 2, 2), under(&p, at(&p, 2, 2)), 1);
+    // (A pipe put down beside the line, looking along it, joins nothing.)
+    build_pipe(&mut w, &p, at(&p, 3, 1), under(&p, at(&p, 3, 1)), 1);
+    w.factory.add(&p, to, Block::StorageTank, 0);
+    w.factory.fill_fluid(from, Fluid::Water, 5000.0);
+    w.run(2.0);
+    assert!(level(&w, to, 0, Fluid::Water) > 1000.0);
+    let lines = w.factory.fluid_networks();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines.iter().any(|l| l.0 == 1 && l.1.is_none()));
+}
+
+#[test]
+fn an_empty_line_nothing_uses_carries_something_else() {
+    let p = planet();
+    let mut w = World::new();
+    let (from, to) = (at(&p, 0, 0), at(&p, 3, 0));
+    w.factory.add(&p, from, Block::StorageTank, 0);
+    w.factory.add(&p, to, Block::StorageTank, 0);
+    build_pipe(&mut w, &p, at(&p, 1, 0), from, 0);
+    build_pipe(&mut w, &p, at(&p, 2, 0), at(&p, 1, 0), 0);
+    w.factory.fill_fluid(from, Fluid::Water, 1000.0);
+    w.run(1.0);
+    assert_eq!(w.factory.fluid_networks()[0].1, Some(Fluid::Water));
+    // Emptied (the line keeps to water while a tank holds some) ...
+    for tank in [from, to] {
+        w.factory.machine_mut(tank).unwrap().tanks[0] = None;
+    }
+    for pipe in &mut w.factory.pipes {
+        pipe.held = Some(FluidStack {
+            fluid: Fluid::Water,
+            amount: 0.0,
+        });
+    }
+    w.run(0.5);
+    assert_eq!(w.factory.fluid_networks()[0].1, None);
+    // ... it takes what is sent down it next.
+    w.factory.fill_fluid(from, Fluid::Hydrogen, 1000.0);
+    w.run(1.0);
+    assert_eq!(w.factory.fluid_networks()[0].1, Some(Fluid::Hydrogen));
+    assert!(level(&w, to, 0, Fluid::Hydrogen) > 100.0);
 }

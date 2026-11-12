@@ -359,6 +359,11 @@ impl WorldState {
         self.factory.infinite = infinite;
     }
 
+    /// The wind at its wind turbines (see `Factory::set_wind`).
+    pub fn set_wind(&mut self, wind: impl Fn(DVec3, f32) -> f32) {
+        self.factory.set_wind(wind);
+    }
+
     /// The world nobody is on goes on too: furnaces burn and factories run (`authority`:
     /// moving what conveyors carry in and out of containers, see `factory`).
     pub fn run(&mut self, planet: &Planet, dt: f64, net: NetSide) {
@@ -503,6 +508,9 @@ pub struct Survival {
     pub factory: Factory,
     /// A cable being run: the pole or machine it starts from.
     pub cable_from: Option<BlockCell>,
+    /// This world has been looked over for miners from before they were big
+    /// (`pick_up_old_miners`).
+    old_miners_checked: bool,
 }
 
 impl Default for Survival {
@@ -556,6 +564,7 @@ impl Default for Survival {
             clicked: false,
             factory: Factory::default(),
             cable_from: None,
+            old_miners_checked: false,
         }
     }
 }
@@ -600,6 +609,7 @@ impl Survival {
         self.pending_lights = state.pending_lights;
         self.factory = state.factory;
         self.cable_from = None;
+        self.old_miners_checked = false;
         self.restore_player(saved, feet);
     }
 
@@ -850,7 +860,13 @@ impl Survival {
             }
             // (Waits for the chunks around it, which may not be loaded here.)
             Block::Torch => self.pending_lights.push((cell, TORCH_LIGHT)),
-            b if b.is_factory() => self.factory.add(world.planet, cell, b, state.facing),
+            b if b.is_factory() && state.is_core() => {
+                self.factory.add(world.planet, cell, b, state.facing);
+                if b == Block::Pipe {
+                    self.factory
+                        .set_pipe_ways(cell, pipe_ways(state), state.axis);
+                }
+            }
             Block::BigDoor | Block::BigDoorOpen if state.piece == 1 => {
                 self.factory
                     .add(world.planet, cell, Block::BigDoor, state.facing)
@@ -1015,6 +1031,7 @@ impl Survival {
     /// Trades the current world's state for `other`'s (moving to another world).
     pub fn swap_world(&mut self, other: &mut WorldState) {
         self.swap_contents(other);
+        self.old_miners_checked = false;
         self.mining = None;
         self.target_name = None;
         self.cable_from = None;
@@ -1123,19 +1140,81 @@ impl Survival {
         block: Block,
         creative: bool,
     ) {
-        // A door comes down whole (and is one door again).
+        // A door comes down whole (and is one door again), and so does a big machine.
         let unit = match (block.door(), self.objects.get(&cell)) {
             (Some((kind, _)), Some(object)) => door_unit(world.planet, cell, object.state, kind),
+            (None, Some(object)) if block.is_structure() => {
+                structure_unit(world.planet, cell, object.state, block)
+            }
             _ => Vec::new(),
         };
         self.break_one(world, cell, block, creative, true);
         for other in unit {
             if let Some(b) = self.objects.get(&other).map(|o| o.block)
-                && b.door().is_some()
+                && (b.door().is_some() || b == block)
             {
                 self.break_one(world, other, b, creative, false);
             }
         }
+    }
+
+    /// A big machine (`Block::structure`) put down whole, its front towards whoever placed it;
+    /// `cell` is its middle bottom. Every cell it needs must be open.
+    fn place_structure(
+        &mut self,
+        world: &mut World,
+        cell: BlockCell,
+        block: Block,
+        pose: &Pose,
+    ) -> bool {
+        let planet = world.planet;
+        let center = interact::cell_center(planet, cell);
+        let facing = models::facing_towards(planet, cell, pose.feet - center);
+        let Some(cells) = factory::footprint(planet, cell, block) else {
+            return false;
+        };
+        let open = |c: &BlockCell| {
+            world.streamer.block(*c).is_some_and(|b| !b.is_solid())
+                && !overlaps_player(planet, *c, pose.feet)
+        };
+        if !cells.iter().all(open) {
+            return false;
+        }
+        self.build_structure(world, &cells, block, facing);
+        self.sound(Sound::Place(block.material()), center);
+        true
+    }
+
+    /// Puts every cell of a big machine (`cells`: its `footprint`) in place, facing `facing`.
+    pub fn build_structure(
+        &mut self,
+        world: &mut World,
+        cells: &[BlockCell],
+        block: Block,
+        facing: u8,
+    ) {
+        let Some(&core) = cells.first() else { return };
+        for &c in cells {
+            let offset = [c.u - core.u, c.v - core.v, c.k - core.k].map(|d| d as i8);
+            let state = ModelState {
+                facing,
+                offset,
+                ..Default::default()
+            };
+            self.put(world, c, block, state, None);
+        }
+    }
+
+    /// Something too big to place: why not.
+    pub fn structure_blocked(block: Block) -> String {
+        let (r, h) = block.structure();
+        format!(
+            "No room: a {} needs {} by {} by {} blocks clear",
+            block.name().to_lowercase(),
+            2 * r + 1,
+            2 * r + 1,
+            h
+        )
     }
 
     /// A vehicle's drill has bored through a block: it is broken as by a player, and gives
@@ -1216,6 +1295,28 @@ impl Survival {
         }
     }
 
+    /// Which ways a pipe put in `cell` (clicked against `support`) joins, and which way it
+    /// runs while it joins nothing: along the way the player looks (up when looking well up or
+    /// down), so a pipe put on the ground carries on the line behind it, not one beside it.
+    fn pipe_start(
+        &mut self,
+        planet: &Planet,
+        cell: BlockCell,
+        support: BlockCell,
+        pose: &Pose,
+    ) -> (u8, u8) {
+        let up = interact::cell_center(planet, cell).normalize_or(DVec3::Y);
+        // (Looking more than about 64 degrees up or down: putting pipes on the ground in
+        // front of you is 30-60.)
+        let axis = if pose.look.dot(up).abs() > 0.9 {
+            2
+        } else {
+            // (Facings 0 and 2 look along v, 1 and 3 along u.)
+            1 - models::facing_towards(planet, cell, pose.look) % 2
+        };
+        (self.factory.pipe_ways(planet, cell, support, axis), axis)
+    }
+
     /// Puts a block (or model) into `cell`, held against `support`.
     fn place(
         &mut self,
@@ -1229,26 +1330,12 @@ impl Survival {
             return false; // they go on vehicles: `Game::craft_clicks`
         }
         let planet = world.planet;
-        // A miner's rig stands five blocks tall: it needs the cells over it open, and nothing
-        // goes inside it.
-        let column = |dk: i32| planet.cell(cell.face, cell.u, cell.v, cell.k + dk);
-        if block == Block::Miner
-            && (1..models::MINER_HEIGHT).any(|dk| {
-                column(dk).is_none_or(|c| world.streamer.block(c).is_some_and(|b| b.is_solid()))
-            })
-        {
-            return false;
-        }
-        if (1..models::MINER_HEIGHT).any(|dk| {
-            column(-dk)
-                .and_then(|c| self.objects.get(&c))
-                .is_some_and(|o| o.block == Block::Miner)
-        }) {
-            return false;
-        }
         let center = interact::cell_center(planet, cell);
         if let Some((kind, _)) = block.door() {
             return self.place_door(world, cell, kind, pose);
+        }
+        if block.is_structure() {
+            return self.place_structure(world, cell, block, pose);
         }
         // Fronts face whoever placed them; a conveyor runs the way they look.
         let towards = if block == Block::Conveyor {
@@ -1257,9 +1344,19 @@ impl Survival {
             pose.feet - center
         };
         let mut state = ModelState {
-            facing: models::facing_towards(planet, cell, towards),
+            // (A pipe is never turned: its model's x and y are the grid's.)
+            facing: if block == Block::Pipe {
+                0
+            } else {
+                models::facing_towards(planet, cell, towards)
+            },
             ..Default::default()
         };
+        if block == Block::Pipe {
+            let (ways, axis) = self.pipe_start(planet, cell, support, pose);
+            state.links = ways | BUILT_WAYS;
+            state.axis = axis;
+        }
         if block == Block::Torch {
             // Torches go on top of a block or on its side, never underneath.
             let below = planet.cell(cell.face, cell.u, cell.v, cell.k - 1);
@@ -1422,9 +1519,17 @@ impl Survival {
                 Block::BigDoor | Block::BigDoorOpen if state.piece == 1 => {
                     self.factory.add(planet, cell, Block::BigDoor, state.facing);
                 }
-                b if b.is_factory() => {
+                // (A big machine is one, in its first cell.)
+                b if b.is_factory() && state.is_core() => {
                     self.factory.add(planet, cell, b, state.facing);
-                    if matches!(b, Block::Miner | Block::OilPump) {
+                    if b == Block::Pipe {
+                        self.factory
+                            .set_pipe_ways(cell, pipe_ways(state), state.axis);
+                    }
+                    if matches!(
+                        b,
+                        Block::Miner | Block::OilPump | Block::WaterPump | Block::GeothermalWell
+                    ) {
                         // What it brings up depends on what is under it (the others may not
                         // have it loaded: they are told).
                         let resource = resource_under(world, cell, b);
@@ -1634,18 +1739,28 @@ impl Survival {
                 hit.block,
                 Block::CraftingTable | Block::Furnace | Block::Chest | Block::PowerPole
             ) || hit.block.is_machine();
-            if usable && !sneaking {
+            // (A pipe goes onto a machine with tanks: Shift opens its screen instead.)
+            let piping = held.is_some_and(|s| s.item == Item::Block(Block::Pipe))
+                && self
+                    .factory
+                    .machine(hit.cell)
+                    .is_some_and(|m| m.kind.has_tanks());
+            if usable && sneaking == piping {
                 if input.button_pressed(MouseButton::Right) {
+                    // (A big machine's screen is its first cell's.)
+                    let cell = self.factory.core(hit.cell);
                     let screen = match hit.block {
-                        Block::Furnace => Screen::Furnace(hit.cell),
-                        Block::Chest => Screen::Chest(hit.cell),
-                        // Poles, accumulators and panels show the network they are on.
-                        Block::PowerPole | Block::Accumulator | Block::SolarPanel => {
-                            Screen::Power(hit.cell)
-                        }
+                        Block::Furnace => Screen::Furnace(cell),
+                        Block::Chest => Screen::Chest(cell),
+                        // Poles, accumulators and power sources show the network they are on.
+                        Block::PowerPole
+                        | Block::Accumulator
+                        | Block::SolarPanel
+                        | Block::WindTurbine
+                        | Block::Rtg => Screen::Power(cell),
                         b => match factory::MachineKind::of(b) {
-                            Some(kind) => Screen::Machine(hit.cell, kind),
-                            None => Screen::Crafting(hit.cell),
+                            Some(kind) => Screen::Machine(cell, kind),
+                            None => Screen::Crafting(cell),
                         },
                     };
                     self.open(screen);
@@ -1660,6 +1775,8 @@ impl Survival {
                     if !creative {
                         self.inventory.take_one(self.selected);
                     }
+                } else if block.is_structure() && input.button_pressed(MouseButton::Right) {
+                    message = Some(Survival::structure_blocked(block));
                 }
                 self.action_cooldown = PLACE_REPEAT;
             }
@@ -1911,6 +2028,70 @@ impl Survival {
         bend_conveyors(&mut self.factory, &mut self.objects);
         if self.net == NetSide::Offline {
             self.factory.changed.clear();
+        }
+    }
+
+    /// Reactors that melted down: each goes up in a burst of fire and smoke, its cells are gone
+    /// and its floor is molten (lava), with all it held. Says so.
+    pub fn meltdowns(&mut self, world: &mut World) -> Option<String> {
+        let cores = std::mem::take(&mut self.factory.meltdowns);
+        let mut message = None;
+        for core in cores {
+            let Some(object) = self.objects.get(&core) else {
+                continue;
+            };
+            let block = object.block;
+            let cells = structure_unit(world.planet, core, object.state, block);
+            if cells.is_empty() {
+                continue;
+            }
+            let center = interact::cell_center(world.planet, core);
+            let up = center.normalize_or(DVec3::Y);
+            for e in effects::explosion(center + up * 2.0, DVec3::ZERO, up) {
+                self.effects.push(e);
+            }
+            self.sound(Sound::Explosion, center);
+            for &c in &cells {
+                self.break_one(world, c, block, true, false);
+            }
+            for &c in &cells {
+                if c.k == core.k {
+                    self.put(world, c, Block::Lava, ModelState::default(), None);
+                }
+            }
+            message = Some("A reactor has melted down!".to_string());
+        }
+        message
+    }
+
+    /// Miners from before they were three blocks square stand in one cell, with no room kept
+    /// round them: each is picked back up (it drops where it stood, with what it held and its
+    /// cables), to be placed again. Once after a world is loaded or swapped in; the host (or
+    /// offline) decides, the others hear of it as blocks broken.
+    pub fn pick_up_old_miners(&mut self, world: &mut World) {
+        if std::mem::replace(&mut self.old_miners_checked, true) || self.net == NetSide::Client {
+            return;
+        }
+        let old: Vec<BlockCell> = self
+            .objects
+            .iter()
+            .filter(|(_, o)| o.block == Block::Miner && o.state.offset == [0; 3])
+            .map(|(&c, _)| c)
+            .filter(|&c| {
+                let part = factory::footprint(world.planet, c, Block::Miner)
+                    .and_then(|cells| cells.get(1).copied());
+                part.is_none_or(|p| self.objects.get(&p).is_none_or(|o| o.block != Block::Miner))
+            })
+            .collect();
+        for cell in old {
+            self.break_one(world, cell, Block::Miner, false, false);
+            let center = interact::cell_center(world.planet, cell);
+            self.spawn(
+                ItemStack::new(Item::Block(Block::Miner), 1),
+                center,
+                DVec3::ZERO,
+                0.5,
+            );
         }
     }
 
@@ -2220,12 +2401,26 @@ impl Survival {
             if object.block == Block::Chest {
                 object.state.open = open_chest == Some(cell);
             }
-            let machine = self.factory.machine(cell);
-            if object.block == Block::Accumulator
-                && let Some(m) = machine
-            {
-                let full = m.energy / m.energy_total.max(1.0);
-                object.state.level = (full * models::LEVELS as f32).round() as u8;
+            let machine = self
+                .factory
+                .machine(cell)
+                .filter(|_| object.state.is_core());
+            if let Some(m) = machine {
+                match object.block {
+                    Block::Accumulator => {
+                        let full = m.energy / m.energy_total.max(1.0);
+                        object.state.level = (full * models::LEVELS as f32).round() as u8;
+                    }
+                    Block::StorageTank => {
+                        let (fluid, full) = m.tanks[0].map_or((0, 0.0), |s| {
+                            (s.fluid as u8 + 1, s.amount / factory::fluids::TANK_HOLDS)
+                        });
+                        object.state.fluid = fluid;
+                        object.state.level = (full * models::LEVELS as f32).ceil() as u8;
+                    }
+                    Block::NuclearReactor => object.state.alarm = m.heat >= factory::OVERHEATING,
+                    _ => {}
+                }
             }
             // Block light can change any time (torches nearby); the sky estimate is fixed.
             let block = streamer.light(cell) as u32;
@@ -2321,8 +2516,9 @@ impl Survival {
                 drop.mesh = renderer.create_mesh(&mesh)?;
             }
             if let Some(mesh) = drop.mesh {
+                let up = drop.position.normalize_or(DVec3::Y).as_vec3();
                 draws.push(DrawItem {
-                    rotation: glam::Quat::IDENTITY,
+                    rotation: glam::Quat::from_axis_angle(up, drop.spin()),
                     mesh,
                     origin: planet.center + drop.draw_position(),
                     radius: 0.5,
@@ -2445,6 +2641,7 @@ impl Survival {
                 .get(i)
                 .map(|&item| ItemStack::new(item, item.max_stack())),
             SlotId::MachineIn(i) => self.open_machine()?.inputs().get(i).copied().flatten(),
+            SlotId::Extra => self.open_machine()?.extra,
             SlotId::Recipe(i) => {
                 let kind = self.open_machine()?.kind;
                 let r = factory::recipes::for_machine(kind).nth(i)?;
@@ -2536,6 +2733,10 @@ impl Survival {
                 }
                 _ => None,
             },
+            SlotId::Extra => match screen {
+                Screen::Machine(cell, _) => Some(&mut self.factory.machine_mut(cell)?.extra),
+                _ => None,
+            },
             SlotId::Output | SlotId::Catalog(_) | SlotId::Recipe(_) => None,
         }
     }
@@ -2544,7 +2745,11 @@ impl Survival {
     /// a machine's ingredient slots what its recipe takes there, results take nothing).
     fn accepts(&self, id: SlotId, stack: &ItemStack) -> bool {
         match id {
-            SlotId::FurnaceFuel => stack.item.fuel().is_some(),
+            SlotId::FurnaceFuel => match self.screen {
+                Some(Screen::Machine(_, kind)) => kind.takes_fuel(stack.item),
+                _ => stack.item.fuel().is_some(),
+            },
+            SlotId::Extra => false,
             SlotId::Armor(i) => stack
                 .item
                 .armor()
@@ -2794,7 +2999,7 @@ impl Survival {
                 }
             }
             _ if shift => self.quick_move(id),
-            SlotId::FurnaceOut => {
+            SlotId::FurnaceOut | SlotId::Extra => {
                 // Results can be taken, not put in.
                 let mut cursor = self.cursor.take();
                 if let Some(slot) = self.slot_mut(id) {
@@ -2880,9 +3085,7 @@ impl Survival {
         match screen {
             Screen::Furnace(_) if item.smelted().is_some() => Some(SlotId::FurnaceIn),
             Screen::Furnace(_) if item.fuel().is_some() => Some(SlotId::FurnaceFuel),
-            Screen::Machine(_, MachineKind::Generator) if item.fuel().is_some() => {
-                Some(SlotId::FurnaceFuel)
-            }
+            Screen::Machine(_, kind) if kind.takes_fuel(item) => Some(SlotId::FurnaceFuel),
             Screen::Machine(_, MachineKind::ElectricFurnace) if item.smelted().is_some() => {
                 Some(SlotId::FurnaceIn)
             }
@@ -3012,6 +3215,40 @@ fn bend_conveyors(factory: &mut Factory, objects: &mut FastMap<BlockCell, Object
             object.state.bend = bend;
         }
     }
+    // (And pipes join what they touch, showing the fluid their line carries.)
+    for (cell, links, ports, fluid) in std::mem::take(&mut factory.pipes_changed) {
+        if let Some(object) = objects.get_mut(&cell)
+            && object.block == Block::Pipe
+        {
+            object.state.links = links;
+            object.state.ports = ports;
+            object.state.fluid = fluid;
+        }
+    }
+}
+
+/// On a pipe just put down (`ModelState::links`, as sent to the others): the rest of the bits
+/// are the ways it was built to join. Without it (a factory put down whole) it joins all it
+/// touches.
+pub const BUILT_WAYS: u8 = 0x80;
+
+/// The ways a pipe just put down joins, from its model's state (see `BUILT_WAYS`).
+fn pipe_ways(state: ModelState) -> Option<u8> {
+    (state.links & BUILT_WAYS != 0).then_some(state.links & 0b11_1111)
+}
+
+/// The cells of the big machine `cell` is a cell of (`state`: its model's), its first first.
+fn structure_unit(
+    planet: &Planet,
+    cell: BlockCell,
+    state: ModelState,
+    block: Block,
+) -> Vec<BlockCell> {
+    let [du, dv, dk] = state.offset.map(i32::from);
+    planet
+        .cell(cell.face, cell.u - du, cell.v - dv, cell.k - dk)
+        .and_then(|core| factory::footprint(planet, core, block))
+        .unwrap_or_default()
 }
 
 /// A machine's moving parts go on (faster while it works, easing to a stop when it doesn't)
@@ -3038,6 +3275,9 @@ fn animate(
     let facing = object.state.facing;
     let (rate, at) = match object.block {
         Block::CoalGenerator if m.speed > 0.5 => (7.0, [12.25, 12.25, 16.5]),
+        Block::Boiler if m.speed > 0.5 => (7.0, [12.5, 12.5, 35.5]),
+        // (Steam off the wellhead.)
+        Block::GeothermalWell if m.speed > 0.5 => (4.0, [8.0, 8.0, 13.5]),
         Block::Miner if m.speed > 0.5 => {
             let pose = models::Motion::Drill.pose(m.work, m.speed, clock, seed);
             // (Only while the bit is in the ground.)
@@ -3135,7 +3375,7 @@ fn move_door(
 /// What the player can change on a machine's screen: its slots, and (as one more) its recipe.
 fn machine_slots(machine: &factory::Machine) -> Vec<Slot> {
     let mut slots: Vec<Slot> = machine.inputs().to_vec();
-    slots.extend([machine.fuel, machine.output]);
+    slots.extend([machine.fuel, machine.output, machine.extra]);
     slots.push(machine.recipe.map(ItemStack::one));
     slots
 }
@@ -3145,6 +3385,33 @@ fn machine_slots(machine: &factory::Machine) -> Vec<Slot> {
 /// reaches (`MINER_DEPTH` down, a column round it), else what the block under it is made of.
 fn resource_under(world: &World, cell: BlockCell, block: Block) -> Option<Item> {
     let planet = world.planet;
+    let near = |reach: i32, below: i32, wanted: &dyn Fn(Block) -> bool| {
+        (-below..=1).any(|dk| {
+            (-reach..=reach).any(|du| {
+                (-reach..=reach).any(|dv| {
+                    planet
+                        .cell(cell.face, cell.u + du, cell.v + dv, cell.k + dk)
+                        .and_then(|c| world.streamer.block(c))
+                        .is_some_and(wanted)
+                })
+            })
+        })
+    };
+    match block {
+        // Water beside it or just under it.
+        Block::WaterPump => {
+            return near(1, 2, &|b| b == Block::Water).then_some(Item::Block(Block::Water));
+        }
+        // Heat: lava or molten rock near it, or deep enough down.
+        Block::GeothermalWell => {
+            let deep = cell.k < planet.sea_layer - factory::GEOTHERMAL_DEPTH;
+            let hot = near(3, 8, &|b| {
+                matches!(b, Block::Lava | Block::OuterCore | Block::Mantle)
+            });
+            return (deep || hot).then_some(Item::Block(Block::Lava));
+        }
+        _ => {}
+    }
     let (depth, reach) = if block == Block::OilPump {
         (factory::PUMP_DEPTH, factory::MINE_REACH)
     } else {
@@ -3331,6 +3598,34 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_big_machine_is_the_same_from_any_of_its_cells() {
+        let planet = Planet::new(DVec3::ZERO, 64, 128, 1);
+        let core = BlockCell {
+            face: crate::world::planet::Face(2),
+            u: 600,
+            v: 700,
+            k: planet.sea_layer + 3,
+        };
+        for block in [Block::NuclearReactor, Block::Blender, Block::WindTurbine] {
+            let cells = factory::footprint(&planet, core, block).unwrap();
+            let (r, h) = block.structure();
+            assert_eq!(cells.len(), ((2 * r + 1) * (2 * r + 1) * h) as usize);
+            assert_eq!(cells[0], core);
+            for &c in &cells {
+                let state = ModelState {
+                    offset: [c.u - core.u, c.v - core.v, c.k - core.k].map(|d| d as i8),
+                    ..Default::default()
+                };
+                assert_eq!(state.is_core(), c == core);
+                assert_eq!(structure_unit(&planet, c, state, block), cells);
+            }
+        }
+        // Not across the edge of a face.
+        let edge = BlockCell { u: 1, ..core };
+        assert!(factory::footprint(&planet, edge, Block::Blender).is_none());
     }
 
     #[test]

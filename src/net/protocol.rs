@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u32 = 12;
+pub const PROTOCOL: u32 = 14;
 /// The host is always player 0.
 pub const HOST: PlayerId = 0;
 /// Most people in one game, the host included.

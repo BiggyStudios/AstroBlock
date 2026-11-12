@@ -1176,6 +1176,21 @@ impl Game {
         let gravity = self.gravity.acceleration(self.player.position).length();
         let sun = self.bodies.sun_in_frame(self.active, self.time);
         self.survival.set_power(sun, self.infinite_power);
+        // Wind turbines take the wind where they stand (only home has weather).
+        let weather = self.weather.snapshot.clone();
+        let wind = |up: DVec3, altitude: f32| {
+            let surface = weather.sample(up.as_vec3()).surface_wind().length();
+            let height = 1.0 + altitude.max(0.0) / crate::factory::WIND_HEIGHT;
+            surface * crate::factory::HUB_WIND * height
+        };
+        if self.active == Body::Planet {
+            self.survival.factory.set_wind(wind);
+        } else {
+            self.survival.factory.set_wind(|_, _| 0.0);
+            if self.other.body == Body::Planet {
+                self.other.state.set_wind(wind);
+            }
+        }
         let messages = self.survival.update(
             &self.planet,
             &world,
@@ -1191,7 +1206,14 @@ impl Game {
         let sun = self.bodies.sun_in_frame(self.other.body, self.time);
         self.other.state.set_power(sun, self.infinite_power);
         self.other.state.run(&self.other.planet, warped, net);
-        if let Some(message) = messages.into_iter().last() {
+        // (A reactor that melted down here is wrecked; one on the other world waits.)
+        let mut world = survival::World {
+            planet: &self.planet,
+            streamer: &mut self.streamer,
+        };
+        self.survival.pick_up_old_miners(&mut world);
+        let meltdown = self.survival.meltdowns(&mut world);
+        if let Some(message) = messages.into_iter().chain(meltdown).last() {
             self.message = Some((message, Instant::now()));
         }
     }

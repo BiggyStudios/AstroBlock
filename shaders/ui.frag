@@ -10,16 +10,16 @@ layout(location = 2) flat in uint v_layer;
 
 layout(location = 0) out vec4 out_color;
 
-// v_layer: 0xffffffff = font atlas. Otherwise bits 0-7 texture layer, bits 8-15 brightness
-// (0 = full), bit 31 sprite (see `ui::Ui`).
+// v_layer: 0xffffffff = font atlas. Otherwise bits 0-11 texture layer (past the blocks' and items'
+// textures: the interface's pictures), bits 16-23 brightness (0 = full), bit 31 sprite (see `ui::Ui`).
 void main() {
     if (v_layer == 0xffffffffu) {
         float a = texture(sampler2D(u_font, u_sampler), v_uv).a;
         out_color = vec4(v_color.rgb, v_color.a * a);
         return;
     }
-    uint layer = v_layer & 255u;
-    uint b = (v_layer >> 8u) & 255u;
+    uint layer = v_layer & 4095u;
+    uint b = (v_layer >> 16u) & 255u;
     float brightness = b == 0u ? 1.0 : float(b) / 255.0;
     vec4 t = texture(sampler2DArray(u_textures, u_sampler), vec3(v_uv, float(layer)));
     if ((v_layer & 0x80000000u) != 0u) {

@@ -39,6 +39,7 @@ struct Cable {
 impl Factory {
     /// Where a cable meets a pole or a machine (planet-relative).
     pub fn attach_point(&self, planet: &Planet, cell: BlockCell) -> DVec3 {
+        let cell = self.core(cell);
         let top = match self.node(cell) {
             Some(Node::Pole(_)) => models::POLE_TOP,
             Some(Node::Machine(i)) => self.machines[i as usize].kind.cable_height(),

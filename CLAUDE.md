@@ -95,6 +95,12 @@ follows their warp, or joins their team (a team warps as one).
     a pole or machine, then another (up to 24 m) to run a cable; it carries on from there, so a
     line of poles is a click each. Right click the last one again to stop, or a connected
     pair to take that cable down.
+  - Pipes join what they are put against (a pipe's side makes a corner; holding pipe, right
+    click a machine to put one on it, Shift opens its screen) and what their open ends point at.
+    A pipe put on the ground runs the way you look, so it carries on the line behind it and
+    lines side by side stay apart. A line carries one fluid (a band of its colour). Big machines
+    (blender, reactor, turbines, accelerator...) are placed whole, centred on the block clicked;
+    any of their cells opens their screen or takes their cable.
 - **Rockets** (test rocket: `give rocket`, or `rocket` in the console):
   - Right click with it on top of a block stands it there; right click a rocket to get in,
     left click a landed one to pick it up.
@@ -121,7 +127,7 @@ follows their warp, or joins their team (a team warps as one).
 | `ASTRO_WARP=<factor>` | Initial time warp. |
 | `ASTRO_FACE_SUN=1` | Turn the camera towards the sun's compass direction (sunset shots). |
 | `ASTRO_MODE=<mode>` | Starting game mode: survival (default), creative or spectator. **Use `spectator` for camera captures**: in survival you fall. |
-| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). `time <hours|noon|night|...>`. For survival tests: `aim <pitch> [yaw]`, `turn <deg>` (the view, to the right), `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears; **put it right after `aim`**: in a capture the targeted block is only worked out by `aim`, and a `wait` or another command in between leaves nothing targeted), `throw`, `open inventory/creative [tab]`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `fuel infinite [on|off]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `brake [on|off]` (the HUD's brake button), `vehicle <plane|rover|rocket|digger|probe|gate> [m]`, `power [percent]` (the flown vehicle's batteries), `power infinite [on|off]`, `drill [on|off]`, `vehicle take <x> <y> <z>` (breaks that part off the nearest vehicle, as a click would), `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Factory tests: `factory` (counts, networks, what the containers on conveyors hold), `factory demo` (a ready-made factory ahead), `factory stress [lines] [length]` (that many conveyors from full chests), `factory turn` (= R on a conveyor), `factory industry` (oil, a miner, silicon, wire and power ahead), `factory open <machine|power>` (that screen, within reach), `factory recipe <item>` (the nearest machine that can make it does). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net vessels` (each vessel: who flies it, parked or moving, height over the terrain), `tp <who>` (go to that player), `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net punch` (strike the player in the crosshair, full strength), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
+| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). `time <hours|noon|night|...>`. For survival tests: `aim <pitch> [yaw]`, `turn <deg>` (the view, to the right), `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears; **put it right after `aim`**: in a capture the targeted block is only worked out by `aim`, and a `wait` or another command in between leaves nothing targeted), `throw`, `open inventory/creative [tab]`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `fuel infinite [on|off]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `brake [on|off]` (the HUD's brake button), `vehicle <plane|rover|rocket|digger|probe|gate> [m]`, `power [percent]` (the flown vehicle's batteries), `power infinite [on|off]`, `drill [on|off]`, `vehicle take <x> <y> <z>` (breaks that part off the nearest vehicle, as a click would), `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Factory tests: `factory` (counts, networks, what the containers on conveyors hold), `factory demo` (a ready-made factory ahead), `factory stress [lines] [length]` (that many conveyors from full chests), `factory turn` (= R on a conveyor), `factory industry` (oil, a miner, silicon, wire and power ahead), `factory open <machine|power>` (that screen, within reach), `factory recipe <item>` (the nearest machine that can make it does), `factory power|chemistry|nuclear` (ready-made steam and wind, acid, reactor ahead), `factory fill <fluid> [l]`, `factory drain`, `factory fluids`. To see a demo, build it then `net nudge -9` (step back; works offline) and `aim -6`; a flat spawn: `ASTRO_SPAWN=-74,-173` (plains). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net vessels` (each vessel: who flies it, parked or moving, height over the terrain), `tp <who>` (go to that player), `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net punch` (strike the player in the crosshair, full strength), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
 | `ASTRO_MENU=1` | Start on the main menu even in a capture (otherwise captures and runs with `ASTRO_SPAWN`, `ASTRO_MODE`, `ASTRO_TIME` or `ASTRO_COMMANDS` go straight into an unsaved world). Menu tests: `menu <main\|worlds\|create\|settings\|pause>`, `world create <name> [seed] [mode]`, `world load <name>`, `world leave`, `save`, `settings [vsync on\|off] [fps <n>] [volume <0-100>] [sensitivity <25-400>] [smoothing on\|off]`. |
 | `ASTRO_SAVE_DIR=<folder>` | Where worlds and settings are kept. **Automated tests must set this**: a capture without it can't save at all, so it can't touch the owner's worlds. |
 | `ASTRO_STEAM=1` | Use Steam even in a capture. Off by default there: a test run would show the owner as playing on their account. |
@@ -159,9 +165,11 @@ src/
     factories.rs    the factory side of the game: turning conveyors, `factory` console commands, the demos
   factory/
     mod.rs          Factory: conveyors (and their bends), machines (generators, accumulators, furnaces, miners,
-                    pumps, recipe machines), poles, cables, power networks and their history; links, stepping,
-                    saving, what other players are sent
-    recipes.rs      what the refinery, arc furnace, assembler and chip fab make, and from what
+                    pumps, recipe machines, steam and wind, the reactor), big machines' cells (`footprint`),
+                    poles, cables, power networks and their history; links, stepping (fluids, power, heat,
+                    conveyors), saving, what other players are sent
+    fluids.rs       Fluid, tanks, pipes and pipe networks
+    recipes.rs      what the recipe machines make (items and fluids), and from what: every production chain
     draw.rs         items riding on conveyors (round bends), cables
   player/
     mod.rs          Player: inertial-frame physics, voxel collision, modes, rails warp, fall height
@@ -239,7 +247,8 @@ src/
     block.rs        Block enum, textures per face, tint kind, opaque / solid / model, icon faces, names
     textures.rs     procedurally generated 16x16 textures: blocks, then item / tool / interface sprites (Tex enum = array layer);
                     textures/industry.rs: oil shale, the machines' fronts, what factories make (every new Tex needs its own arm:
-                    an armor fallback catches the rest)
+                    an armor fallback catches the rest); textures/icons.rs: the machines' pictures for the interface
+                    (`IconTex`, layers after every Tex; `Tex` is `repr(u8)` and nearly full: 242 of 256)
 shaders/
   block.vert/.frag  blocks and models (variants WATER, FAR; FAR also does cutout sprites); HDR lighting from the atmosphere LUTs; target outline
   atmosphere.glsl   shared: frame uniforms, LUT access, medium (#include'd; build.rs resolves includes)
@@ -391,9 +400,10 @@ shaders/
   camera-relative position.
 - Texture alpha is the biome tint mask for opaque blocks and opacity for water. For item
   sprites (`Tex::Stick` onwards) it is transparency.
-- UI vertices: layer `u32::MAX` means the font atlas. Otherwise bits 0-7 are the layer, bits
-  8-15 a brightness (0 = full), and bit 31 marks a sprite (`ui/mod.rs` and `ui.frag`
-  must agree).
+- UI vertices: layer `u32::MAX` means the font atlas. Otherwise bits 0-11 are the layer, bits
+  16-23 a brightness (0 = full), and bit 31 marks a sprite (`ui/mod.rs` and `ui.frag`
+  must agree). The interface reaches past layer 255, to its own pictures (`IconTex`): block
+  vertices can't, so a mesh in the world never uses them.
 
 ### World generation overview (terrain.rs)
 - `sample_column(dir)` builds each column from these layers:
@@ -415,6 +425,8 @@ shaders/
   - ilmenite (titanium) placer sand on some beaches
   - oil shale 6-90 m down under deserts, badlands, plains, savanna and tundra, rolled only in what
     the other ores leave of the roll (`choose_ore`), so no existing vein moved
+  - after oil, again in what is left: sulfur round volcanoes (and a little 150-900 m down
+    anywhere), galena (lead) and fluorite in mountains, saltpeter just under deserts and badlands
 - Caves exist at every depth, down to the centre. There are two kinds: spaghetti tunnels (two
   noise fields both near zero) and "cheese" caverns.
   - `cave_noise(face, u, v, k, n)` uses parameters that change smoothly with radius, so there
@@ -702,7 +714,9 @@ shaders/
     files into `target/sounds` to listen to.
 - **Drops** (`survival/drops.rs`) fall and slide in the body frame, are picked up within 1.6 m (after
   a short delay when thrown), and despawn after 5 minutes. Blocks render as small cubes,
-  items as crossed cutout sprites.
+  items as their sprite standing up one pixel thick (`models::extruded_sprite`, as held), and
+  machines with a picture (`Icon::Picture`) as their model made small. They bob and turn slowly
+  (`Drop::spin`, the draw's rotation about up; the mesh is built once).
 - **Furnaces** keep working when nobody watches, and under time warp (`Furnace::update`
   steps from event to event). Fuel: coal 80 s, logs and planks 15 s, sticks 5 s. Smelting
   takes 10 s per item.
@@ -724,7 +738,10 @@ shaders/
     above the hotbar. Armor is a faint second line. They turn red when low.
   - Hotbar: items in a quiet row, a dot for empty slots, an underline under the selection.
   - Blocks show as flat tiles in the UI, not isometric cubes. The targeted block gets a soft
-    light edge, not a dark outline.
+    light edge, not a dark outline. Machines whose faces say nothing on their own (the big
+    ones, pipes, pumps, tanks...) have a picture instead (`IconTex`, `textures/icons.rs`:
+    their silhouette in the sprites' style); `cargo test --release write_icons -- --ignored`
+    writes them all to `target/icons.bmp`. The structure test fails for a big machine without one.
   - Palette: off-white text, dim blue-grey labels, an amber accent for results and food.
 - **Motion:** the UI is immediate-mode, so animation state lives in `hud::HudAnim` and
   `screen::ScreenAnim` (owned by `Game`), built on `ui/anim.rs`.
@@ -957,16 +974,18 @@ shaders/
     - `IonEngine`: runs on electricity (`EngineKind::power`; its `exhaust` is infinite, so it burns
       no fuel). 600 N for 300 kg, and nothing in thick air (`Vacuum(0.0)`). It makes a faint blue
       glow (`effects::ion_exhaust`), not flames.
+    - `AntimatterDrive`: a rocket with an exhaust of 120 km/s (30 times a rocket engine's), 40 kN
+      for 1.5 t. It takes antimatter (a particle accelerator's) to build.
   - `VehicleDrill`: see Drills below.
   - Model blocks that may go on a vehicle (`is_vehicle_model`): the `Accumulator`, the
-    `CoalGenerator` and the `SolarPanel` (drawn with their world models), and doors.
+    `CoalGenerator`, the `SolarPanel` and the `Rtg` (drawn with their world models), and doors.
 - **Electricity** (`Vessel::charge`, `craft_physics`'s `Vessel::electricity`):
   - Batteries: the core holds `CORE_BATTERY` (1 MJ), and each accumulator aboard
     `ACCUMULATOR_BATTERY` (5 MJ).
   - Sources: solar panels make `SOLAR_POWER` by how square on to the sun they are
     (`Bodies::sunlight`: 1 at home, falling as 1 / distance^2, 0 in the planet's or the moon's
     shadow). Generators burn the tanks' fuel (`FUEL_ENERGY` per kg), only for what the batteries
-    and the draw still want.
+    and the draw still want. RTGs make `RTG_POWER` (10 kW) each, always.
   - Users: driven wheels take work done × `DRIVE_COST` plus `MOTOR_IDLE` each; that is
     gameplay-tuned, about 20 kW for a rover at full speed. Ion engines take `power` × throttle,
     drills `DRILL_POWER` each, and a big door `BIG_DOOR_ENERGY` per move.
@@ -1062,9 +1081,10 @@ shaders/
   - `Miner` (60 kW): brings up what is under it for ever, `MINE_TIME` (2.5 s) an item: the best
     ore within `MINER_DEPTH` (8) layers below and a column round it (`ore_rank`), else what the
     block under it drops (`mined_from`). Decided when it is placed (`resource_under`, from loaded
-    chunks; the placer sends it as a `WorldEvent::Machine`). The ground isn't dug away. Its model
-    is a drilling rig `MINER_HEIGHT` (5) blocks tall: placing one needs the cells over it open, and
-    nothing can be placed inside it (`Survival::place`); only its bottom cell is solid.
+    chunks; the placer sends it as a `WorldEvent::Machine`). The ground isn't dug away. It is a
+    big machine (see "Fluids, power and nuclear"): a drilling rig 3 x 3 and 5 tall, the drill
+    down its middle cell. Miners from before (one cell) are picked back up into an item when
+    a world loads (`Survival::pick_up_old_miners`).
   - `OilPump` (50 kW): crude oil, `PUMP_TIME` (3 s) a barrel, if there is `OilShale` within
     `PUMP_DEPTH` (24) layers below.
   - Recipe machines (`factory/recipes.rs`, picked on their screen; each ingredient has its own
@@ -1075,7 +1095,13 @@ shaders/
     The chains are at the top of `recipes.rs`; `every_ingredient_can_be_made` checks they close.
   - Crafted at the workbench (`crafting::factory_recipes`): the miner (with an iron pickaxe), pump,
     refinery, arc furnace and assembler from metal, glass and furnaces; the chip fab needs circuit
-    boards and an assembler, the accumulator batteries.
+    boards and an assembler, the accumulator batteries. The fluid, power and nuclear machines:
+    `crafting::power_recipes` (see "Fluids, power and nuclear" below).
+  - A recipe may also take fluids (`Recipe::fluids`, into the machine's input tanks), make a
+    second item (`extra`, into `Machine::extra`, its own slot; conveyors take from it too) and
+    fluids (`fluid_out`). A recipe is known by what it makes (`output`; a fluid's is
+    `Item::Fluid`, an item that only ever names a fluid), so a machine has one recipe for each
+    product (`every_ingredient_can_be_made` checks). A machine with only one recipe is set to it.
 - **Power:** cables make networks (union-find in `relink`). Each tick a network's generators make
   their full power, its machines with something to do ask for theirs and get it first (all slowed
   alike when there isn't enough: `Machine::supply`), the rest charges accumulators (shared by how
@@ -1125,13 +1151,112 @@ shaders/
 - **Trying it:** `factory industry` builds a row ahead (oil pump over oil shale into a refinery,
   a miner on a bent belt, sand and coal through an arc furnace into a chip fab, copper into an
   assembler; four generators, an accumulator, one pole). `factory open <machine|power>`,
-  `factory recipe <item>`, `factory status` (each machine's state).
+  `factory recipe <item>`, `factory status` (each machine's state). `factory power`,
+  `factory chemistry`, `factory nuclear`: see below.
 - Tests: `factory::tests` (items into a furnace, belt speed, what a line takes, power over a cable
   and shared, generators always running, accumulators, an assembler fed by a line, one line
   bringing two ingredients, a miner, bends, every ingredient can be made, side joins, without
   authority, saving and what clients are sent, a big factory, solar panels by day, a big door's
-  motor and infinite power); `models::tests` (`machines_move_while_they_work`, `doors_open`, every
-  model and moving part fits).
+  motor and infinite power, and the fluid and power tests below); `models::tests`
+  (`machines_move_while_they_work`, `doors_open`, every model and moving part fits);
+  `crafting::tests::every_recipe_crafts_what_it_says` (no pattern hides another) and
+  `everything_can_be_made_or_found` (every item in the game comes from the ground, an animal, a
+  workbench, a furnace or a machine).
+
+### Fluids, power and nuclear (factory/fluids.rs, factory/mod.rs, factory/recipes.rs)
+- **Big machines** fill a block of cells round the one they were put on (`Block::structure`: cells
+  out each way, cells up; `factory::footprint`, the first cell first): `Blender` and
+  `NuclearReactor` 5 x 5 (4 and 5 tall), `Miner` (5 tall), `SteamTurbine`, `CoolingPool`, `ReprocessingPlant` 3 x 3,
+  `ParticleAccelerator` 7 x 7, and the tall `WindTurbine` (8), `Centrifuge` (3), `Electrolyzer`,
+  `Boiler`, `StorageTank` (2).
+  - Every cell is its own model block (as a door's), `ModelState::offset` saying how far from the
+    first; only the first draws the machine (`is_core`) and is the factory's machine. The factory
+    maps every other cell to it (`Factory::parts`, `core`, worked out in `add` or, for a saved game,
+    `locate`), so conveyors, pipes, cables, clicks and the HUD find it from any cell.
+  - Placing one (`place_structure`) needs every cell clear and on one face and shell (else "No
+    room"); breaking any cell breaks all of them and gives one back (`structure_unit`).
+  - Models (`render/models.rs`) are built in the first cell's frame and reach out past it; their
+    boxes are cut along the block grid (`tiled_quads`) so their texels stay in range.
+- **Fluids** (`Fluid`, 13 of them; litres): water, steam, sulfuric, nitric and hydrofluoric acid,
+  hydrogen, oxygen, uranium hexafluoride (natural and enriched), dissolved fuel, loaded solvent,
+  liquid waste, solvent. Never carried, only piped (`Item::Fluid` only names one in recipes).
+  - A machine's `tanks`: two in (`fluid_input`: what each takes and holds) and two out
+    (`output_holds`); a `StorageTank` (`TANK_HOLDS`, 20,000 l) uses the first.
+  - `Pipe`s join the ways they were built to (`Pipe::ways`, saved): where one is put down
+    (`Factory::pipe_ways`, from `Survival::pipe_start`) it joins the pipe or machine with tanks it
+    was clicked against, whatever is in front of its open ends (`Pipe::open_ends`: straight on
+    from its one way, or both ways along `axis`, the way the player looked, while it has none),
+    and pipes whose open ends or ways point at it. A way left after what was there went is a
+    socket: what is put there joins. A machine put in front of open ends joins them
+    (`Factory::add`). Joined pipes are a line (`relink_pipes`, `FluidNet`), with the machines
+    they join. Pipes from older saves, and ready-made factories' pipes by default, join all they
+    touch (`ways` None, worked out once; `build_ahead` takes `PIPE_*` ways). The placer sends the
+    ways in `ModelState::links` (with `survival::BUILT_WAYS`); `set_pipe_ways` joins them back.
+  - A line's pipes (`PIPE_HOLDS` each) and storage tanks are one pool (`step_fluids`, each tick
+    before power): what wants its fluid takes first (shared alike), then what was made of it goes in.
+  - One fluid to a line (`Pipe::carries`, the tag kept at 0 l): an empty line takes only what
+    something on it wants (or anything with a tank on it), so an electrolyzer's oxygen goes to the
+    blender and its hydrogen to a tank. Pipes of different fluids don't join even when built to;
+    a line carrying nothing yet joined to one carrying something carries that too (if all it is
+    joined to agree). A carrying line joins only machines that use its fluid (`Machine::uses`:
+    take, make, hold; a storage tank holding nothing else); a recipe changed rejoins them
+    (`piped_recipes`). Empty, with nothing on it using its fluid, a line is free for any again.
+  - The model (`models::pipe`, never turned): a round run with collars at its joins, a capped end
+    where it stops, a fitting where it turns or branches, a flange on a machine
+    (`ModelState::ports`) and a band in its fluid's colour (`ModelState::fluid`); on its own along
+    `ModelState::axis`. `pipes_changed` updates them after every relink. Textures `PipeSteel`,
+    `PipeFitting`; the band is `Lamp` tinted.
+  - The HUD on a pipe: its fluid, how much the line (with its tanks) holds, the machines on it.
+  - Screens show each tank as a line in the fluid's colour (`Machine::gauges`, `gauge_count`), and
+    a storage tank's model a gauge (`ModelState::fluid`, `level`).
+- **Power sources** (all make their power whether used or not, like generators):
+  - `WaterPump` (30 kW): `PUMP_RATE` (300 l/s) of water if there is water beside it or just under
+    it (`resource_under`).
+  - `Boiler`: burns fuel (`BOILER_GAIN`: half as much again out of it as a generator) into
+    `BOILER_HEAT` (1.2 MW) of steam, as far as its water and room for steam allow.
+  - `GeothermalWell`: `GEOTHERMAL_HEAT` (2 MW) of steam from water, with lava or molten rock within
+    a few cells, or anywhere deeper than `GEOTHERMAL_DEPTH` (150 m under the sea).
+  - `SteamTurbine`: steam (`STEAM_ENERGY`, 100 kJ a litre) into up to `TURBINE_POWER` (5 MW),
+    giving back nine tenths as water (let off if nothing takes it).
+  - `WindTurbine`: `wind_power` of the wind at its hub (up to `WIND_POWER`, 150 kW, from
+    `WIND_RATED` 11 m/s; it stops past `WIND_CUT_OUT`). The game sets `Machine::wind` every frame
+    from the weather where it stands (`Factory::set_wind`: the surface wind x `HUB_WIND`, more the
+    higher it stands). Only home has weather: none on the moon.
+  - `Rtg`: `RTG_POWER` (10 kW) for ever, in a factory or on a vehicle.
+- **The reactor** (`step_heat`): it burns fuel rods (`rod_energy`: a uranium rod is 200 s at
+  `REACTOR_HEAT` 25 MW, MOX half as long again; four at most from a conveyor), each going out as a
+  spent rod.
+  - It needs `MachineKind::power` (150 kW) for its pumps: without it its rods drop in. Its rods
+    move `ROD_SPEED` a second towards full while it has fuel, power and room for steam, else
+    towards none.
+  - Heat (fission plus decay heat, `DECAY_HEAT` of it dying away over `DECAY_TIME`) boils water
+    into steam; steam with no room is let off. What the water can't carry heats it
+    (`REACTOR_CAPACITY` per degree): `OVERHEATING` (800 °C) it warns (status, a red light),
+    `MELTDOWN` (1200 °C) it melts down (`Factory::meltdowns`, where `authority`; `Survival::meltdowns`
+    breaks all its cells with an explosion and leaves its floor lava). Dry at full power that is
+    about a minute.
+- **Chains** (all in `recipes.rs`, with how each goes at its top): sulfuric acid (sulfur, water,
+  oxygen) in a blender; nitric and hydrofluoric acid from it; alumina in a blender and aluminium in
+  an electrolyzer; titanium and zircon in an arc furnace, zirconium from zircon; concrete in a
+  blender; motors, turbine blades, superconducting magnets in an assembler. Nuclear: uranium ore
+  leached into yellowcake, hexafluoride, enriched in centrifuges (depleted uranium left), fuel rods
+  in a fuel fabricator; spent rods cooled in a cooling pool, then dissolved, extracted and stripped
+  in a reprocessing plant into recovered uranium and plutonium (MOX rods), liquid waste vitrified
+  in an arc furnace (`VitrifiedWaste`, a faintly glowing block). The particle accelerator (2.5 MW)
+  makes plutonium from depleted uranium, antimatter from hydrogen, gold from lead.
+- **Trying it:** `factory power` (a tank, a coal boiler and a steam turbine; a wind turbine and an
+  RTG), `factory chemistry` (an electrolyzer and a blender making sulfuric acid from a chest of
+  sulfur), `factory nuclear` (a reactor on a tank's water, two turbines, a generator to start it).
+  `factory fill <fluid> [l]` (the tank or machine you look at, else the nearest storage tank),
+  `factory drain` (every tank and pipe empty: try a meltdown), `factory fluids` (each line).
+- Tests: `a_boiler_and_a_turbine_make_power_from_water_and_coal`,
+  `a_reactor_boils_water_for_its_turbines`, `a_reactor_without_water_melts_down`,
+  `an_electrolyzer_sends_each_gas_down_the_line_that_wants_it`,
+  `wind_turbines_and_rtgs_make_power`, `a_big_machine_is_one_from_any_of_its_cells`,
+  `pipes_keep_what_they_hold_when_saved`, `pipe_lines_side_by_side_keep_apart`,
+  `pipes_turn_corners_and_join_what_their_ends_point_at`,
+  `an_empty_line_nothing_uses_carries_something_else` (`build_pipe` puts one down as a player
+  would); `survival::tests::a_big_machine_is_the_same_from_any_of_its_cells`.
 
 
 ### Two worlds: home and the moon (app/worlds.rs)
@@ -1446,15 +1571,22 @@ shaders/
   conveyor is its own draw: per-chunk batched model meshes (or instancing) are the next step for
   huge factories in view. A client's container changes race with the host's conveyors (the last
   whole-container message wins). Lights of the world you aren't on wait until you are back.
-  Miners and pumps never run out and don't dig the ground away. A recipe machine with more
-  outputs than one (a refinery making fuel and plastic together) isn't possible: each recipe has
-  one product. Computers and AI chips are only items so far (nothing uses them; AI servers were
-  taken out, and saves that had them load them as computers). A miner's rig is solid only in its
-  bottom cell: you can walk through the tower from a block beside it. Fuel burns in
+  Miners and pumps never run out and don't dig the ground away. A recipe makes at most one
+  product, one extra item and two fluids, and a machine has one recipe per product (recovered
+  uranium goes into MOX, not back into hexafluoride). Computers are used only by the reactor and
+  reprocessing plant, AI chips only by the accelerator. Fuel burns in
   generators and furnaces but doesn't fill a vehicle's tanks.
+- Fluids: never carried by hand or in barrels (only piped); a line still holding some of a fluid
+  keeps to it until that is used up (there is no way to flush it), and there are no valves
+  or pumps along a line (a line moves its fluid at once). A join can't be undone without taking
+  the pipe up, and an empty line placed against both of two different lines joins neither. A
+  pipe line passing a machine's side doesn't join it unless built to. Pipes don't join across a change in the grid deep down, and big machines can't
+  stand across a face edge or such a change. A wind turbine's blades aren't solid. A meltdown on
+  the world you aren't on waits until you are there. Radiation isn't modelled: spent fuel and
+  waste are only items and blocks.
 - Vehicles: no docking or staging, no parachutes, no water (they sink through it). Blocks with
   their own contents (chests, furnaces, torches, crafting tables) can't go on one, nor machines that
-  work items (only accumulators, coal generators, solar panels and doors). Walking aboard
+  work items (only accumulators, coal generators, solar panels, RTGs and doors). Walking aboard
   has no ladders: build steps of blocks. Deck gravity always points at the deck, even upside down.
   A vehicle can't plug into a factory's network to charge (panels, generators, or `power
   infinite`). Reaction wheels take no power. Ion engines draw power in thick air though they push
