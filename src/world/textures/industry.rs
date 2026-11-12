@@ -5,7 +5,9 @@
 //! shells with a lit top-left edge, and what makes each one itself glowing (cyan for data and
 //! light, amber for computing and power, violet for AI, mint for charge).
 
-use super::{Img, Rgb, Rng, TEX_SIZE, Tex, ingot, lump, noisy, panel, scale, speckle, sprite};
+use super::{
+    Img, Rgb, Rng, TEX_SIZE, Tex, disc, ingot, lump, noisy, panel, scale, speckle, sprite,
+};
 
 const INK: Rgb = [20, 23, 31];
 const SHELL: Rgb = [46, 52, 66];
@@ -727,7 +729,130 @@ pub(super) fn make(t: Tex, r: &mut Rng) -> Img {
                 _ => SHELL,
             })
         }),
+        Tex::VectorFace => {
+            // A nozzle in a gimbal ring (amber), its throat glowing faintly.
+            let mut img = disc(r, [92, 96, 106], [26, 24, 26], [200, 110, 50]);
+            ring(&mut img, 6.4, 7.4, AMBER);
+            img
+        }
+        Tex::AerospikeFace => {
+            // A dark plug with a ring of small burner ports round it.
+            let mut img = disc(r, [176, 180, 190], [56, 58, 66], [210, 214, 222]);
+            for i in 0..12 {
+                let a = i as f32 / 12.0 * std::f32::consts::TAU;
+                let (x, y) = (7.5 + 4.4 * a.cos(), 7.5 + 4.4 * a.sin());
+                img.set(x as usize, y as usize, [230, 120, 50], 0);
+            }
+            img
+        }
+        Tex::IonFace => {
+            // A grid of fine holes over a blue glow.
+            let mut img = noisy(r, [60, 66, 80], 0.03, 0);
+            for y in 0..TEX_SIZE {
+                for x in 0..TEX_SIZE {
+                    let (dx, dy) = (x as f32 - 7.5, y as f32 - 7.5);
+                    let d = (dx * dx + dy * dy).sqrt();
+                    if d < 6.3 {
+                        let hole = x % 2 == 0 && y % 2 == 0;
+                        let c = if hole { [150, 220, 255] } else { [38, 70, 120] };
+                        img.set(x, y, c, 0);
+                    } else if d < 7.4 {
+                        img.set(x, y, STEEL, 0);
+                    }
+                }
+            }
+            img
+        }
+        Tex::DrillFace => {
+            // The cutting head seen end on: a hard-faced cross with teeth round the rim.
+            let mut img = noisy(r, [70, 72, 78], 0.06, 0);
+            for y in 0..TEX_SIZE {
+                for x in 0..TEX_SIZE {
+                    let (dx, dy) = (x as f32 - 7.5, y as f32 - 7.5);
+                    let d = (dx * dx + dy * dy).sqrt();
+                    let cross = dx.abs() < 1.2 || dy.abs() < 1.2;
+                    if d < 2.0 {
+                        img.set(x, y, [230, 186, 40], 0);
+                    } else if cross && d < 7.0 {
+                        img.set(x, y, [196, 200, 210], 0);
+                    } else if d > 6.0 && ((x + y) % 3 == 0) {
+                        img.set(x, y, [210, 214, 222], 0);
+                    }
+                }
+            }
+            img
+        }
+        Tex::SolarCell => {
+            // Deep blue cells in a thin silver grid.
+            let mut img = noisy(r, [30, 52, 116], 0.05, 0);
+            for i in 0..TEX_SIZE {
+                for line in [0, 5, 10, 15] {
+                    img.set(i, line, [170, 178, 196], 0);
+                    img.set(line, i, [170, 178, 196], 0);
+                }
+            }
+            for y in 1..TEX_SIZE {
+                for x in 1..TEX_SIZE {
+                    if (x % 5 == 1) && (y % 5 == 1) {
+                        img.set(x, y, [76, 120, 210], 0);
+                    }
+                }
+            }
+            img
+        }
+        Tex::DoorPlanks => {
+            // Upright planks with a darker frame and two cross rails.
+            let mut img = noisy(r, [150, 108, 64], 0.06, 0);
+            for y in 0..TEX_SIZE {
+                for x in [0, 4, 8, 12] {
+                    img.shade(x, y, 0.8);
+                }
+                for x in [0, 15] {
+                    img.set(x, y, [96, 66, 38], 0);
+                }
+            }
+            for x in 0..TEX_SIZE {
+                for y in [0, 4, 11, 15] {
+                    img.set(x, y, [104, 72, 42], 0);
+                }
+            }
+            img
+        }
+        Tex::SlidingPanel => {
+            // A pale panel with a tall window and a dark handle groove.
+            let mut img = panel(r, [206, 212, 220]);
+            fill(&mut img, r, 4..=11, 2..=13, [120, 168, 196]);
+            fill(&mut img, r, 5..=6, 3..=7, [176, 214, 232]);
+            fill(&mut img, r, 13..=13, 5..=10, [60, 64, 72]);
+            img
+        }
+        Tex::ShutterPanel => {
+            // Steel slats.
+            let mut img = noisy(r, [128, 134, 146], 0.03, 0);
+            for x in 0..TEX_SIZE {
+                for y in [3, 7, 11, 15] {
+                    img.set(x, y, [70, 74, 84], 0);
+                }
+                for y in [0, 4, 8, 12] {
+                    img.shade(x, y, 1.18);
+                }
+            }
+            img
+        }
         _ => noisy(r, [255, 0, 255], 0.0, 0),
+    }
+}
+
+/// A ring from radius `inner` to `outer` about the middle of the image.
+fn ring(img: &mut Img, inner: f32, outer: f32, color: Rgb) {
+    for y in 0..TEX_SIZE {
+        for x in 0..TEX_SIZE {
+            let (dx, dy) = (x as f32 - 7.5, y as f32 - 7.5);
+            let d = (dx * dx + dy * dy).sqrt();
+            if (inner..outer).contains(&d) {
+                img.set(x, y, color, 0);
+            }
+        }
     }
 }
 
@@ -741,7 +866,7 @@ mod tests {
     #[ignore]
     fn write_industry_sprites() {
         const ZOOM: usize = 8;
-        let sprites = &Tex::ALL[Tex::CrudeOil as usize..];
+        let sprites = &Tex::ALL[Tex::CrudeOil as usize..=Tex::Computer as usize];
         let columns = 7;
         let rows = sprites.len().div_ceil(columns);
         let cell = TEX_SIZE * ZOOM + 8;

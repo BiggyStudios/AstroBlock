@@ -15,7 +15,10 @@
 use glam::{DMat3, DQuat, DVec3};
 
 use super::{
-    craft::{At, Craft, Massing, SPRING_REST, Stats, WHEEL_RADIUS, center},
+    craft::{
+        At, Craft, DRILL_POWER, FUEL_ENERGY, GENERATOR_POWER, Massing, SOLAR_POWER, SPRING_REST,
+        Stats, WHEEL_RADIUS, center,
+    },
     vessel::{
         CRASH_SPEED, Controls, Env, Ground, HEAT_REFERENCE_MASS, Landed, REFUEL_TIME, Vessel,
     },
@@ -98,6 +101,65 @@ const OVERLAP: f64 = 0.03;
 const STILL_SPEED: f64 = 0.25;
 const STILL_SPIN: f64 = 0.08;
 const STILL_TIME: f64 = 0.6;
+/// Driven wheels on electricity: what they take per joule of work they do (gameplay-tuned, as
+/// a real motor would empty a battery in seconds here: wheels are very strong), and what each
+/// takes just for being driven (W). A rover at full speed takes about 20 kW: a core's battery
+/// lasts it under a minute, an accumulator a few, and two solar panels in good sun keep up.
+const DRIVE_COST: f64 = 0.15;
+const MOTOR_IDLE: f64 = 300.0;
+
+impl Vessel {
+    /// Electricity for one step of `dt` while the vehicle asks for `draw` (W, before any
+    /// shortage): the panels make what the sun gives them, the generators burn fuel for what
+    /// the batteries and `draw` still want, and the batteries take or give the difference.
+    /// Returns the fuel the generators burned (kg).
+    pub(super) fn electricity(&mut self, craft: &Craft, draw: f64, dt: f64) -> f64 {
+        let s = &craft.stats;
+        if self.charge < 0.0 {
+            self.charge = s.battery;
+        }
+        let (sun, light) = self.sun;
+        let solar: f64 = if light > 0.0 {
+            s.solar
+                .iter()
+                .map(|n| (self.attitude * *n).dot(sun).max(0.0))
+                .sum::<f64>()
+                * SOLAR_POWER
+                * light
+        } else {
+            0.0
+        };
+        let used = draw * self.power_share;
+        let mut made = solar;
+        let mut burned = 0.0;
+        if s.generators > 0 && self.fuel > 0.0 {
+            let wanted = ((s.battery - self.charge) / dt + used - solar).max(0.0);
+            let output = wanted.min(GENERATOR_POWER * s.generators as f64);
+            burned = (output * dt / FUEL_ENERGY).min(self.fuel);
+            made += burned * FUEL_ENERGY / dt;
+        }
+        let before = self.charge;
+        self.charge = (self.charge + (made - used) * dt).clamp(0.0, s.battery);
+        self.power_draw = draw;
+        // (What is made counts as far as it goes somewhere: full batteries take nothing more.)
+        self.power_made = if self.charge >= s.battery {
+            used + (self.charge - before) / dt
+        } else {
+            made
+        };
+        burned
+    }
+
+    /// How much of what is asked for the next step gets: all of it while the batteries have
+    /// some, else what is being made, shared out.
+    fn power_share(&self) -> f64 {
+        if self.charge > 1.0 || self.power_draw <= 0.0 {
+            1.0
+        } else {
+            (self.power_made / self.power_draw).clamp(0.0, 1.0)
+        }
+    }
+}
 
 /// Lift for a surface with this much of the flow against it (the sine of its angle).
 fn lift(against: f64) -> f64 {
@@ -230,10 +292,18 @@ impl Vessel {
     ) {
         let bodies = env.bodies;
         let stats = &craft.stats;
-        if self.fuel <= 0.0 {
+        let electric_engines = stats.engines.iter().any(|e| e.kind.electric());
+        if self.fuel <= 0.0 && !electric_engines {
             self.throttle = 0.0;
         }
         let throttle = self.throttle.clamp(0.0, 1.0);
+        self.power_share = self.power_share();
+        let share = self.power_share;
+        // What it asks of the batteries this step (W).
+        let mut draw = 0.0;
+        if self.drilling {
+            draw += DRILL_POWER * stats.drills.len() as f64;
+        }
         // (For the eye: the front wheels turn with the stick even standing still, or in the
         // air; on the ground `meet_the_ground` says by how much at this speed.)
         self.steer = (controls.yaw * STEER_ANGLE) as f32;
@@ -246,6 +316,9 @@ impl Vessel {
                     let rate = stats.capacity / REFUEL_TIME;
                     self.fuel = (self.fuel + rate * dt).min(stats.capacity);
                 }
+                // (Parked, the panels still charge it, and a drill still runs down the batteries.)
+                let burned = self.electricity(craft, draw, dt);
+                self.fuel -= burned;
                 self.sync_landed(bodies, t + dt);
                 self.heating = 0.0;
                 self.pressure = 0.0;
@@ -277,20 +350,31 @@ impl Vessel {
             torque: DVec3::ZERO,
         };
 
-        // Engines.
+        // Engines. Those on electricity get what there is of it; gimballed ones can steer.
         let mut burn = 0.0;
+        let mut gimbal = 0.0;
         for e in &stats.engines {
             if throttle <= 0.0 {
                 break;
             }
-            let thrust = e.kind.thrust_at(relative_air, speed) * throttle;
+            let electric = e.kind.electric();
+            if !electric && self.fuel <= 0.0 {
+                continue;
+            }
+            let mut thrust = e.kind.thrust_at(relative_air, speed) * throttle;
+            if electric {
+                draw += e.kind.power * throttle;
+                thrust *= share;
+            } else {
+                burn += thrust / e.kind.exhaust;
+            }
+            gimbal += thrust * e.kind.gimbal.sin() * (e.position - m.com).length();
             load.add(e.position, e.push * thrust);
-            burn += thrust / e.kind.exhaust;
         }
         let push = attitude * load.force / m.mass;
 
         // Who is asking for what turn: the pilot, else SAS.
-        let (asked, flaps) = self.steering(craft, &m, spin, air, controls, target);
+        let (asked, flaps) = self.steering(craft, &m, spin, air, controls, target, gimbal);
         let plan = FlapPlan::new(stats, m.com, flaps);
         self.flaps.clear();
         self.flaps.extend(stats.surfaces.iter().map(|s| {
@@ -396,15 +480,26 @@ impl Vessel {
         if let Some(ground) = env.ground
             && ground.body == self.body
         {
-            self.meet_the_ground(craft, &m, ground, env, controls, t + dt, dt);
+            draw += self.meet_the_ground(craft, &m, ground, env, controls, t + dt, dt);
         }
-        let running = self.throttle > 0.0 && self.fuel > 0.0 && !stats.engines.is_empty();
+        // Electricity, and the fuel the generators burned for it.
+        let burned = self.electricity(craft, draw, dt);
+        if burned > 0.0 {
+            let before = craft.massing(self.fuel).com;
+            self.fuel = (self.fuel - burned).max(0.0);
+            self.position += self.attitude * (craft.massing(self.fuel).com - before);
+        }
+        let running = self.throttle > 0.0
+            && (self.fuel > 0.0 || electric_engines)
+            && !stats.engines.is_empty();
         self.settle_craft(bodies, t + dt, controls, running, dt);
         self.change_soi(bodies, t + dt);
     }
 
-    /// What the pilot and SAS want: the torque from reaction wheels (grid axes), and what the
-    /// flaps should do (a wanted change in angular velocity).
+    /// What the pilot and SAS want: the torque from reaction wheels and gimballed engines
+    /// (`gimbal`: the most those can give, N m) in grid axes, and what the flaps should do (a
+    /// wanted change in angular velocity).
+    #[allow(clippy::too_many_arguments)]
     fn steering(
         &mut self,
         craft: &Craft,
@@ -413,8 +508,10 @@ impl Vessel {
         air: DVec3,
         controls: &Controls,
         target: Option<DVec3>,
+        gimbal: f64,
     ) -> (DVec3, DVec3) {
         let s = &craft.stats;
+        self.gimbal = DVec3::ZERO;
         let pilot = s.right * controls.pitch + s.forward * controls.roll - s.up * controls.yaw;
         let wanted: Option<DVec3> = if controls.any() {
             self.hold = None;
@@ -453,18 +550,23 @@ impl Vessel {
             self.hold = None;
         }
         let change = (wanted - spin) / SAS_RESPONSE;
-        // Reaction wheels: as much of that as they have.
+        // Reaction wheels and gimbals: as much of that as they have.
         let torque = m.inertia * change;
-        let most = s.gyro_torque;
+        let most = s.gyro_torque + gimbal;
         let torque = if torque.length() > most {
             torque * (most / torque.length())
         } else {
             torque
         };
+        if gimbal > 0.0 {
+            // (For the eye: the nozzles swing by how much of their reach this takes.)
+            self.gimbal = (torque / most).clamp_length_max(1.0);
+        }
         (torque, change.clamp_length_max(1.0))
     }
 
-    /// Wheels on their springs, then the hull's corners.
+    /// Wheels on their springs, then the hull's corners. Returns the electricity the driven
+    /// wheels asked for (W).
     #[allow(clippy::too_many_arguments)]
     fn meet_the_ground(
         &mut self,
@@ -475,13 +577,15 @@ impl Vessel {
         controls: &Controls,
         t: f64,
         dt: f64,
-    ) {
+    ) -> f64 {
         let planet = ground.planet;
         let stats = &craft.stats;
         let top = planet.layer_radius(planet.layers as f64) + 2.0;
+        let mut draw = 0.0;
         if self.position.length() - stats.radius - m.com.length() > top {
-            return;
+            return draw;
         }
+        let power = self.power_share;
         let frame = env.bodies.frame(ground.body, t);
         let omega = frame.rotation * frame.omega;
         let attitude = self.attitude;
@@ -506,9 +610,13 @@ impl Vessel {
         let share = m.mass / count;
         let stiffness = share * gravity / SPRING_REST;
         let damping = 2.0 * 0.7 * (stiffness * share).sqrt();
-        let reach = WHEEL_RADIUS + SPRING_REST;
         let ahead = stats.forward;
         for wheel in &stats.wheels {
+            // A bigger wheel reaches further, climbs higher and grips a little more.
+            let bigger = wheel.radius - WHEEL_RADIUS;
+            let reach = wheel.radius + SPRING_REST;
+            let step_up = STEP_UP + bigger;
+            let grip = GRIP * (1.0 + 0.3 * bigger);
             let local = wheel.position - m.com;
             let origin = self.position + attitude * local;
             let down = attitude * DVec3::NEG_Y;
@@ -517,10 +625,10 @@ impl Vessel {
             let body_ahead = frame.to_body(attitude * ahead);
             // How far below the axle the ground is at a point `offset` along the vehicle. None:
             // out of reach, or a wall (it is solid even as high as a wheel can climb).
-            let span = reach + DROOP + STEP_UP;
+            let span = reach + DROOP + step_up;
             let steps = (span / 0.4).ceil() as usize;
             let surface = |offset: f64| {
-                let start = body_origin + body_ahead * offset - body_down * STEP_UP;
+                let start = body_origin + body_ahead * offset - body_down * step_up;
                 if solid(start) {
                     return None;
                 }
@@ -538,7 +646,7 @@ impl Vessel {
                                 lo = mid;
                             }
                         }
-                        return Some(hi - STEP_UP);
+                        return Some(hi - step_up);
                     }
                     lo = d;
                 }
@@ -582,14 +690,18 @@ impl Vessel {
             let (along, across) = (v.dot(roll), v.dot(side));
             // (A wheel that is hanging, or barely loaded, still has some: enough to drive a
             // vehicle off the step its hull has come to rest on.)
-            let most = GRIP * press.max(share * gravity * LEAST_GRIP);
+            let most = grip * press.max(share * gravity * LEAST_GRIP);
             // Grip builds up with how fast the tyre slides sideways, as a real one does.
             // (All or nothing, the rear wheels would cancel any turn the front ones start.)
             let lateral = -most * (across / SLIDE_SPEED).clamp(-1.0, 1.0);
             let mut drive = 0.0;
             if wheel.driven && controls.drive != 0.0 && !controls.brake {
+                // Electric motors: as hard as the electricity there is lets them.
+                // (What is asked for counts, not what it got: `electricity` shares it out.)
                 let limit = share * WHEEL_PULL.min(WHEEL_POWER / along.abs().max(1.0));
-                drive = controls.drive * limit;
+                let wanted = controls.drive * limit;
+                drive = wanted * power;
+                draw += (wanted.clamp(-most, most) * along).abs() * DRIVE_COST + MOTOR_IDLE;
             }
             let brake = if controls.brake {
                 (-along * share / dt.max(0.02)).clamp(-most, most)
@@ -646,7 +758,7 @@ impl Vessel {
             }
             if closing < -WRECK_SPEED {
                 self.destroyed = Some("crashed");
-                return;
+                return draw;
             }
             let leverage = |n: DVec3| 1.0 / m.mass + n.dot(turn(arm.cross(n)).cross(arm));
             let j = -(1.0 + BOUNCE) * closing / leverage(normal);
@@ -685,6 +797,7 @@ impl Vessel {
                 self.velocity += up * gravity * RIGHT_LIFT * dt;
             }
         }
+        draw
     }
 
     /// A block of a tree the world grew, in the way: noted for the game to knock down (the
@@ -1023,9 +1136,12 @@ mod tests {
         Vessel::built(bodies, Body::Planet, core, rotation, 0.0, craft)
     }
 
+    /// (With full batteries throughout: the tests of how it drives and flies aren't about
+    /// electricity. `run` is, see the tests of power.)
     fn step(v: &mut Vessel, env: &Env, t: &mut f64, seconds: f64, controls: &Controls) {
         let dt = 1.0 / 60.0;
         for _ in 0..(seconds / dt) as usize {
+            v.fill_charge();
             v.update(env, controls, (*t, *t + dt), None);
             *t += dt;
             if v.destroyed.is_some() {
@@ -1044,6 +1160,10 @@ mod tests {
     }
 
     fn rover() -> Craft {
+        rover_on(Block::Wheel)
+    }
+
+    fn rover_on(wheel: Block) -> Craft {
         let mut c = Craft::new(4);
         for (x, z) in [
             (1, 0),
@@ -1059,7 +1179,7 @@ mod tests {
         }
         assert!(c.place(part([0, 1, 0], Block::Seat, DVec3::Z)));
         for (x, z) in [(2, 0), (-2, 0), (2, 2), (-2, 2)] {
-            assert!(c.place(part([x, 0, z], Block::Wheel, DVec3::X)));
+            assert!(c.place(part([x, 0, z], wheel, DVec3::X)));
         }
         c
     }
@@ -1213,10 +1333,16 @@ mod tests {
 
     /// Drives at a step and reports how far up it got (m).
     fn climbs(height: i32) -> f64 {
+        climbs_with(height, Block::Wheel)
+    }
+
+    /// `climbs` on wheels of another kind.
+    fn climbs_with(height: i32, wheel: Block) -> f64 {
         let (planet, bodies) = setup();
         let ground = planet.sea_layer + 5;
         // Where it will be, and which way (in grid cells) is ahead of it.
-        let mut v = parked(&bodies, &planet, rover(), ground, 1.0);
+        let lift = crate::flight::craft::wheel_radius(wheel).unwrap_or(0.7) + 0.3;
+        let mut v = parked(&bodies, &planet, rover_on(wheel), ground, lift);
         let frame = bodies.frame(Body::Planet, 0.0);
         let at = frame.to_body(v.position);
         let ahead = frame.to_body(v.nose());
@@ -2033,5 +2159,228 @@ mod tests {
         assert!(v.spin.length() < 0.02, "still turning {}", v.spin.length());
         step(&mut v, &env, &mut t, 2.0, &Controls::default());
         assert!(held.dot(v.nose()) > 0.9999);
+    }
+
+    /// Like `step`, but the batteries are left as they are: these tests are about them.
+    fn run(v: &mut Vessel, env: &Env, t: &mut f64, seconds: f64, controls: &Controls) {
+        let dt = 1.0 / 60.0;
+        for _ in 0..(seconds / dt) as usize {
+            v.update(env, controls, (*t, *t + dt), None);
+            *t += dt;
+        }
+    }
+
+    /// A rover's wheels run on its batteries: driving empties them, and with them empty it
+    /// doesn't go (the brakes still work: no power needed).
+    #[test]
+    fn a_rover_runs_on_electricity_and_stops_without_it() {
+        let (planet, bodies) = setup();
+        let ground = planet.sea_layer + 5;
+        let world = Floor(ground);
+        let env = Env {
+            bodies: &bodies,
+            ground: Some(Ground {
+                body: Body::Planet,
+                planet: &planet,
+                world: &world,
+            }),
+            drag: true,
+        };
+        let mut v = parked(&bodies, &planet, rover(), ground, 1.0);
+        v.landed = None;
+        let mut t = 0.0;
+        run(&mut v, &env, &mut t, 2.0, &Controls::default());
+        let full = v.charge;
+        assert_eq!(full, crate::flight::craft::CORE_BATTERY);
+        let go = Controls {
+            drive: 1.0,
+            ..Default::default()
+        };
+        run(&mut v, &env, &mut t, 6.0, &go);
+        let used = full - v.charge;
+        assert!(ground_speed(&v, &bodies, t) > 8.0);
+        // (About 20 kW at full speed, less on the way up to it.)
+        assert!((10_000.0..200_000.0).contains(&used), "{used} J in 6 s");
+
+        // Stopped (brakes need no power) with flat batteries, it won't go again.
+        let brake = Controls {
+            brake: true,
+            ..Default::default()
+        };
+        run(&mut v, &env, &mut t, 6.0, &brake);
+        assert!(ground_speed(&v, &bodies, t) < 0.5);
+        v.charge = 0.0;
+        run(&mut v, &env, &mut t, 6.0, &go);
+        let speed = ground_speed(&v, &bodies, t);
+        assert!(speed < 0.5, "going {speed} m/s on no power");
+        assert_eq!(v.charge, 0.0);
+        assert_eq!(v.power_share, 0.0);
+    }
+
+    /// Solar panels charge the batteries by how square on to the sun they are, and not at all
+    /// in a shadow; a generator burns the tanks' fuel to top them up.
+    #[test]
+    fn panels_and_generators_charge_the_batteries() {
+        let mut c = Craft::new(4);
+        assert!(c.place(part([0, 1, 0], Block::SolarPanel, DVec3::Y)));
+        assert!(c.place(part([1, 0, 0], Block::Accumulator, DVec3::X)));
+        let (_, bodies) = setup();
+        let mut v = Vessel::built(
+            &bodies,
+            Body::Planet,
+            DVec3::X * 50_000.0,
+            DQuat::IDENTITY,
+            0.0,
+            c,
+        );
+        v.charge = 0.0;
+        let up = v.attitude * DVec3::Y;
+        v.sun = (up, 1.0);
+        let craft = v.craft.take().unwrap();
+        v.electricity(&craft, 0.0, 10.0);
+        let square = v.charge;
+        assert!((square - SOLAR_POWER * 10.0).abs() < 1.0, "{square}");
+        v.sun = ((up + v.attitude * DVec3::X).normalize(), 1.0);
+        v.electricity(&craft, 0.0, 10.0);
+        assert!(
+            v.charge - square < SOLAR_POWER * 10.0 * 0.75,
+            "at an angle, less"
+        );
+        let before = v.charge;
+        v.sun = (up, 0.0);
+        v.electricity(&craft, 0.0, 10.0);
+        assert_eq!(v.charge, before, "nothing in the dark");
+
+        // A generator: burns fuel only for what the batteries take.
+        let mut c = Craft::new(4);
+        assert!(c.place(part([1, 0, 0], Block::CoalGenerator, DVec3::X)));
+        assert!(c.place(part([0, 1, 0], Block::FuelTank, DVec3::X)));
+        let mut v = Vessel::built(
+            &bodies,
+            Body::Planet,
+            DVec3::X * 50_000.0,
+            DQuat::IDENTITY,
+            0.0,
+            c,
+        );
+        let fuel = v.fuel;
+        let craft = v.craft.take().unwrap();
+        v.electricity(&craft, 0.0, 1.0);
+        assert_eq!(v.fuel, fuel, "full batteries: nothing burned");
+        v.charge = 0.0;
+        let burned = v.electricity(&craft, 0.0, 1.0);
+        assert!(burned > 0.0 && v.charge > 0.0);
+        assert!((v.charge - burned * crate::flight::craft::FUEL_ENERGY).abs() < 1.0);
+    }
+
+    /// Something in space, its engines down (+Y up the grid), no air and no ground.
+    fn in_space(craft: Craft, bodies: &Bodies) -> Vessel {
+        let r = bodies.radius(Body::Planet) + 60_000.0;
+        let mut v = Vessel::built(
+            bodies,
+            Body::Planet,
+            DVec3::X * r,
+            DQuat::IDENTITY,
+            0.0,
+            craft,
+        );
+        v.landed = None;
+        v.sas = false;
+        v.spin = DVec3::ZERO;
+        v.velocity = DVec3::Y * 1_400.0;
+        v
+    }
+
+    /// Ion engines push very gently, for as long as there is power, and burn no fuel; with flat
+    /// batteries they don't push at all.
+    #[test]
+    fn ion_engines_run_on_power_alone() {
+        let (_, bodies) = setup();
+        let env = Env {
+            bodies: &bodies,
+            ground: None,
+            drag: false,
+        };
+        let mut c = Craft::new(2);
+        assert!(c.place(part([0, -1, 0], Block::IonEngine, DVec3::NEG_Y)));
+        let ion = crate::flight::craft::engine_kind(Block::IonEngine).unwrap();
+        // It can't even hold up its own weight at home.
+        assert!(ion.thrust < crate::flight::craft::part_mass(Block::IonEngine) * 9.81 * 0.5);
+        let mut v = in_space(c, &bodies);
+        v.throttle = 1.0;
+        let mut t = 0.0;
+        let (before, nose) = (v.velocity, v.nose());
+        let fuel = v.fuel;
+        run(&mut v, &env, &mut t, 5.0, &Controls::default());
+        // (What gravity did along the nose comes off.)
+        let g = bodies.gravity(Body::Planet, v.position).dot(nose) * 5.0;
+        let pushed = (v.velocity - before).dot(nose) - g;
+        let expected = ion.thrust / v.mass() * 5.0;
+        assert!(
+            pushed > 0.5 * expected && pushed < 1.5 * expected,
+            "{pushed} vs {expected}"
+        );
+        assert_eq!(v.fuel, fuel);
+        assert!(
+            v.charge < crate::flight::craft::CORE_BATTERY,
+            "it used power"
+        );
+        assert!(v.engines_on());
+
+        // Flat: nothing.
+        v.charge = 0.0;
+        run(&mut v, &env, &mut t, 0.2, &Controls::default());
+        let before = v.velocity;
+        let nose = v.nose();
+        run(&mut v, &env, &mut t, 5.0, &Controls::default());
+        let pushed = (v.velocity - before).dot(nose);
+        // (Gravity still pulls; it should be the same as with no engine at all.)
+        let g = bodies.gravity(Body::Planet, v.position).dot(nose) * 5.0;
+        assert!(
+            (pushed - g).abs() < 0.05 * expected.max(0.01),
+            "{pushed} vs gravity {g}"
+        );
+    }
+
+    /// A gimballed engine steers with its thrust: under power it turns a long rocket much
+    /// faster than the core's reaction wheels alone can start it turning.
+    #[test]
+    fn vector_engines_steer_with_their_thrust() {
+        let (_, bodies) = setup();
+        let env = Env {
+            bodies: &bodies,
+            ground: None,
+            drag: false,
+        };
+        let turned = |engine: Block| {
+            let mut c = Craft::new(2);
+            for y in 1..=8 {
+                assert!(c.place(part([0, y, 0], Block::FuelTank, DVec3::X)));
+            }
+            assert!(c.place(part([0, -1, 0], engine, DVec3::NEG_Y)));
+            let mut v = in_space(c, &bodies);
+            v.throttle = 1.0;
+            let start = v.nose();
+            let mut t = 0.0;
+            let pitch = Controls {
+                pitch: 1.0,
+                ..Default::default()
+            };
+            run(&mut v, &env, &mut t, 0.6, &pitch);
+            start.dot(v.nose()).clamp(-1.0, 1.0).acos()
+        };
+        let (fixed, vectored) = (turned(Block::RocketEngine), turned(Block::VectorEngine));
+        assert!(
+            vectored > 2.0 * fixed,
+            "vectored {vectored} rad, fixed {fixed} rad"
+        );
+    }
+
+    /// Giant wheels climb a step two blocks high that ordinary ones can't.
+    #[test]
+    fn giant_wheels_climb_higher() {
+        assert!(climbs(2) < 0.8, "ordinary wheels don't climb two blocks");
+        let giant = climbs_with(2, Block::GiantWheel);
+        assert!(giant > 1.6, "got {giant} m up two blocks on giant wheels");
     }
 }

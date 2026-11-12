@@ -297,7 +297,7 @@ impl Item {
     pub fn all() -> Vec<Item> {
         let mut items: Vec<Item> = Block::ALL
             .iter()
-            .filter(|b| !matches!(b, Block::Air | Block::Water))
+            .filter(|b| !matches!(b, Block::Air | Block::Water) && !b.is_state())
             .map(|&b| Item::Block(b))
             .collect();
         items.extend([
@@ -355,7 +355,10 @@ impl Item {
                 | Block::CraftingTable
                 | Block::Furnace
                 | Block::Chest
-                | Block::Torch,
+                | Block::Torch
+                | Block::Door
+                | Block::SlidingDoor
+                | Block::BigDoor,
             ) => Category::Building,
             Item::Block(_) => Category::Terrain,
             Item::Tool(..) | Item::Armor(..) => Category::Gear,
@@ -685,6 +688,12 @@ pub fn mining(block: Block) -> Mining {
         CoalGenerator | ElectricFurnace | Miner | OilPump | Refinery | ArcFurnace | Assembler
         | ChipFab | Accumulator => m(3.5, Some(Pickaxe), Some(0)),
         OilShale => m(2.0, Some(Pickaxe), Some(0)),
+        LargeWheel | GiantWheel => m(0.8, None, None),
+        VectorEngine | Aerospike | IonEngine | VehicleDrill => m(1.2, None, None),
+        SolarPanel => m(1.5, Some(Pickaxe), None),
+        Door | DoorOpen => m(3.0, Some(Axe), None),
+        SlidingDoor | SlidingDoorOpen => m(2.0, Some(Pickaxe), None),
+        BigDoor | BigDoorOpen => m(3.5, Some(Pickaxe), None),
     }
 }
 
@@ -732,7 +741,7 @@ pub fn drops(block: Block, tool: Option<(ToolKind, Tier)>, roll: f32) -> Option<
         OakLeaves | SpruceLeaves | JungleLeaves => {
             return (roll < 0.05).then(|| ItemStack::one(Item::Stick));
         }
-        other => Item::Block(other),
+        other => Item::Block(other.as_item()),
     };
     Some(ItemStack::one(item))
 }

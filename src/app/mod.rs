@@ -152,6 +152,9 @@ struct Game {
     drag: bool,
     /// The tank of whatever you fly stays full (console: `fuel infinite`). Lasts the session.
     infinite_fuel: bool,
+    /// Vehicles' batteries stay full and factories never go short (console: `power infinite`).
+    /// Lasts the session.
+    infinite_power: bool,
     console: Console,
     /// Inventory, held item, screens, drops, placed models, furnaces, health.
     survival: Survival,
@@ -742,6 +745,7 @@ impl Game {
             player,
             drag: true,
             infinite_fuel: false,
+            infinite_power: false,
             console,
             survival: Survival::default(),
             audio,
@@ -1131,6 +1135,7 @@ impl Game {
         }
         self.place_aboard();
         let warped = self.time - start;
+        self.run_drills(warped as f32);
 
         let feet = self.player.body_position(&self.active_frame(self.time));
         self.place_camera();
@@ -1169,6 +1174,8 @@ impl Game {
             terrain: &self.terrain,
         };
         let gravity = self.gravity.acceleration(self.player.position).length();
+        let sun = self.bodies.sun_in_frame(self.active, self.time);
+        self.survival.set_power(sun, self.infinite_power);
         let messages = self.survival.update(
             &self.planet,
             &world,
@@ -1181,6 +1188,8 @@ impl Game {
             .spawn_mobs(&self.planet, &self.terrain, &world, &pose, warped);
         // (The other world goes on too: its furnaces and factories.)
         let net = self.survival.net;
+        let sun = self.bodies.sun_in_frame(self.other.body, self.time);
+        self.other.state.set_power(sun, self.infinite_power);
         self.other.state.run(&self.other.planet, warped, net);
         if let Some(message) = messages.into_iter().last() {
             self.message = Some((message, Instant::now()));

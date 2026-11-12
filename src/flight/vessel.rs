@@ -280,6 +280,40 @@ pub struct Vessel {
     pub moving: Vec<(Pivot, MeshHandle)>,
     #[serde(skip)]
     pub looks: Looks,
+    /// `looks` has been set to how the vehicle is (doors open or shut) when first drawn.
+    #[serde(skip)]
+    pub looks_started: bool,
+    /// Electricity in its batteries (J; see `Stats::battery`). Negative: full (a vehicle saved
+    /// before there was electricity).
+    #[serde(default = "full_battery")]
+    pub charge: f64,
+    /// Its drills are running.
+    #[serde(default)]
+    pub drilling: bool,
+    /// Electricity in the last step: what was asked for and what was made (W), and how much of
+    /// what was asked for the next step gets (0..1).
+    #[serde(skip)]
+    pub power_draw: f64,
+    #[serde(skip)]
+    pub power_made: f64,
+    #[serde(skip, default = "one")]
+    pub power_share: f64,
+    /// The way to the sun (inertial) and how strong its light is here (1 at home, 0 in a
+    /// shadow), worked out once a frame.
+    #[serde(skip)]
+    pub sun: (DVec3, f64),
+    /// How the gimballed engines' nozzles are swung (grid axes: the torque they give, as a
+    /// share of what they can).
+    #[serde(skip)]
+    pub gimbal: DVec3,
+}
+
+fn full_battery() -> f64 {
+    -1.0
+}
+
+fn one() -> f64 {
+    1.0
 }
 
 impl Vessel {
@@ -339,6 +373,14 @@ impl Vessel {
             steer: 0.0,
             moving: Vec::new(),
             looks: Looks::default(),
+            looks_started: false,
+            charge: 0.0,
+            drilling: false,
+            power_draw: 0.0,
+            power_made: 0.0,
+            power_share: 1.0,
+            sun: (DVec3::Y, 0.0),
+            gimbal: DVec3::ZERO,
         };
         vessel.sync_landed(bodies, t);
         vessel
@@ -357,6 +399,7 @@ impl Vessel {
         let mut vessel = Self::on_pad(bodies, body, core, t);
         let com = craft.massing(craft.stats.capacity).com;
         vessel.fuel = craft.stats.capacity;
+        vessel.charge = craft.stats.battery;
         vessel.landed = Some(Landed {
             position: core + rotation * com,
             attitude: rotation.normalize(),
@@ -397,8 +440,12 @@ impl Vessel {
             return;
         };
         let before = craft.massing(self.fuel).com;
+        if self.charge < 0.0 {
+            self.charge = craft.stats.battery;
+        }
         change(&mut craft);
         self.fuel = self.fuel.min(craft.stats.capacity);
+        self.charge = self.charge.min(craft.stats.battery);
         let shift = craft.massing(self.fuel).com - before;
         self.position += self.attitude * shift;
         if let Some(l) = &mut self.landed {
@@ -436,15 +483,90 @@ impl Vessel {
         self.fuel = full;
     }
 
-    /// The throttle is up and there is an engine with something to burn. (Not for use inside a
-    /// physics step: the craft is taken out of the vessel for that.)
+    /// The throttle is up and there is an engine with something to burn (or electricity, for
+    /// one that runs on it). (Not for use inside a physics step: the craft is taken out of the
+    /// vessel for that.)
     pub fn engines_on(&self) -> bool {
-        self.throttle > 0.0
-            && self.fuel > 0.0
-            && self
-                .craft
-                .as_ref()
-                .is_none_or(|c| !c.stats.engines.is_empty())
+        if self.throttle <= 0.0 {
+            return false;
+        }
+        match &self.craft {
+            None => self.fuel > 0.0,
+            Some(c) => c.stats.engines.iter().any(|e| {
+                if e.kind.electric() {
+                    self.charge != 0.0 || self.power_made > 0.0
+                } else {
+                    self.fuel > 0.0
+                }
+            }),
+        }
+    }
+
+    /// The engines that are pushing now, and how hard (0..1 of full thrust, by what they have
+    /// to burn).
+    pub fn running_engines(&self) -> Vec<(crate::flight::craft::Engine, f64)> {
+        let Some(c) = &self.craft else {
+            return Vec::new();
+        };
+        if self.throttle <= 0.0 {
+            return Vec::new();
+        }
+        c.stats
+            .engines
+            .iter()
+            .filter_map(|e| {
+                let power = if e.kind.electric() {
+                    self.power_share
+                } else if self.fuel > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                (power > 0.0).then_some((*e, power * self.throttle))
+            })
+            .collect()
+    }
+
+    /// Full batteries at once (`power infinite`).
+    pub fn fill_charge(&mut self) {
+        if let Some(c) = &self.craft {
+            self.charge = c.stats.battery;
+            self.power_share = 1.0;
+        }
+    }
+
+    /// How full the batteries are (0..1).
+    pub fn charge_share(&self) -> f64 {
+        match &self.craft {
+            Some(c) if c.stats.battery > 0.0 => {
+                if self.charge < 0.0 {
+                    1.0
+                } else {
+                    (self.charge / c.stats.battery).clamp(0.0, 1.0)
+                }
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// While nothing simulates it (parked, or coasting on rails): its panels and generators
+    /// still charge the batteries, over `dt` seconds.
+    pub fn charge_idle(&mut self, bodies: &Bodies, t: f64, dt: f64) {
+        let Some(craft) = self.craft.take() else {
+            return;
+        };
+        if craft.stats.solar.is_empty() && craft.stats.generators == 0 {
+            self.craft = Some(craft);
+            return;
+        }
+        self.sun = bodies.sunlight(self.body, self.position, t);
+        // (In steps, so a generator doesn't overshoot what the batteries take.)
+        let steps = (dt / 1.0).ceil().clamp(1.0, 64.0);
+        for _ in 0..steps as usize {
+            let burned = self.electricity(&craft, 0.0, dt / steps);
+            self.fuel = (self.fuel - burned).max(0.0);
+        }
+        self.craft = Some(craft);
     }
 
     /// Mass right now (kg).
@@ -619,6 +741,7 @@ impl Vessel {
     /// Follows the conic from `t0` to `t1`; returns the time reached (earlier if it had to
     /// stop for an atmosphere or a surface) and whether it stopped.
     pub fn rails(&mut self, bodies: &Bodies, (t0, t1): (f64, f64)) -> (f64, bool) {
+        self.charge_idle(bodies, t0, t1 - t0);
         if self.landed.is_some() {
             self.sync_landed(bodies, t1);
             return (t1, false);
@@ -668,6 +791,7 @@ impl Vessel {
         };
         let steps = ((t1 - t0) / step).ceil().clamp(1.0, 2400.0) as usize;
         let dt = (t1 - t0) / steps as f64;
+        self.sun = env.bodies.sunlight(self.body, self.position, t0);
         for i in 0..steps {
             if self.destroyed.is_some() {
                 return;

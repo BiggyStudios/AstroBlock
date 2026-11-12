@@ -2293,6 +2293,12 @@ impl Game {
         v.flaps.clear();
         v.flaps
             .extend(state.flaps.iter().take(surfaces).map(|&f| f as f32 / 127.0));
+        let battery = v.craft.as_ref().map_or(0.0, |c| c.stats.battery);
+        if state.charge.is_finite() {
+            v.charge = (state.charge as f64).clamp(0.0, battery);
+        }
+        v.drilling = state.drilling;
+        v.gimbal = glam::DVec3::from(state.gimbal.map(|g| g as f64 / 127.0));
     }
 
     fn got_pilot(&mut self, id: u32, pilot: Option<PlayerId>) {
@@ -2820,7 +2826,7 @@ fn vessel_is_sound(v: &Vessel) -> bool {
 fn craft_change_is_sound(change: &CraftChange) -> bool {
     let at = match change {
         CraftChange::Put(part) => part.at,
-        CraftChange::Take(at) | CraftChange::Crash(at) => *at,
+        CraftChange::Take(at) | CraftChange::Crash(at) | CraftChange::Door { at, .. } => *at,
     };
     at.iter().all(|c| c.abs() <= MAX_REACH)
 }
@@ -2855,6 +2861,12 @@ fn vessel_state(v: &Vessel, time: f64) -> VesselState {
         touching: v.touching,
         steer: v.steer,
         flaps: v.flaps.iter().map(|f| (f * 127.0).round() as i8).collect(),
+        charge: v.charge.max(0.0) as f32,
+        drilling: v.drilling,
+        gimbal: v
+            .gimbal
+            .to_array()
+            .map(|g| (g.clamp(-1.0, 1.0) * 127.0).round() as i8),
     }
 }
 
@@ -2866,7 +2878,8 @@ fn valid_event(planet: &Planet, event: &WorldEvent) -> bool {
         }
         WorldEvent::Chest { cell, .. }
         | WorldEvent::Furnace { cell, .. }
-        | WorldEvent::Turned { cell, .. } => valid_cell(planet, *cell),
+        | WorldEvent::Turned { cell, .. }
+        | WorldEvent::Door { cell, .. } => valid_cell(planet, *cell),
         WorldEvent::Machine { cell, machine } => {
             valid_cell(planet, *cell)
                 && machine.cell == *cell

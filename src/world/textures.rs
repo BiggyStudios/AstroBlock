@@ -223,6 +223,15 @@ textures! {
     PowerSupply,
     ComputerCase,
     Computer,
+    // More vehicle parts, solar panels and doors (block faces: alpha 0, never tinted).
+    VectorFace,
+    AerospikeFace,
+    IonFace,
+    DrillFace,
+    SolarCell,
+    DoorPlanks,
+    SlidingPanel,
+    ShutterPanel,
 }
 
 impl Tex {

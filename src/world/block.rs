@@ -132,6 +132,67 @@ pub enum Block {
     ChipFab,
     /// Stores power when there is more than is used, and gives it back when there isn't enough.
     Accumulator,
+    // More vehicle parts (only on a vehicle, like the ones above).
+    /// A driven wheel half as big again: climbs more, grips more.
+    LargeWheel,
+    /// A driven wheel more than twice as big, for heavy rovers.
+    GiantWheel,
+    /// A rocket engine on a gimbal: its thrust steers the vehicle.
+    VectorEngine,
+    /// A rocket engine that works as well in air as in vacuum, and sips fuel.
+    Aerospike,
+    /// Runs on electricity, not fuel: very little thrust for its weight, but it never runs dry
+    /// while there is power. Only in vacuum.
+    IonEngine,
+    /// Bores through whatever is in front of it, on power.
+    VehicleDrill,
+    /// Makes power from sunlight, in a factory or on a vehicle.
+    SolarPanel,
+    // Doors: each block is one cell of a door (a door is two cells tall, a big door three by
+    // three); the open ones are the same doors standing open (walked through).
+    /// Swings open on a hinge.
+    Door,
+    DoorOpen,
+    /// Slides aside.
+    SlidingDoor,
+    SlidingDoorOpen,
+    /// Three by three, rolls up on a motor: needs power.
+    BigDoor,
+    BigDoorOpen,
+}
+
+/// What kind of door a door block belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoorKind {
+    Hinged,
+    Sliding,
+    Big,
+}
+
+impl DoorKind {
+    /// Cells across and up.
+    pub fn size(self) -> (i32, i32) {
+        match self {
+            DoorKind::Big => (3, 3),
+            _ => (1, 2),
+        }
+    }
+
+    pub fn closed(self) -> Block {
+        match self {
+            DoorKind::Hinged => Block::Door,
+            DoorKind::Sliding => Block::SlidingDoor,
+            DoorKind::Big => Block::BigDoor,
+        }
+    }
+
+    pub fn opened(self) -> Block {
+        match self {
+            DoorKind::Hinged => Block::DoorOpen,
+            DoorKind::Sliding => Block::SlidingDoorOpen,
+            DoorKind::Big => Block::BigDoorOpen,
+        }
+    }
 }
 
 /// What a block sounds like (footsteps, breaking, placing).
@@ -161,7 +222,7 @@ pub enum Tint {
 
 impl Block {
     /// Every block, in declaration order.
-    pub const ALL: [Block; 74] = {
+    pub const ALL: [Block; 87] = {
         use Block::*;
         [
             Air,
@@ -238,18 +299,58 @@ impl Block {
             Assembler,
             ChipFab,
             Accumulator,
+            LargeWheel,
+            GiantWheel,
+            VectorEngine,
+            Aerospike,
+            IonEngine,
+            VehicleDrill,
+            SolarPanel,
+            Door,
+            DoorOpen,
+            SlidingDoor,
+            SlidingDoorOpen,
+            BigDoor,
+            BigDoorOpen,
         ]
     };
 
     /// Only exists on a vehicle: can't be placed in the world.
     pub fn is_vehicle_part(self) -> bool {
-        (Block::VehicleCore as u8..=Block::LandingGear as u8).contains(&(self as u8))
-            && self != Block::Hull
+        ((Block::VehicleCore as u8..=Block::LandingGear as u8).contains(&(self as u8))
+            && self != Block::Hull)
+            || (Block::LargeWheel as u8..=Block::VehicleDrill as u8).contains(&(self as u8))
     }
 
     /// Part of a factory (see `factory`): conveyors, poles and machines.
     pub fn is_factory(self) -> bool {
         self == Block::Conveyor || self.is_electric()
+    }
+
+    /// A cell of a door, and which kind; whether it stands open.
+    pub fn door(self) -> Option<(DoorKind, bool)> {
+        Some(match self {
+            Block::Door => (DoorKind::Hinged, false),
+            Block::DoorOpen => (DoorKind::Hinged, true),
+            Block::SlidingDoor => (DoorKind::Sliding, false),
+            Block::SlidingDoorOpen => (DoorKind::Sliding, true),
+            Block::BigDoor => (DoorKind::Big, false),
+            Block::BigDoorOpen => (DoorKind::Big, true),
+            _ => return None,
+        })
+    }
+
+    /// Exists only as the state of another block (an open door): never an item of its own.
+    pub fn is_state(self) -> bool {
+        self.door().is_some_and(|(_, open)| open)
+    }
+
+    /// The item it is as (an open door is the door).
+    pub fn as_item(self) -> Block {
+        match self.door() {
+            Some((kind, _)) => kind.closed(),
+            None => self,
+        }
     }
 
     /// Cables can run to it: poles and machines.
@@ -270,6 +371,7 @@ impl Block {
                 | Block::Assembler
                 | Block::ChipFab
                 | Block::Accumulator
+                | Block::SolarPanel
         )
     }
 
@@ -285,8 +387,9 @@ impl Block {
 
     /// Things walk into it (torches don't stop you).
     pub fn collides(self) -> bool {
-        // (A conveyor is a low belt you walk over, as you walk through a torch.)
-        self.is_solid() && !matches!(self, Block::Torch | Block::Conveyor)
+        // (A conveyor is a low belt you walk over, as you walk through a torch; an open door
+        // you walk through.)
+        self.is_solid() && !matches!(self, Block::Torch | Block::Conveyor) && !self.is_state()
     }
 
     /// Trees and cacti: a tornado takes several at a time, and vehicles knock down the ones
@@ -324,6 +427,7 @@ impl Block {
             self,
             Block::CraftingTable | Block::Furnace | Block::Torch | Block::Chest
         ) || self.is_factory()
+            || self.door().is_some()
     }
 
     /// Textures for (top, side, bottom) faces. "Top" is radially outward.
@@ -398,6 +502,15 @@ impl Block {
             CoalGenerator | ElectricFurnace | Miner | OilPump | Refinery | ArcFurnace
             | Assembler | Accumulator => [Tex::MachineTop, Tex::MachineSide, Tex::MachineSide],
             ChipFab => [Tex::CleanPanel, Tex::CleanPanel, Tex::CleanPanel],
+            LargeWheel | GiantWheel => all(Tex::Tire),
+            VectorEngine => all(Tex::VectorFace),
+            Aerospike => all(Tex::AerospikeFace),
+            IonEngine => all(Tex::IonFace),
+            VehicleDrill => all(Tex::DrillFace),
+            SolarPanel => [Tex::SolarCell, Tex::MachineSide, Tex::MachineSide],
+            Door | DoorOpen => all(Tex::DoorPlanks),
+            SlidingDoor | SlidingDoorOpen => all(Tex::SlidingPanel),
+            BigDoor | BigDoorOpen => all(Tex::ShutterPanel),
         }
     }
 
@@ -407,7 +520,7 @@ impl Block {
             Grass | SnowyGrass | Cactus => Material::Grass,
             Dirt => Material::Dirt,
             OakLog | SpruceLog | OakPlanks | SprucePlanks | CraftingTable | Chest | Torch
-            | PowerPole => Material::Wood,
+            | PowerPole | Door | DoorOpen => Material::Wood,
             Sand | RedSand | IlmeniteSand | Regolith | Ash => Material::Sand,
             Gravel => Material::Gravel,
             Snow => Material::Snow,
@@ -434,6 +547,7 @@ impl Block {
             Block::Assembler => [Tex::MachineTop, Tex::AssemblerFront, Tex::MachineSide],
             Block::ChipFab => [Tex::CleanPanel, Tex::FabFront, Tex::CleanPanel],
             Block::Accumulator => [Tex::MachineTop, Tex::AccumulatorFront, Tex::MachineSide],
+            Block::SolarPanel => [Tex::SolarCell, Tex::SolarCell, Tex::MachineSide],
             _ => {
                 let [top, side, _] = self.textures();
                 [top, side, side]
@@ -474,10 +588,17 @@ mod tests {
         for (i, b) in Block::ALL.iter().enumerate() {
             assert_eq!(*b as usize, i);
         }
-        assert_eq!(*Block::ALL.last().unwrap(), Block::Accumulator);
+        assert_eq!(*Block::ALL.last().unwrap(), Block::BigDoorOpen);
         assert!(Block::Assembler.is_machine() && Block::Assembler.is_model());
         assert!(!Block::OilShale.is_model() && !Block::OilShale.is_factory());
         assert!(Block::Wheel.is_vehicle_part() && !Block::Hull.is_vehicle_part());
         assert!(!Block::Conveyor.is_vehicle_part() && Block::Conveyor.is_model());
+        assert!(Block::IonEngine.is_vehicle_part() && Block::VehicleDrill.is_vehicle_part());
+        assert!(!Block::SolarPanel.is_vehicle_part() && Block::SolarPanel.is_machine());
+        // Doors: closed ones stop you, open ones don't; an open door is the door as an item.
+        assert!(Block::Door.collides() && !Block::DoorOpen.collides());
+        assert!(Block::BigDoorOpen.is_solid() && Block::BigDoorOpen.is_model());
+        assert_eq!(Block::SlidingDoorOpen.as_item(), Block::SlidingDoor);
+        assert!(!Block::BigDoor.is_factory() && !Block::Door.is_vehicle_part());
     }
 }

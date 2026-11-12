@@ -566,6 +566,38 @@ pub fn exhaust(at: DVec3, down: DVec3, velocity: DVec3, count: u32) -> [Particle
     ]
 }
 
+/// An ion engine's exhaust: a thin, fast, faint blue glow (`power` 0..1).
+pub fn ion_exhaust(
+    at: DVec3,
+    down: DVec3,
+    velocity: DVec3,
+    count: u32,
+    power: f32,
+) -> ParticleEmitter {
+    ParticleEmitter {
+        count,
+        origin: at + down * 0.2,
+        extent: Vec3::new(0.3, 0.3, 0.3),
+        velocity: (velocity + down * 30.0).as_vec3(),
+        spread: 0.6,
+        life: (0.12, 0.3),
+        size: (0.18, 0.4),
+        gravity: 0.0,
+        tint: [90, 170, 255, (90.0 + 120.0 * power) as u8],
+        light: (15, 15),
+        flags: flags::GLOW | flags::BLEND | flags::ROUND,
+        ..ParticleEmitter::default()
+    }
+}
+
+/// A drill biting into rock: chips of what it cuts, thrown off the face, and a little dust.
+pub fn drill_chips(block: Block, at: DVec3, out: DVec3, up: DVec3) -> ParticleEmitter {
+    let mut chips = mining_chips(block, at, out, up);
+    chips.count = 3;
+    chips.velocity = (out * 1.8 + up * 1.2).as_vec3();
+    chips
+}
+
 /// Exhaust smoke in the air: grey puffs that stop in the air and linger.
 pub fn smoke(at: DVec3, down: DVec3, velocity: DVec3, count: u32) -> ParticleEmitter {
     ParticleEmitter {

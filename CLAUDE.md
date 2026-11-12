@@ -72,12 +72,15 @@ follows their warp, or joins their team (a team warps as one).
 - **Time warp:** `.` and `,` raise and lower it (x1 up to x1,000,000), as in KSP. In a shared
   game it is your own (see `app/timeline.rs`).
 - **Vehicles** (planes, rockets, rovers, built from blocks): right click a vehicle core on top of a
-  block, then build onto it. R turns the next engine, wing or seat. Right click a seat to sit:
-  the first one in flies it, and F stands up. Walk around on it like anywhere else.
+  block, then build onto it. R turns the next engine, wing, seat, drill or panel. Right click a seat to sit:
+  the first one in flies it, and F stands up. Walk around on it like anywhere else. Right click a
+  door (on a vehicle or in the world) to open or close it.
   Flying: as for rockets, plus W/S drive wheels, A/D steer them, Space brakes while held (the HUD's
-  brake button stays on until clicked again), V sees from the seat. `vehicle <plane|rover|rocket>` in the console makes a ready-made one.
+  brake button stays on until clicked again), G runs the drills (or the HUD's drill button), V sees
+  from the seat. `vehicle <plane|rover|rocket|digger|probe|gate>` in the console makes a ready-made one.
   Nothing can be placed in a cell a vehicle has a part in (`vehicle_in_cell`; a second core neither).
-  `fuel infinite [on|off]` keeps the tank of whatever you fly full (`Vessel::fill_up`; not saved).
+  `fuel infinite [on|off]` keeps the tank of whatever you fly full (`Vessel::fill_up`; not saved);
+  `power infinite [on|off]` keeps its batteries full and gives every factory network all it asks for.
 - **Console teleports and time:** `tp <lat> <lon> [alt]`, or `tp <player>` in a shared game (beside
   them, on their world). `time <hours|sunrise|day|noon|sunset|night|midnight>` goes on to that local
   time through `clock_jump`, which carries you over the same ground (setting the clock alone left you
@@ -118,7 +121,7 @@ follows their warp, or joins their team (a team warps as one).
 | `ASTRO_WARP=<factor>` | Initial time warp. |
 | `ASTRO_FACE_SUN=1` | Turn the camera towards the sun's compass direction (sunset shots). |
 | `ASTRO_MODE=<mode>` | Starting game mode: survival (default), creative or spectator. **Use `spectator` for camera captures**: in survival you fall. |
-| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). `time <hours|noon|night|...>`. For survival tests: `aim <pitch> [yaw]`, `turn <deg>` (the view, to the right), `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears), `throw`, `open inventory/creative [tab]`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `fuel infinite [on|off]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `brake [on|off]` (the HUD's brake button), `vehicle <plane|rover|rocket> [m]`, `vehicle take <x> <y> <z>` (breaks that part off the nearest vehicle, as a click would), `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Factory tests: `factory` (counts, networks, what the containers on conveyors hold), `factory demo` (a ready-made factory ahead), `factory stress [lines] [length]` (that many conveyors from full chests), `factory turn` (= R on a conveyor), `factory industry` (oil, a miner, silicon, wire and power ahead), `factory open <machine|power>` (that screen, within reach), `factory recipe <item>` (the nearest machine that can make it does). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net vessels` (each vessel: who flies it, parked or moving, height over the terrain), `tp <who>` (go to that player), `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net punch` (strike the player in the crosshair, full strength), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
+| `ASTRO_COMMANDS="cmd;cmd"` | Console commands run 4 s after start, one per frame (e.g. `orbit 20`, `break`, `look`). `time <hours|noon|night|...>`. For survival tests: `aim <pitch> [yaw]`, `turn <deg>` (the view, to the right), `give <item> [n]`, `select <1-9>`, `place` (= right click: places, opens, eats, wears; **put it right after `aim`**: in a capture the targeted block is only worked out by `aim`, and a `wait` or another command in between leaves nothing targeted), `throw`, `open inventory/creative [tab]`, `summon <cow|pig|sheep>`, `hurt <n>`, `heal`, `swing [secs]` (a slow-motion first-person swing, to capture its phases), `rain [n/s]` (test rain, GPU particles). Flight tests: `rocket [m]`, `board`, `exit`, `throttle <0-1>`, `fuel [percent]`, `fuel infinite [on|off]`, `steer <pitch> <yaw> <roll> <drive>` (holds those controls), `brake [on|off]` (the HUD's brake button), `vehicle <plane|rover|rocket|digger|probe|gate> [m]`, `power [percent]` (the flown vehicle's batteries), `power infinite [on|off]`, `drill [on|off]`, `vehicle take <x> <y> <z>` (breaks that part off the nearest vehicle, as a click would), `sit`, `aboard [status]`, `cockpit`, `sas <mode|off>`, `orbit <km> [moon]` (in a rocket: puts it in orbit), `transfer` (plans a moon transfer node), `node <pro> [norm] [rad] [in s]`, `dive <m/s> [deg]` (reentry), `map`, `mapcam <yaw> <pitch> <km> [craft|home|moon]`, `chase <yaw> <pitch> <m>`, `lookat <moon|home|sun|rocket>`, `goto <moon|home> [lat lon]` (stand on that world's ground; on foot). Factory tests: `factory` (counts, networks, what the containers on conveyors hold), `factory demo` (a ready-made factory ahead), `factory stress [lines] [length]` (that many conveyors from full chests), `factory turn` (= R on a conveyor), `factory industry` (oil, a miner, silicon, wire and power ahead), `factory open <machine|power>` (that screen, within reach), `factory recipe <item>` (the nearest machine that can make it does). Weather tests: `weather` (what the sky is doing here), `weather <clear|fair|cloudy|fog|drizzle|rain|storm|snow|blizzard|sandstorm|tornado>` (holds that within 9 km until `weather auto`), `weather strike` (a bolt straight ahead), `weather approach [m]` (go to that far from the nearest tornado), `erupt` (the nearest volcano; prints where it is), `lookat <tornado|volcano>`. Multiplayer tests: `net host 127.0.0.1:<port>` (**bind to 127.0.0.1 in tests**: any other address raises a Windows Firewall prompt), `net join 127.0.0.1:<port>`, `net status`, `net vessels` (each vessel: who flies it, parked or moving, height over the terrain), `tp <who>` (go to that player), `net leave`, `net nudge <m>` (stand that far ahead), `net hit` (hit the nearest animal someone else simulates), `net punch` (strike the player in the crosshair, full strength), `net sync <who>`, `net follow <who>`, `net unfollow`, `net team <who>`, `net team leave` (who: player number or name), `lookat player`, `wait <s>` (holds up the rest of the command list). Run two captures at once, the client started later. The worker needs a moment: put a few dozen no-op commands (`heal`) between `weather tornado` and `lookat tornado`. Captures are silent (no audio device is opened). |
 | `ASTRO_MENU=1` | Start on the main menu even in a capture (otherwise captures and runs with `ASTRO_SPAWN`, `ASTRO_MODE`, `ASTRO_TIME` or `ASTRO_COMMANDS` go straight into an unsaved world). Menu tests: `menu <main\|worlds\|create\|settings\|pause>`, `world create <name> [seed] [mode]`, `world load <name>`, `world leave`, `save`, `settings [vsync on\|off] [fps <n>] [volume <0-100>] [sensitivity <25-400>] [smoothing on\|off]`. |
 | `ASTRO_SAVE_DIR=<folder>` | Where worlds and settings are kept. **Automated tests must set this**: a capture without it can't save at all, so it can't touch the owner's worlds. |
 | `ASTRO_STEAM=1` | Use Steam even in a capture. Off by default there: a test run would show the owner as playing on their account. |
@@ -178,7 +181,7 @@ src/
     models.rs       the animals' box models (many small tinted boxes, tiled coats) and their animation
   flight/
     vessel.rs       Vessel: the test rocket's physics (thrust, reaction wheels, SAS, drag, fins, reentry heat, landing, crashing, SOI changes, rails)
-    craft.rs        Craft: a vehicle's grid of parts, and what follows from them (mass, centre of mass, inertia, engines, wings, wheels)
+    craft.rs        Craft: a vehicle's grid of parts, and what follows from them (mass, centre of mass, inertia, engines, wings, wheels, batteries, panels, drills, doors)
     craft_physics.rs  a vehicle as one rigid body: engines and wings where they sit, wheels on springs, the hull against the ground
     craft_model.rs  a vehicle's mesh (rebuilt when its parts change, drawn turned into place); its moving pieces (`Pivot`, `Looks`)
     rocket_model.rs the rocket's box model (glows when hot)
@@ -942,6 +945,83 @@ shaders/
 - **Seats:** the first to sit flies it (`boarded`, as a rocket); anyone else aboard rides along
   and their clock is attached to the pilot's (`keep_ride`). Leaving the seat leaves the throttle
   where it is: an engine left on keeps running with nobody aboard (`Vessel::engines_on`).
+- **More parts:**
+  - Wheels: `LargeWheel` (1.1 m) and `GiantWheel` (1.6 m) beside `Wheel` (0.7). `wheel_radius` gives
+    each its own reach. A bigger wheel also climbs higher (`STEP_UP` plus the extra radius) and grips
+    a little more, so giant wheels climb two blocks.
+  - Engines (`engine_kind`):
+    - `VectorEngine`: a rocket engine on a gimbal. Its thrust adds steering torque beside the
+      reaction wheels (`steering`'s `gimbal`), and the bell swings as drawn (`Vessel::gimbal`).
+    - `Aerospike`: works the same in air as in vacuum, and goes further on its fuel than a rocket
+      engine.
+    - `IonEngine`: runs on electricity (`EngineKind::power`; its `exhaust` is infinite, so it burns
+      no fuel). 600 N for 300 kg, and nothing in thick air (`Vacuum(0.0)`). It makes a faint blue
+      glow (`effects::ion_exhaust`), not flames.
+  - `VehicleDrill`: see Drills below.
+  - Model blocks that may go on a vehicle (`is_vehicle_model`): the `Accumulator`, the
+    `CoalGenerator` and the `SolarPanel` (drawn with their world models), and doors.
+- **Electricity** (`Vessel::charge`, `craft_physics`'s `Vessel::electricity`):
+  - Batteries: the core holds `CORE_BATTERY` (1 MJ), and each accumulator aboard
+    `ACCUMULATOR_BATTERY` (5 MJ).
+  - Sources: solar panels make `SOLAR_POWER` by how square on to the sun they are
+    (`Bodies::sunlight`: 1 at home, falling as 1 / distance^2, 0 in the planet's or the moon's
+    shadow). Generators burn the tanks' fuel (`FUEL_ENERGY` per kg), only for what the batteries
+    and the draw still want.
+  - Users: driven wheels take work done × `DRIVE_COST` plus `MOTOR_IDLE` each; that is
+    gameplay-tuned, about 20 kW for a rover at full speed. Ion engines take `power` × throttle,
+    drills `DRILL_POWER` each, and a big door `BIG_DOOR_ENERGY` per move.
+  - Shortage: `power_share` is what everything gets. It is all while the batteries have some,
+    else what is made, shared out. Flat batteries in the dark: driven wheels don't pull (they
+    still brake), ion engines and drills stop.
+  - Parked or on rails, panels and generators still charge it (`charge_idle`).
+  - The HUD shows a power gauge (`PowerInfo`). `charge` is saved: negative means full, for saves
+    from before there was electricity. `power infinite` fills it every frame.
+- **Drills** (`Game::run_drills`): while they run (G, the HUD button, `Vessel::drilling`) and have
+  power, each bores the block its head faces as fast as an iron tool of the right kind would
+  (slower on less power). They don't bore models, lava or air. What they cut goes to the driver
+  (`Survival::drill_block`; spilled if the inventory is full); the block breaks as for a player,
+  so others are told. Only the flown vehicle's drills work. The head turns (`Motion::Bore`).
+- **Doors** (on vehicles, `Stats::doors`, `CraftDoor`):
+  - A door's cells are parts (2 up, or 3 x 3 for a big door) placed together (`place_all`, out
+    from where it was put, so each touches one before it on the network too).
+  - Each part's `facing` keeps its door's front (bits 0-2), which cell it is (`door_piece`, bits
+    3-6) and whether it stands open (`DOOR_OPEN`, bit 7). Always read a direction with
+    `direction`, which masks the rest off.
+  - Opening (`Craft::set_door`, `CraftChange::Door`) only changes those bits: the mesh stays and
+    the leaves move (`Motion::Door`, eased in `Looks`). An open door isn't solid to people walking
+    aboard (`Craft::solid`).
+  - Breaking any cell takes the whole door off, and it is one item again (`vehicle_part_items`).
+- Ready-made: `rover` (now with an accumulator and two panels), `digger` (nine drills, a generator
+  on two tanks), `probe` (ion engines, twelve panels), `gate` (a flatbed with a big door).
+  Tests: `a_rover_runs_on_electricity_and_stops_without_it`,
+  `panels_and_generators_charge_the_batteries`, `ion_engines_run_on_power_alone`,
+  `vector_engines_steer_with_their_thrust`, `giant_wheels_climb_higher`,
+  `drills_gimbals_and_doors_move`. The physics tests' `step` keeps batteries full: `run` doesn't.
+
+### Doors in the world (survival/mod.rs, render/models.rs)
+- **Kinds** (`DoorKind`):
+  - `Door`: swings open on a hinge.
+  - `SlidingDoor`: slides aside, into the wall beside it.
+  - `BigDoor`: three by three, rolls up into a housing over it. Its motor needs power.
+- **Blocks and units:**
+  - Each kind is two blocks, closed (collides) and open (`DoorOpen` etc., doesn't; `is_state`: never
+    an item, `as_item` gives the door). A door is a unit of cells, each its own model block
+    (`ModelState::piece` = across + 3 x up), so collision, saving and the network need nothing new.
+  - Placing one places all its cells (`place_door`: all must be open). The clicked cell is the bottom
+    of a door, or the bottom middle of a big door, its front towards the player.
+  - Breaking any cell breaks the unit and drops one door (`break_one`).
+  - Opening (`toggle_door`, right click; `WorldEvent::Door` for the others) swaps the blocks of all
+    its cells in place (`set_door`). The models stay, and their leaves move: `models::door_model`
+    with `Motion::Swing` / `Slide` / `Shutter` and a `Warn` lamp. `move_door` eases them, near or
+    far, so a door's cells keep together.
+- **A big door's motor** is a factory machine (`MachineKind::BigDoor`) in its bottom middle cell
+  (the second of `door_unit`), so cables run to it (clicking any cell runs it to the motor:
+  `door_motor`).
+  - It asks for `DOOR_POWER` only while the door moves (`Machine::wanted`), and moves as fast as its
+    `supply` allows.
+  - It won't start without power on its network (`Factory::has_power`), and says so.
+- On vehicles, doors are parts instead (see above).
+- Tests: `a_door_is_the_same_from_any_of_its_cells`, `doors_open`, `a_big_door_runs_on_its_network`.
 
 ### Factories (factory/, app/factories.rs)
 - **Parts** (model blocks; what they hold lives in `Factory`, one per world, kept with the chests
@@ -972,6 +1052,12 @@ shaders/
     holds `FUEL_ENERGY` (90 kJ) per second it burns in a furnace (coal 7.2 MJ: 40 s).
   - `Accumulator`: holds `ACCUMULATOR_ENERGY` (5 MJ, `Machine::energy`), takes or gives up to
     `ACCUMULATOR_POWER` (300 kW).
+  - `SolarPanel` (`MachineKind::Solar`): makes `SOLAR_POWER` (20 kW) with the sun overhead, by the
+    sine of its height (`Factory::sun`, set every frame from `Bodies::sun_in_frame` for both worlds;
+    `Machine::up` is worked out in `locate`), nothing at night. Right click: the power screen. It
+    goes on vehicles too.
+  - `Factory::infinite` (`power infinite`): every network gets all it asks for and its
+    accumulators fill.
   - `ElectricFurnace` (90 kW): smelts, 5 s an item.
   - `Miner` (60 kW): brings up what is under it for ever, `MINE_TIME` (2.5 s) an item: the best
     ore within `MINER_DEPTH` (8) layers below and a column round it (`ore_rank`), else what the
@@ -1043,8 +1129,9 @@ shaders/
 - Tests: `factory::tests` (items into a furnace, belt speed, what a line takes, power over a cable
   and shared, generators always running, accumulators, an assembler fed by a line, one line
   bringing two ingredients, a miner, bends, every ingredient can be made, side joins, without
-  authority, saving and what clients are sent, a big factory); `models::tests`
-  (`machines_move_while_they_work`, every model and moving part fits).
+  authority, saving and what clients are sent, a big factory, solar panels by day, a big door's
+  motor and infinite power); `models::tests` (`machines_move_while_they_work`, `doors_open`, every
+  model and moving part fits).
 
 
 ### Two worlds: home and the moon (app/worlds.rs)
@@ -1366,8 +1453,15 @@ shaders/
   bottom cell: you can walk through the tower from a block beside it. Fuel burns in
   generators and furnaces but doesn't fill a vehicle's tanks.
 - Vehicles: no docking or staging, no parachutes, no water (they sink through it). Blocks with
-  their own contents (chests, furnaces, torches, crafting tables) can't go on one. Walking aboard
+  their own contents (chests, furnaces, torches, crafting tables) can't go on one, nor machines that
+  work items (only accumulators, coal generators, solar panels and doors). Walking aboard
   has no ladders: build steps of blocks. Deck gravity always points at the deck, even upside down.
+  A vehicle can't plug into a factory's network to charge (panels, generators, or `power
+  infinite`). Reaction wheels take no power. Ion engines draw power in thick air though they push
+  nothing there. Only the flown vehicle's drills bore. The fuel gauge shows 0 m/s for a craft
+  with no tanks (an ion probe), as before.
+- Doors: a door in the world is one door, not a pair (two side by side open separately). A door
+  that can't get its cells (something in the way, or across a cube face edge) isn't placed.
 - The built-in test rocket is still there, with its simpler model.
   - It collides as an upright box at its engine:
     tipping over is a rule (more than ~50 degrees off vertical), not physics. Water isn't

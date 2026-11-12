@@ -40,7 +40,10 @@ use crate::{
     },
     util::FastMap,
     world::{
-        block::Block, chunk::BlockCell, planet::Planet, streaming::WorldStreamer,
+        block::{Block, DoorKind},
+        chunk::BlockCell,
+        planet::Planet,
+        streaming::WorldStreamer,
         terrain::TerrainGenerator,
     },
 };
@@ -149,19 +152,20 @@ pub struct Object {
 }
 
 /// A moving part as drawn: its mesh, where it turns about and which way (planet-relative), one
-/// model unit up, its reach, and how it moves.
+/// model unit up and along its axis, its reach, and how it moves.
 #[derive(Clone, Copy)]
 struct Part {
     mesh: MeshHandle,
     pivot: DVec3,
     axis: DVec3,
     up: DVec3,
+    step: DVec3,
     radius: f32,
     motion: models::Motion,
 }
 
 /// A machine model's moving parts (`models::moving_parts`): their meshes, and how far its work
-/// has carried them.
+/// has carried them. For a door: `speed` is how far open it is, `work` 1 while it moves.
 #[derive(Clone, Default)]
 struct Motion {
     parts: Vec<Part>,
@@ -170,6 +174,45 @@ struct Motion {
     speed: f32,
     /// Smoke or dust owed (a puff each when it reaches 1).
     puffs: f32,
+    /// A door has been set to how it stands (it doesn't swing open as it comes into view).
+    started: bool,
+}
+
+/// How fast doors open (share of the way a second): a big door takes three seconds.
+fn door_rate(kind: DoorKind) -> f32 {
+    match kind {
+        DoorKind::Hinged => 2.2,
+        DoorKind::Sliding => 1.8,
+        DoorKind::Big => 0.33,
+    }
+}
+
+/// The model's +x (across a door) for each facing, in grid steps (u, v).
+const ACROSS: [(i32, i32); 4] = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+
+/// The cells of the door that `cell` is a cell of (`state`: its model's), bottom left first
+/// (as `ModelState::piece` counts them). A big door's motor is the second.
+fn door_unit(
+    planet: &Planet,
+    cell: BlockCell,
+    state: ModelState,
+    kind: DoorKind,
+) -> Vec<BlockCell> {
+    let (w, h) = kind.size();
+    let (col, row) = ((state.piece % 3) as i32, (state.piece / 3) as i32);
+    let (du, dv) = ACROSS[state.facing as usize % 4];
+    let mut cells = Vec::new();
+    for r in 0..h {
+        for c in 0..w {
+            let (dc, dr) = (c - col, r - row);
+            if let Some(at) =
+                planet.cell(cell.face, cell.u + dc * du, cell.v + dc * dv, cell.k + dr)
+            {
+                cells.push(at);
+            }
+        }
+    }
+    cells
 }
 
 /// The parts of the world this module changes.
@@ -307,6 +350,13 @@ impl WorldState {
 
     pub fn restored(saved: SavedWorldState) -> Self {
         saved.into_state()
+    }
+
+    /// Where the sun is for its solar panels (unit, this world's frame), and whether power is
+    /// infinite (`power infinite`).
+    pub fn set_power(&mut self, sun: DVec3, infinite: bool) {
+        self.factory.sun = sun;
+        self.factory.infinite = infinite;
     }
 
     /// The world nobody is on goes on too: furnaces burn and factories run (`authority`:
@@ -707,6 +757,9 @@ impl Survival {
                     self.factory.turn(world.planet, *cell, *facing);
                 }
             }
+            WorldEvent::Door { cell, open } => {
+                self.set_door(world, *cell, *open);
+            }
             WorldEvent::DropNew(drop) => {
                 if !self.drops.iter().any(|d| d.id == drop.id) {
                     let mut new =
@@ -798,6 +851,10 @@ impl Survival {
             // (Waits for the chunks around it, which may not be loaded here.)
             Block::Torch => self.pending_lights.push((cell, TORCH_LIGHT)),
             b if b.is_factory() => self.factory.add(world.planet, cell, b, state.facing),
+            Block::BigDoor | Block::BigDoorOpen if state.piece == 1 => {
+                self.factory
+                    .add(world.planet, cell, Block::BigDoor, state.facing)
+            }
             _ => {}
         }
     }
@@ -1066,6 +1123,45 @@ impl Survival {
         block: Block,
         creative: bool,
     ) {
+        // A door comes down whole (and is one door again).
+        let unit = match (block.door(), self.objects.get(&cell)) {
+            (Some((kind, _)), Some(object)) => door_unit(world.planet, cell, object.state, kind),
+            _ => Vec::new(),
+        };
+        self.break_one(world, cell, block, creative, true);
+        for other in unit {
+            if let Some(b) = self.objects.get(&other).map(|o| o.block)
+                && b.door().is_some()
+            {
+                self.break_one(world, other, b, creative, false);
+            }
+        }
+    }
+
+    /// A vehicle's drill has bored through a block: it is broken as by a player, and gives
+    /// what an iron tool of the right kind would get from it (returned, for the vehicle's
+    /// driver).
+    pub fn drill_block(
+        &mut self,
+        world: &mut World,
+        cell: BlockCell,
+        block: Block,
+    ) -> Option<ItemStack> {
+        self.break_block(world, cell, block, true);
+        let tool = items::mining(block).tool.unwrap_or(ToolKind::Pickaxe);
+        let roll = self.random() as f32;
+        items::drops(block, Some((tool, Tier::Iron)), roll)
+    }
+
+    /// `break_block` of one cell; `drops`: what it was made of drops.
+    fn break_one(
+        &mut self,
+        world: &mut World,
+        cell: BlockCell,
+        block: Block,
+        creative: bool,
+        drops: bool,
+    ) {
         world.streamer.set_block(cell, Block::Air);
         self.tell(WorldEvent::Broke(cell));
         let center = interact::cell_center(world.planet, cell);
@@ -1101,7 +1197,7 @@ impl Survival {
                 loot.push(ItemStack::new(Item::Cable, removed.cables.min(64) as u8));
             }
         }
-        if !creative {
+        if !creative && drops {
             let roll = self.random() as f32;
             loot.extend(items::drops(block, self.tool(), roll));
         }
@@ -1151,6 +1247,9 @@ impl Survival {
             return false;
         }
         let center = interact::cell_center(planet, cell);
+        if let Some((kind, _)) = block.door() {
+            return self.place_door(world, cell, kind, pose);
+        }
         // Fronts face whoever placed them; a conveyor runs the way they look.
         let towards = if block == Block::Conveyor {
             pose.look
@@ -1183,6 +1282,99 @@ impl Survival {
             self.effects.push(effects::block_place(block, center, up));
         }
         true
+    }
+
+    /// A door, all of it: its front towards whoever places it, `cell` its bottom (the bottom
+    /// middle of a big door). Every cell it needs must be open.
+    fn place_door(
+        &mut self,
+        world: &mut World,
+        cell: BlockCell,
+        kind: DoorKind,
+        pose: &Pose,
+    ) -> bool {
+        let planet = world.planet;
+        let center = interact::cell_center(planet, cell);
+        let facing = models::facing_towards(planet, cell, pose.feet - center);
+        let first = ModelState {
+            facing,
+            piece: if kind == DoorKind::Big { 1 } else { 0 },
+            ..Default::default()
+        };
+        let cells = door_unit(planet, cell, first, kind);
+        let (w, h) = kind.size();
+        let open = |c: &BlockCell| {
+            world.streamer.block(*c).is_some_and(|b| !b.is_solid())
+                && !overlaps_player(planet, *c, pose.feet)
+        };
+        if cells.len() != (w * h) as usize || !cells.iter().all(open) {
+            return false;
+        }
+        for (i, c) in cells.into_iter().enumerate() {
+            let state = ModelState {
+                piece: i as u8 % w as u8 + 3 * (i as u8 / w as u8),
+                ..first
+            };
+            self.put(world, c, kind.closed(), state, None);
+        }
+        self.sound(Sound::Place(kind.closed().material()), center);
+        true
+    }
+
+    /// The cell a cable to what `hit` is on goes to: a big door's motor, else that cell.
+    fn door_motor(&self, world: &World, hit: &Hit) -> BlockCell {
+        match (hit.block.door(), self.objects.get(&hit.cell)) {
+            (Some((DoorKind::Big, _)), Some(object)) => {
+                door_unit(world.planet, hit.cell, object.state, DoorKind::Big)
+                    .get(1)
+                    .copied()
+                    .unwrap_or(hit.cell)
+            }
+            _ => hit.cell,
+        }
+    }
+
+    /// Opens or closes the door with a cell at `cell`, all of it, as `open` says (news from
+    /// the others, or `toggle_door`).
+    fn set_door(&mut self, world: &mut World, cell: BlockCell, open: bool) {
+        let Some((kind, state)) = self
+            .objects
+            .get(&cell)
+            .and_then(|o| Some((o.block.door()?.0, o.state)))
+        else {
+            return;
+        };
+        let block = if open { kind.opened() } else { kind.closed() };
+        for c in door_unit(world.planet, cell, state, kind) {
+            if let Some(object) = self.objects.get_mut(&c)
+                && object.block.door().is_some_and(|(k, _)| k == kind)
+            {
+                object.block = block;
+                world.streamer.set_block(c, block);
+            }
+        }
+    }
+
+    /// A right click on a door: it opens, or closes. A big door only with power (from the
+    /// network its motor is cabled to). Says why not, if not.
+    fn toggle_door(&mut self, world: &mut World, cell: BlockCell) -> Option<String> {
+        let object = self.objects.get(&cell)?;
+        let (kind, open) = object.block.door()?;
+        let state = object.state;
+        if kind == DoorKind::Big {
+            let motor = door_unit(world.planet, cell, state, kind).get(1).copied();
+            if !motor.is_some_and(|m| self.factory.has_power(m)) {
+                return Some(
+                    "No power: run a cable to the big door from a powered network".to_string(),
+                );
+            }
+        }
+        self.set_door(world, cell, !open);
+        self.tell(WorldEvent::Door { cell, open: !open });
+        let center = interact::cell_center(world.planet, cell);
+        self.sound(Sound::Place(object_material(kind)), center);
+        self.uses += 1;
+        None
     }
 
     /// Puts a block or model into `cell` as it is (`state`: the model's), and tells the others.
@@ -1227,6 +1419,9 @@ impl Survival {
                     self.factory.touch();
                 }
                 Block::Torch => world.streamer.set_light(cell, TORCH_LIGHT),
+                Block::BigDoor | Block::BigDoorOpen if state.piece == 1 => {
+                    self.factory.add(planet, cell, Block::BigDoor, state.facing);
+                }
                 b if b.is_factory() => {
                     self.factory.add(planet, cell, b, state.facing);
                     if matches!(b, Block::Miner | Block::OilPump) {
@@ -1418,13 +1613,23 @@ impl Survival {
         }
         if cable
             && input.button_pressed(MouseButton::Right)
-            && let Some(hit) = target.filter(|h| h.block.is_electric())
+            && let Some(hit) = target.filter(|h| {
+                h.block.is_electric() || self.factory.is_electric(self.door_motor(world, h))
+            })
         {
+            // (A cable to a big door goes to its motor.)
+            let cell = self.door_motor(world, hit);
             self.uses += 1;
-            return Some(self.run_cable(world, hit.cell, creative));
+            return Some(self.run_cable(world, cell, creative));
         }
         if right && let Some(hit) = target {
             let sneaking = input.held(KeyCode::ShiftLeft);
+            if hit.block.door().is_some() && !sneaking {
+                if input.button_pressed(MouseButton::Right) {
+                    return self.toggle_door(world, hit.cell).or(message);
+                }
+                return message;
+            }
             let usable = matches!(
                 hit.block,
                 Block::CraftingTable | Block::Furnace | Block::Chest | Block::PowerPole
@@ -1434,8 +1639,10 @@ impl Survival {
                     let screen = match hit.block {
                         Block::Furnace => Screen::Furnace(hit.cell),
                         Block::Chest => Screen::Chest(hit.cell),
-                        // Poles and accumulators show the network they are on.
-                        Block::PowerPole | Block::Accumulator => Screen::Power(hit.cell),
+                        // Poles, accumulators and panels show the network they are on.
+                        Block::PowerPole | Block::Accumulator | Block::SolarPanel => {
+                            Screen::Power(hit.cell)
+                        }
                         b => match factory::MachineKind::of(b) {
                             Some(kind) => Screen::Machine(hit.cell, kind),
                             None => Screen::Crafting(hit.cell),
@@ -1462,7 +1669,7 @@ impl Survival {
         if input.button_pressed(MouseButton::Middle)
             && let Some(hit) = target
         {
-            self.pick_block(Item::Block(hit.block), creative);
+            self.pick_block(Item::Block(hit.block.as_item()), creative);
         }
         message
     }
@@ -1675,6 +1882,13 @@ impl Survival {
                 self.lights.push((*cell, level));
             }
         }
+    }
+
+    /// Where the sun is for the solar panels (unit, the active world's frame), and whether
+    /// power is infinite (`power infinite`).
+    pub fn set_power(&mut self, sun: DVec3, infinite: bool) {
+        self.factory.sun = sun;
+        self.factory.infinite = infinite;
     }
 
     /// Conveyors and machines run for `dt` game seconds (also what a jump in time skips over).
@@ -1996,10 +2210,16 @@ impl Survival {
             let center = *object
                 .center
                 .get_or_insert_with(|| interact::cell_center(planet, cell));
+            // (Doors move near or far: all of a door's cells go together.)
+            if let Some((kind, open)) = object.block.door() {
+                move_door(planet, cell, object, kind, open, &mut self.factory, dt);
+            }
             if !near(center) {
                 continue;
             }
-            object.state.open = open_chest == Some(cell);
+            if object.block == Block::Chest {
+                object.state.open = open_chest == Some(cell);
+            }
             let machine = self.factory.machine(cell);
             if object.block == Block::Accumulator
                 && let Some(m) = machine
@@ -2020,7 +2240,7 @@ impl Survival {
                 // The moving parts first: all of it, or (out of uploads) all again next frame.
                 let mut parts = Vec::new();
                 let mut complete = true;
-                for part in models::moving_parts(object.block) {
+                for part in models::moving_parts(object.block, object.state) {
                     let made = models::part_model(planet, cell, object.state.facing, &part, light);
                     match renderer.create_mesh(&made.mesh)? {
                         Some(mesh) => parts.push(Part {
@@ -2028,6 +2248,7 @@ impl Survival {
                             pivot: made.pivot,
                             axis: made.axis,
                             up: made.up,
+                            step: made.step,
                             radius: made.radius,
                             motion: part.motion,
                         }),
@@ -2037,13 +2258,16 @@ impl Survival {
                         }
                     }
                 }
-                let handle = if complete {
-                    renderer.create_mesh(&mesh)?
-                } else {
+                // (Some(None): done, and there is nothing that stays put to draw.)
+                let handle = if !complete {
                     None
+                } else if mesh.opaque.is_empty() {
+                    Some(None)
+                } else {
+                    renderer.create_mesh(&mesh)?.map(Some)
                 };
                 if let Some(handle) = handle {
-                    if let Some(old) = object.mesh.replace(handle) {
+                    if let Some(old) = std::mem::replace(&mut object.mesh, handle) {
                         renderer.destroy_mesh(old);
                     }
                     for old in std::mem::replace(&mut object.motion.parts, parts) {
@@ -2066,7 +2290,9 @@ impl Survival {
                     fade: Fade::Visible,
                 });
             }
-            if object.block.is_machine() {
+            if object.block.door().is_some() {
+                draw_parts(planet, cell, object, self.clock, &mut draws);
+            } else if object.block.is_machine() {
                 let working = machine.is_some_and(|m| m.lit());
                 animate(
                     planet,
@@ -2806,22 +3032,9 @@ fn animate(
     let target = if working { 1.0 } else { 0.0 };
     m.speed += (target - m.speed) * (1.0 - (-2.5 * dt).exp());
     m.work += (m.speed * dt) as f64;
-    let seed = (cell.u as u64).wrapping_mul(73_856_093)
-        ^ (cell.v as u64).wrapping_mul(19_349_663)
-        ^ (cell.k as u64).wrapping_mul(83_492_791);
-    for part in &m.parts {
-        let pose = part.motion.pose(m.work, m.speed, clock, seed);
-        if !pose.shown {
-            continue;
-        }
-        draws.push(DrawItem {
-            mesh: part.mesh,
-            origin: planet.center + part.pivot + part.up * pose.lift as f64,
-            rotation: glam::Quat::from_axis_angle(part.axis.as_vec3(), pose.angle),
-            radius: part.radius,
-            fade: Fade::Visible,
-        });
-    }
+    let seed = cell_seed(cell);
+    draw_parts(planet, cell, object, clock, draws);
+    let m = &mut object.motion;
     let facing = object.state.facing;
     let (rate, at) = match object.block {
         Block::CoalGenerator if m.speed > 0.5 => (7.0, [12.25, 12.25, 16.5]),
@@ -2843,6 +3056,80 @@ fn animate(
             effects::chimney_smoke(p, up)
         });
     }
+}
+
+/// Keeps machines (and their blinking lamps) out of step with each other.
+fn cell_seed(cell: BlockCell) -> u64 {
+    (cell.u as u64).wrapping_mul(73_856_093)
+        ^ (cell.v as u64).wrapping_mul(19_349_663)
+        ^ (cell.k as u64).wrapping_mul(83_492_791)
+}
+
+/// A model's moving parts, listed to draw where their motion has them now.
+fn draw_parts(
+    planet: &Planet,
+    cell: BlockCell,
+    object: &Object,
+    clock: f64,
+    draws: &mut Vec<DrawItem>,
+) {
+    let m = &object.motion;
+    let seed = cell_seed(cell);
+    for part in &m.parts {
+        let pose = part.motion.pose(m.work, m.speed, clock, seed);
+        if !pose.shown {
+            continue;
+        }
+        let moved = part.up * pose.lift as f64 + part.step * pose.shift as f64;
+        draws.push(DrawItem {
+            mesh: part.mesh,
+            origin: planet.center + part.pivot + moved,
+            rotation: glam::Quat::from_axis_angle(part.axis.as_vec3(), pose.angle),
+            radius: part.radius,
+            fade: Fade::Visible,
+        });
+    }
+}
+
+/// A door goes on opening or closing (`open`: its cells stand open now). A big door only
+/// moves as fast as its motor's network gives it power; its motor asks for power while it
+/// moves (`Machine::wanted`).
+fn move_door(
+    planet: &Planet,
+    cell: BlockCell,
+    object: &mut Object,
+    kind: DoorKind,
+    open: bool,
+    factory: &mut Factory,
+    dt: f32,
+) {
+    let m = &mut object.motion;
+    let target = if open { 1.0 } else { 0.0 };
+    if !m.started {
+        m.speed = target;
+        m.started = true;
+    }
+    let mut power = 1.0;
+    if kind == DoorKind::Big {
+        let motor = door_unit(planet, cell, object.state, kind).get(1).copied();
+        power = motor
+            .and_then(|c| factory.machine(c))
+            .map_or(0.0, |machine| machine.supply);
+        let moving = (target - m.speed).abs() > 1e-4;
+        if object.state.piece == 1
+            && let Some(machine) = factory.machine_mut(cell)
+        {
+            machine.wanted = moving;
+        }
+    }
+    let step = door_rate(kind) * power * dt;
+    let before = m.speed;
+    m.speed += (target - m.speed).clamp(-step, step);
+    m.work = if (m.speed - before).abs() > 0.0 {
+        1.0
+    } else {
+        0.0
+    };
 }
 
 /// What the player can change on a machine's screen: its slots, and (as one more) its recipe.
@@ -2887,6 +3174,11 @@ fn resource_under(world: &World, cell: BlockCell, block: Block) -> Option<Item> 
     }
     let below = planet.cell(cell.face, cell.u, cell.v, cell.k - 1)?;
     factory::mined_from(world.streamer.block(below)?)
+}
+
+/// What a door sounds like opening (its own block's material).
+fn object_material(kind: DoorKind) -> crate::world::block::Material {
+    kind.closed().material()
 }
 
 /// Models that light up their surroundings (and must be put out when taken away).
@@ -2997,6 +3289,47 @@ mod tests {
             eye: DVec3::Y * 100.0,
             look: DVec3::X,
             feet: DVec3::Y * 98.0,
+        }
+    }
+
+    /// A door's cells are the same seen from any of them, whichever way it faces: two up for a
+    /// door, three by three for a big one (with its motor second, the bottom middle).
+    #[test]
+    fn a_door_is_the_same_from_any_of_its_cells() {
+        let planet = Planet::new(DVec3::ZERO, 64, 128, 1);
+        let base = BlockCell {
+            face: crate::world::planet::Face(2),
+            u: 600,
+            v: 700,
+            k: planet.sea_layer + 3,
+        };
+        for kind in [DoorKind::Hinged, DoorKind::Big] {
+            for facing in 0..4u8 {
+                let first = ModelState {
+                    facing,
+                    ..Default::default()
+                };
+                let cells = door_unit(&planet, base, first, kind);
+                let (w, h) = kind.size();
+                assert_eq!(cells.len(), (w * h) as usize);
+                assert_eq!(cells[0], base);
+                for (i, &c) in cells.iter().enumerate() {
+                    let state = ModelState {
+                        facing,
+                        piece: (i as i32 % w + 3 * (i as i32 / w)) as u8,
+                        ..Default::default()
+                    };
+                    assert_eq!(
+                        door_unit(&planet, c, state, kind),
+                        cells,
+                        "{kind:?} {facing}"
+                    );
+                }
+                if kind == DoorKind::Big {
+                    assert_eq!(cells[1].k, base.k, "the motor is at the bottom");
+                    assert_eq!(cells[8].k, base.k + 2);
+                }
+            }
         }
     }
 

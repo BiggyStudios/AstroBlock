@@ -29,7 +29,7 @@ use crate::{
     render::{DrawItem, Fade, ParticleEmitter, models::Light},
     survival::items::{self, Item, ItemStack},
     world::{
-        block::{Block, Material},
+        block::{Block, DoorKind, Material},
         chunk::BlockCell,
     },
 };
@@ -87,6 +87,24 @@ pub(super) fn preset(name: &str) -> Option<Craft> {
             facing: facing_of(facing),
         });
     };
+    // Parts that may be listed before what they hold on to: placed as they can be, out from
+    // the core.
+    let grow = |c: &mut Craft, cells: &[At], block: Block, facing: DVec3| {
+        let mut left: Vec<At> = cells.to_vec();
+        loop {
+            let before = left.len();
+            left.retain(|&at| {
+                !c.place(Part {
+                    at,
+                    block,
+                    facing: facing_of(facing),
+                })
+            });
+            if left.len() == before {
+                break;
+            }
+        }
+    };
     match name {
         "rover" => {
             for (x, z) in [
@@ -107,6 +125,93 @@ pub(super) fn preset(name: &str) -> Option<Craft> {
             for (x, z) in [(2, 0), (-2, 0), (2, 2), (-2, 2)] {
                 place(&mut c, [x, 0, z], Block::Wheel, DVec3::X);
             }
+            // Its wheels run on electricity: a battery, and panels on the back to charge it.
+            place(&mut c, [0, 1, 2], Block::Accumulator, DVec3::NEG_Z);
+            place(&mut c, [1, 1, 2], Block::SolarPanel, DVec3::Y);
+            place(&mut c, [-1, 1, 2], Block::SolarPanel, DVec3::Y);
+        }
+        "digger" => {
+            // A rover with a wall of drills in front: it bores a tunnel three wide and three
+            // high. A generator burns the tanks' fuel to keep the batteries up.
+            let mut deck = Vec::new();
+            for x in -1..=1 {
+                for z in -1..=3 {
+                    if [x, z] != [0, 0] {
+                        deck.push([x, 0, z]);
+                    }
+                }
+                deck.push([x, 1, 3]);
+                deck.push([x, 2, 3]);
+            }
+            grow(&mut c, &deck, Block::Hull, DVec3::X);
+            let drills: Vec<At> = (-1..=1)
+                .flat_map(|x| (0..=2).map(move |y| [x, y, 4]))
+                .collect();
+            grow(&mut c, &drills, Block::VehicleDrill, DVec3::Z);
+            place(&mut c, [0, 1, 1], Block::Seat, DVec3::Z);
+            place(&mut c, [0, 1, 0], Block::Accumulator, DVec3::NEG_Z);
+            place(&mut c, [1, 1, 0], Block::Accumulator, DVec3::NEG_Z);
+            place(&mut c, [-1, 1, 0], Block::CoalGenerator, DVec3::NEG_Z);
+            place(&mut c, [-1, 1, -1], Block::FuelTank, DVec3::X);
+            place(&mut c, [0, 1, -1], Block::FuelTank, DVec3::X);
+            for z in [-1, 1, 3] {
+                place(&mut c, [2, 0, z], Block::Wheel, DVec3::X);
+                place(&mut c, [-2, 0, z], Block::Wheel, DVec3::X);
+            }
+        }
+        "probe" => {
+            // An ion probe for space: a battery, panels on two wings and four ion engines.
+            c = Craft::new(2);
+            for y in 1..=3 {
+                place(&mut c, [0, y, 0], Block::Hull, DVec3::X);
+            }
+            place(&mut c, [0, 4, 0], Block::Seat, DVec3::Z);
+            place(&mut c, [0, 2, 1], Block::Accumulator, DVec3::Z);
+            place(&mut c, [1, 2, 0], Block::Gyro, DVec3::X);
+            for (x, z) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                place(&mut c, [x, 0, z], Block::IonEngine, DVec3::NEG_Y);
+            }
+            for x in [1, 2, 3, -1, -2, -3] {
+                place(&mut c, [x, 3, 0], Block::Hull, DVec3::X);
+                place(&mut c, [x, 3, 1], Block::SolarPanel, DVec3::Z);
+                place(&mut c, [x, 3, -1], Block::SolarPanel, DVec3::NEG_Z);
+            }
+            place(&mut c, [0, -1, 0], Block::LandingGear, DVec3::X);
+        }
+        "gate" => {
+            // A flatbed with a big door across its back (a door on a vehicle).
+            let mut deck = Vec::new();
+            for x in -2..=2 {
+                for z in -3..=2 {
+                    if [x, z] != [0, 0] {
+                        deck.push([x, 0, z]);
+                    }
+                }
+            }
+            for y in 1..=3 {
+                deck.push([-2, y, -3]);
+                deck.push([2, y, -3]);
+            }
+            for x in -2..=2 {
+                deck.push([x, 4, -3]);
+            }
+            grow(&mut c, &deck, Block::Hull, DVec3::X);
+            for (x, z) in [(3, -2), (-3, -2), (3, 1), (-3, 1)] {
+                place(&mut c, [x, 0, z], Block::Wheel, DVec3::X);
+            }
+            let big = craft::door_cells(DoorKind::Big, [1, 1, -3], facing_of(DVec3::NEG_Z));
+            let parts: Vec<Part> = big
+                .iter()
+                .map(|&(at, facing)| Part {
+                    at,
+                    block: Block::BigDoor,
+                    facing,
+                })
+                .collect();
+            c.place_all(&parts);
+            place(&mut c, [0, 1, 1], Block::Seat, DVec3::Z);
+            place(&mut c, [1, 1, 2], Block::Accumulator, DVec3::Z);
+            place(&mut c, [1, 2, 2], Block::SolarPanel, DVec3::Y);
         }
         "plane" => {
             for z in 1..=6 {
@@ -157,17 +262,43 @@ pub(super) fn preset(name: &str) -> Option<Craft> {
     Some(c)
 }
 
+/// How fast a door on a vehicle opens (share of the way a second).
+fn vehicle_door_rate(kind: DoorKind) -> f32 {
+    match kind {
+        DoorKind::Hinged => 2.2,
+        DoorKind::Sliding => 1.8,
+        DoorKind::Big => 0.33,
+    }
+}
+
+/// The items parts taken off a vehicle are: one each, and one for all the cells of a door.
+fn vehicle_part_items(parts: &[Part]) -> Vec<ItemStack> {
+    let mut doors: Vec<At> = Vec::new();
+    let mut items = Vec::new();
+    for p in parts {
+        if p.block.door().is_some() {
+            let (col, row) = craft::door_piece(p.facing);
+            let across = craft::door_across(p.facing);
+            let anchor = [
+                p.at[0] - across[0] * col,
+                p.at[1] - row,
+                p.at[2] - across[2] * col,
+            ];
+            if doors.contains(&anchor) {
+                continue;
+            }
+            doors.push(anchor);
+        }
+        items.push(ItemStack::new(Item::Block(p.block.as_item()), 1));
+    }
+    items
+}
+
 /// How high a vehicle's core must sit for its lowest part to rest on the ground (m).
 fn rest_height(c: &Craft) -> f64 {
     c.parts()
         .iter()
-        .map(|p| {
-            let reach = match p.block {
-                Block::Wheel | Block::LandingGear => craft::WHEEL_RADIUS,
-                _ => 0.5,
-            };
-            reach - p.at[1] as f64
-        })
+        .map(|p| craft::wheel_radius(p.block).unwrap_or(0.5) - p.at[1] as f64)
         .fold(0.5, f64::max)
 }
 
@@ -364,11 +495,45 @@ impl Game {
         if !self.input.button_pressed(MouseButton::Right) {
             return;
         }
-        if part.block == Block::Seat && !self.input.held(KeyCode::ShiftLeft) {
+        let sneaking = self.input.held(KeyCode::ShiftLeft);
+        if part.block == Block::Seat && !sneaking {
             self.sit_down(hit.vessel, hit.at);
             return;
         }
+        if part.block.door().is_some() && !sneaking {
+            self.toggle_vehicle_door(hit.vessel, hit.at);
+            return;
+        }
         self.place_vehicle_part(hit);
+    }
+
+    /// Opens or closes a door on a vehicle (and tells the others). A big door's motor takes
+    /// its electricity from the vehicle's batteries.
+    pub(super) fn toggle_vehicle_door(&mut self, i: usize, at: At) {
+        let infinite = self.infinite_power;
+        let v = &mut self.flight.vessels[i];
+        let id = v.id;
+        let Some((n, door)) = v.craft.as_ref().and_then(|c| c.door_at(at)) else {
+            return;
+        };
+        let open = !v.craft.as_ref().is_some_and(|c| c.door_open(n));
+        if door.kind == DoorKind::Big && !infinite && v.charge >= 0.0 {
+            if v.charge < craft::BIG_DOOR_ENERGY {
+                self.say("Not enough power to move the big door");
+                return;
+            }
+            v.charge -= craft::BIG_DOOR_ENERGY;
+        }
+        if let Some(c) = v.craft.as_mut() {
+            c.set_door(at, open);
+        }
+        let (grid, to_world) = self.grid_pose(&self.flight.vessels[i]);
+        let material = door.kind.closed().material();
+        self.survival
+            .sounds
+            .push((Sound::Place(material), grid + to_world * craft::center(at)));
+        self.survival.uses += 1;
+        self.send_craft_change(id, CraftChange::Door { at, open });
     }
 
     pub(super) fn break_vehicle_part(&mut self, hit: CraftHit) {
@@ -378,17 +543,31 @@ impl Game {
             return;
         }
         let id = v.id;
+        // A door comes off whole: all its cells, and it is one door again.
+        let cells: Vec<At> = match v.craft.as_ref().and_then(|c| c.door_at(hit.at)) {
+            Some((_, door)) => craft::door_cells(door.kind, door.anchor, door.front)
+                .into_iter()
+                .map(|(at, _)| at)
+                .filter(|&at| at != hit.at)
+                .collect(),
+            None => Vec::new(),
+        };
         let mut removed = craft::Removed::default();
-        v.rebuild_craft(|c| removed = c.remove(hit.at));
+        v.rebuild_craft(|c| {
+            removed = c.remove(hit.at);
+            for &at in &cells {
+                let more = c.remove(at);
+                removed.core_gone |= more.core_gone;
+                removed.parts.extend(more.parts);
+            }
+        });
         let (grid, to_world) = self.grid_pose(&self.flight.vessels[hit.vessel]);
         let at = grid + to_world * craft::center(hit.at);
         self.survival
             .sounds
             .push((Sound::Break(Material::Stone), at));
         if self.player.mode != GameMode::Creative {
-            let parts = removed.parts.iter().map(|p| p.block);
-            for block in parts {
-                let stack = ItemStack::new(Item::Block(block), 1);
+            for stack in vehicle_part_items(&removed.parts) {
                 if let Some(rest) = self.survival.inventory.add(stack) {
                     self.survival.spawn(rest, at, DVec3::ZERO, 0.0);
                 }
@@ -401,6 +580,9 @@ impl Game {
             return;
         }
         self.send_craft_change(id, CraftChange::Take(hit.at));
+        for at in cells {
+            self.send_craft_change(id, CraftChange::Take(at));
+        }
     }
 
     fn place_vehicle_part(&mut self, hit: CraftHit) {
@@ -410,7 +592,8 @@ impl Game {
         let Some(block) = stack.item.block() else {
             return;
         };
-        if block.is_model() || matches!(block, Block::Air | Block::Water | Block::VehicleCore) {
+        let fits = !block.is_model() || craft::is_vehicle_model(block);
+        if !fits || matches!(block, Block::Air | Block::Water | Block::VehicleCore) {
             self.say("That doesn't go on a vehicle");
             return;
         }
@@ -420,6 +603,10 @@ impl Game {
         let Some(craft) = &v.craft else { return };
         if !craft.can_place(at) {
             self.say("Too far from the core");
+            return;
+        }
+        if let Some((kind, _)) = block.door() {
+            self.place_vehicle_door(hit, at, kind, outward);
             return;
         }
         // Not inside whoever is placing it.
@@ -452,6 +639,69 @@ impl Game {
             .sounds
             .push((Sound::Place(block.material()), grid + to_world * center));
         self.send_craft_change(id, CraftChange::Put(part));
+    }
+
+    /// A door onto a vehicle: all its cells at once, `at` its bottom (the bottom middle of a
+    /// big door). It faces out from what it is put on, or (put on a floor) towards whoever
+    /// puts it there.
+    fn place_vehicle_door(&mut self, hit: CraftHit, at: At, kind: DoorKind, outward: DVec3) {
+        let v = &self.flight.vessels[hit.vessel];
+        let (grid, to_world) = self.grid_pose(v);
+        let frame = self.active_frame(self.time);
+        let look = to_world.inverse() * self.camera.forward().as_dvec3();
+        let flat_out = DVec3::new(outward.x, 0.0, outward.z);
+        let front = if flat_out.length() > 0.5 {
+            facing_of(flat_out)
+        } else {
+            facing_of(DVec3::new(-look.x, 0.0, -look.z))
+        };
+        let across = craft::door_across(front);
+        let (w, _) = kind.size();
+        let back = if w > 1 { 1 } else { 0 };
+        let anchor = [at[0] - across[0] * back, at[1], at[2] - across[2] * back];
+        // In order out from where it was put, so each touches one before it (the network
+        // places them one at a time).
+        let mut parts: Vec<Part> = craft::door_cells(kind, anchor, front)
+            .iter()
+            .map(|&(at, facing)| Part {
+                at,
+                block: kind.closed(),
+                facing,
+            })
+            .collect();
+        parts.sort_by_key(|p| (0..3).map(|i| (p.at[i] - at[i]).abs()).sum::<i16>());
+        // Not inside whoever is placing it.
+        let feet = to_world.inverse() * (frame.to_body(self.player.position) - grid);
+        let inside = parts.iter().any(|p| {
+            let c = craft::center(p.at);
+            (feet.x - c.x).abs() < 0.5 + HALF_WIDTH
+                && (feet.z - c.z).abs() < 0.5 + HALF_WIDTH
+                && feet.y < c.y + 0.5
+                && feet.y + HEIGHT > c.y - 0.5
+        });
+        if inside {
+            return;
+        }
+        let v = &mut self.flight.vessels[hit.vessel];
+        let id = v.id;
+        let mut placed = false;
+        v.rebuild_craft(|c| placed = c.place_all(&parts));
+        if !placed {
+            self.say("There isn't room for the door there");
+            return;
+        }
+        if self.player.mode != GameMode::Creative {
+            self.survival.inventory.take_one(self.survival.selected);
+        }
+        self.survival.uses += 1;
+        let (grid, to_world) = self.grid_pose(&self.flight.vessels[hit.vessel]);
+        self.survival.sounds.push((
+            Sound::Place(kind.closed().material()),
+            grid + to_world * craft::center(at),
+        ));
+        for part in parts {
+            self.send_craft_change(id, CraftChange::Put(part));
+        }
     }
 
     /// The way a new part faces, unless R has said otherwise.
@@ -496,6 +746,11 @@ impl Game {
                     c.remove(at);
                 });
             }
+            CraftChange::Door { at, open } => {
+                if let Some(c) = v.craft.as_mut() {
+                    c.set_door(at, open);
+                }
+            }
         }
     }
 
@@ -524,6 +779,7 @@ impl Game {
         if place {
             match part {
                 Some(p) if p.block == Block::Seat => self.sit_down(hit.vessel, hit.at),
+                Some(p) if p.block.door().is_some() => self.toggle_vehicle_door(hit.vessel, hit.at),
                 _ => self.place_vehicle_part(hit),
             }
         } else {
@@ -990,6 +1246,15 @@ impl Game {
         };
         let flaps = std::mem::take(&mut self.flight.vessels[i].flaps);
         let v = &mut self.flight.vessels[i];
+        let doors: Vec<(bool, f32)> = v.craft.as_ref().map_or(Vec::new(), |c| {
+            (c.stats.doors.iter().enumerate())
+                .map(|(n, d)| (c.door_open(n), vehicle_door_rate(d.kind)))
+                .collect()
+        });
+        if !v.looks_started {
+            v.looks.settle_doors(&doors);
+            v.looks_started = true;
+        }
         let doing = craft_model::Doing {
             power: if v.engines_on() {
                 v.throttle as f32
@@ -1000,6 +1265,13 @@ impl Game {
             ground_speed,
             steer: v.steer,
             flaps: &flaps,
+            drilling: v.drilling && v.power_share > 0.0,
+            gimbal: if v.engines_on() {
+                v.gimbal
+            } else {
+                DVec3::ZERO
+            },
+            doors: &doors,
         };
         v.looks.advance(&doing, dt);
         v.flaps = flaps;
@@ -1016,10 +1288,14 @@ impl Game {
             });
         }
         for (pivot, mesh) in &v.moving {
+            if !v.looks.shown(pivot) {
+                continue;
+            }
             let turn = (to_world * v.looks.turn(pivot, up)).normalize();
+            let at = pivot.at + v.looks.offset(pivot);
             objects.push(DrawItem {
                 mesh: *mesh,
-                origin: self.planet.center + grid + to_world * pivot.at,
+                origin: self.planet.center + grid + to_world * at,
                 rotation: turn.as_quat(),
                 radius: 1.6,
                 fade: Fade::Visible,
@@ -1061,8 +1337,11 @@ impl Game {
     /// Flames from each engine that is running.
     pub(super) fn vehicle_flames(&mut self, i: usize, dt: f32, out: &mut Vec<ParticleEmitter>) {
         let v = &self.flight.vessels[i];
-        let Some(craft) = &v.craft else { return };
-        if v.throttle <= 0.0 || v.fuel <= 0.0 {
+        if v.craft.is_none() {
+            return;
+        }
+        let running = v.running_engines();
+        if running.is_empty() {
             return;
         }
         let t = self.time;
@@ -1073,9 +1352,22 @@ impl Game {
         let throttle = v.throttle as f32;
         let n = ((180.0 + 260.0 * throttle) * dt).ceil() as u32;
         let mut sound_at = None;
-        for e in craft.stats.engines.iter().take(10) {
+        for (e, power) in running.iter().take(10) {
             if matches!(e.kind.air, craft::AirUse::Propeller(_)) {
                 sound_at.get_or_insert(grid + to_world * e.position);
+                continue;
+            }
+            if e.kind.electric() {
+                // (Quiet: no rumble.)
+                let nozzle = grid + to_world * (e.position - e.push * 0.6);
+                let count = ((60.0 * *power as f32) * dt).ceil() as u32;
+                out.push(effects::ion_exhaust(
+                    nozzle,
+                    to_world * -e.push,
+                    speed,
+                    count,
+                    *power as f32,
+                ));
                 continue;
             }
             let nozzle = grid + to_world * (e.position - e.push * 0.8);
@@ -1095,10 +1387,105 @@ impl Game {
         }
     }
 
-    /// `vehicle <plane|rover|rocket>`: a ready-made one a few metres ahead.
+    /// The flown vehicle's drills, while they run (G, or the HUD's button) and have power: each
+    /// bores through the block in front of its head, as fast as an iron tool would (slower on
+    /// less power). What it cuts goes to the driver.
+    pub(super) fn run_drills(&mut self, dt: f32) {
+        let Some(i) = self.flight.boarded else {
+            self.flight.drill_work.clear();
+            return;
+        };
+        let v = &self.flight.vessels[i];
+        let Some(craft) = &v.craft else { return };
+        if !v.drilling || v.power_share <= 0.0 || craft.stats.drills.is_empty() || dt <= 0.0 {
+            self.flight.drill_work.clear();
+            return;
+        }
+        let share = v.power_share as f32;
+        let drills = craft.stats.drills.clone();
+        let (grid, to_world) = self.grid_pose(v);
+        self.flight.drill_work.resize(drills.len(), None);
+        let mut done = Vec::new();
+        for (n, d) in drills.iter().enumerate() {
+            let out = to_world * craft::direction(d.facing);
+            let tip = grid + to_world * craft::center(d.at) + out;
+            let Some(cell) = self.planet.cell_at(tip) else {
+                continue;
+            };
+            let block = self.streamer.block(cell).unwrap_or(Block::Air);
+            if !block.is_solid() || block.is_model() || block == Block::Lava {
+                self.flight.drill_work[n] = None;
+                continue;
+            }
+            let tool = items::mining(block)
+                .tool
+                .unwrap_or(items::ToolKind::Pickaxe);
+            let time = items::break_time(block, Some((tool, items::Tier::Iron))).max(0.15);
+            let work = match self.flight.drill_work[n] {
+                Some((c, w)) if c == cell => w + dt * share,
+                _ => dt * share,
+            };
+            // Chips off the face now and then, and the sound of it.
+            let before = work - dt * share;
+            if (before / 0.12).floor() != (work / 0.12).floor() {
+                let up = tip.normalize_or(DVec3::Y);
+                self.survival
+                    .effects
+                    .push(effects::drill_chips(block, tip - out * 0.5, -out, up));
+            }
+            if (before / 0.3).floor() != (work / 0.3).floor() {
+                self.survival
+                    .sounds
+                    .push((Sound::Dig(block.material()), tip));
+            }
+            if work >= time {
+                self.flight.drill_work[n] = None;
+                done.push((cell, block));
+            } else {
+                self.flight.drill_work[n] = Some((cell, work));
+            }
+        }
+        done.dedup();
+        for (cell, block) in done {
+            if self.streamer.block(cell) != Some(block) {
+                continue;
+            }
+            let mut world = crate::survival::World {
+                planet: &self.planet,
+                streamer: &mut self.streamer,
+            };
+            let got = self.survival.drill_block(&mut world, cell, block);
+            if self.player.mode != GameMode::Creative
+                && let Some(stack) = got
+                && let Some(rest) = self.survival.inventory.add(stack)
+            {
+                let at = interact::cell_center(&self.planet, cell);
+                self.survival.spawn(rest, at, DVec3::ZERO, 0.5);
+            }
+        }
+    }
+
+    /// G while flying: the drills on or off.
+    pub(super) fn toggle_drills(&mut self) {
+        let Some(i) = self.flight.boarded else { return };
+        let v = &mut self.flight.vessels[i];
+        if v.craft.as_ref().is_none_or(|c| c.stats.drills.is_empty()) {
+            return;
+        }
+        v.drilling = !v.drilling;
+        let text = if v.drilling {
+            "Drills on"
+        } else {
+            "Drills off"
+        };
+        self.say(text);
+    }
+
+    /// `vehicle <plane|rover|rocket|digger|probe|gate>`: a ready-made one a few metres ahead.
     pub(super) fn spawn_preset(&mut self, name: &str, distance: f64) {
         let Some(craft) = preset(name) else {
-            self.console.print("vehicle <plane|rover|rocket> [m]");
+            self.console
+                .print("vehicle <plane|rover|rocket|digger|probe|gate> [m]");
             return;
         };
         let frame = self.active_frame(self.time);
@@ -1228,6 +1615,44 @@ mod tests {
         assert_eq!(plane.stats.forward, DVec3::Z);
         let rocket = preset("rocket").unwrap();
         assert_eq!(rocket.stats.forward, DVec3::Y);
+
+        // The newer ones have everything they are about.
+        assert!(rover.stats.battery > craft::CORE_BATTERY && rover.stats.solar.len() == 2);
+        let digger = preset("digger").unwrap();
+        assert_eq!(digger.stats.drills.len(), 9, "a wall of drills");
+        assert_eq!(digger.stats.generators, 1);
+        assert_eq!(digger.stats.wheels.len(), 6);
+        let probe = preset("probe").unwrap();
+        assert_eq!(probe.stats.engines.len(), 4);
+        assert!(probe.stats.engines.iter().all(|e| e.kind.electric()));
+        assert_eq!(probe.stats.solar.len(), 12);
+        let gate = preset("gate").unwrap();
+        assert_eq!(gate.stats.doors.len(), 1);
+        let door_cells = gate
+            .parts()
+            .iter()
+            .filter(|p| p.block.door().is_some())
+            .count();
+        assert_eq!(door_cells, 9);
+        assert_eq!(gate.stats.wheels.len(), 4);
+        for name in ["digger", "probe", "gate"] {
+            assert!(preset(name).unwrap().stats.seats.len() == 1, "{name}");
+        }
+    }
+
+    /// Taking a door off a vehicle gives one door, however many cells it had.
+    #[test]
+    fn a_door_comes_off_as_one_door() {
+        let gate = preset("gate").unwrap();
+        let parts: Vec<Part> = gate
+            .parts()
+            .iter()
+            .filter(|p| p.block.door().is_some() || p.block == Block::Seat)
+            .copied()
+            .collect();
+        let items = vehicle_part_items(&parts);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|s| s.item == Item::Block(Block::BigDoor)));
     }
 
     #[test]

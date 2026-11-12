@@ -23,7 +23,7 @@ use crate::{
     effects,
     flight::{
         craft::At,
-        hud::{self, Attitude, FlightAction, FlightInfo, Pointer},
+        hud::{self, Attitude, FlightAction, FlightInfo, Pointer, PowerInfo},
         map_view::{self, MapContext, Planner, View},
         rocket_model::rocket_model,
         vessel::{self, COM_HEIGHT, Controls, FUEL_CAPACITY, SasMode, Vessel},
@@ -120,6 +120,8 @@ pub(super) struct Flight {
     /// Explosions etc. to send with this frame's particles.
     pending: Vec<ParticleEmitter>,
     time: f32,
+    /// What each drill of the flown vehicle is boring into, and how far it has got (s).
+    pub drill_work: Vec<Option<(crate::world::chunk::BlockCell, f32)>>,
 }
 
 impl Default for Flight {
@@ -164,6 +166,7 @@ impl Default for Flight {
             carry: [0.0; 3],
             pending: Vec::new(),
             time: 0.0,
+            drill_work: Vec::new(),
         }
     }
 }
@@ -440,6 +443,9 @@ impl Game {
         if self.input.pressed(KeyCode::KeyV) && self.flight.vessels[i].craft.is_some() {
             self.flight.cockpit = !self.flight.cockpit;
         }
+        if self.input.pressed(KeyCode::KeyG) {
+            self.toggle_drills();
+        }
     }
 
     fn toggle_map(&mut self) {
@@ -518,6 +524,9 @@ impl Game {
         let vessel = &mut self.flight.vessels[i];
         if self.infinite_fuel {
             vessel.fill_up();
+        }
+        if self.infinite_power {
+            vessel.fill_charge();
         }
         if rails {
             let (t, stopped) = vessel.rails(&self.bodies, (t0, t1));
@@ -618,6 +627,8 @@ impl Game {
             // (An engine left running keeps running with nobody at the controls.)
             let burning = v.engines_on();
             if v.landed.is_some() && !burning {
+                // (Parked: its panels still charge it.)
+                v.charge_idle(&self.bodies, t0, t1 - t0);
                 v.sync_landed(&self.bodies, t1);
                 continue;
             }
@@ -1447,6 +1458,7 @@ impl Game {
                     }
                     FlightAction::ToggleMap => self.toggle_map(),
                     FlightAction::ToggleBrake => self.flight.brake_on = !self.flight.brake_on,
+                    FlightAction::ToggleDrills => self.toggle_drills(),
                 }
             }
         }
@@ -1504,6 +1516,25 @@ impl Game {
                 .as_ref()
                 .filter(|c| !c.stats.wheels.is_empty())
                 .map(|_| self.flight.controls.brake),
+            power: v
+                .craft
+                .as_ref()
+                .filter(|c| c.stats.electric || !c.stats.solar.is_empty())
+                .map(|c| PowerInfo {
+                    charge: v.charge_share(),
+                    stored: if v.charge < 0.0 {
+                        c.stats.battery
+                    } else {
+                        v.charge
+                    },
+                    made: v.power_made,
+                    used: v.power_draw * v.power_share,
+                }),
+            drills: v
+                .craft
+                .as_ref()
+                .filter(|c| !c.stats.drills.is_empty())
+                .map(|_| v.drilling),
             attitude: Attitude {
                 right: v.right(),
                 nose: v.nose(),
@@ -1752,6 +1783,57 @@ impl Game {
                 } else {
                     "Infinite fuel off"
                 });
+            }
+            "power" if matches!(args.first().copied(), Some("infinite" | "inf")) => {
+                // power infinite [on|off]: vehicles' batteries stay full, and every factory
+                // network has all the power it asks for.
+                self.infinite_power = match args.get(1).copied() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => !self.infinite_power,
+                };
+                self.console.print(if self.infinite_power {
+                    "Infinite power on: batteries stay full, factories never go short"
+                } else {
+                    "Infinite power off"
+                });
+            }
+            "power" => {
+                // power [percent]: the flown vehicle's batteries (what they hold, or set them).
+                let Some(i) = self.flight.boarded else {
+                    self.console
+                        .print("power infinite [on|off], or in a vehicle: power [percent]");
+                    return true;
+                };
+                let v = &mut self.flight.vessels[i];
+                let battery = v.craft.as_ref().map_or(0.0, |c| c.stats.battery);
+                if let Some(percent) = args.first().and_then(|a| a.parse::<f64>().ok()) {
+                    v.charge = battery * (percent / 100.0).clamp(0.0, 1.0);
+                }
+                let text = format!(
+                    "Batteries {:.0} of {:.0} kJ, making {:.1} kW, using {:.1} kW",
+                    v.charge.max(0.0) / 1000.0,
+                    battery / 1000.0,
+                    v.power_made / 1000.0,
+                    v.power_draw * v.power_share / 1000.0
+                );
+                self.console.print(text);
+            }
+            "drill" => {
+                // drill [on|off]: the flown vehicle's drills.
+                let Some(i) = self.flight.boarded else {
+                    self.console.print("Not in a vehicle");
+                    return true;
+                };
+                let v = &mut self.flight.vessels[i];
+                v.drilling = match args.first().copied() {
+                    Some("on") => true,
+                    Some("off") => false,
+                    _ => !v.drilling,
+                };
+                let n = v.craft.as_ref().map_or(0, |c| c.stats.drills.len());
+                let text = format!("Drills {} ({n})", if v.drilling { "on" } else { "off" });
+                self.console.print(text);
             }
             "throttle" | "sas" | "node" | "chase" | "dive" | "fuel" | "steer" | "brake" => {
                 let Some(i) = self.flight.boarded else {

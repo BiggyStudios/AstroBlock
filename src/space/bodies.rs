@@ -139,6 +139,32 @@ impl Bodies {
         max_temperature * (edge / distance.max(1.0)).sqrt()
     }
 
+    /// Sunlight at `r` (relative to `body`, inertial axes): the way to the star (inertial,
+    /// unit) and how strong it is, 1 at the home planet's distance (as 1 / distance^2) and 0
+    /// where the planet or the moon is in the way.
+    pub fn sunlight(&self, body: Body, r: DVec3, t: f64) -> (DVec3, f64) {
+        let at = self.offset(body, t).0 + r;
+        let to_star = self.offset(Body::Star, t).0 - at;
+        let distance = to_star.length().max(1.0);
+        let dir = to_star / distance;
+        let home = self.state(Body::Planet, t).0.length();
+        let mut strength = (home / distance).powi(2).min(20.0);
+        for b in [Body::Planet, Body::Moon] {
+            let c = self.offset(b, t).0 - at;
+            let along = c.dot(dir);
+            if along > 0.0 && (c - dir * along).length() < self.radius(b) {
+                strength = 0.0;
+            }
+        }
+        (dir, strength)
+    }
+
+    /// The way to the star from `body`'s centre, in its own rotating frame (unit).
+    pub fn sun_in_frame(&self, body: Body, t: f64) -> DVec3 {
+        let to_star = self.offset(Body::Star, t).0 - self.offset(body, t).0;
+        (self.frame(body, t).rotation.inverse() * to_star).normalize_or(DVec3::Y)
+    }
+
     /// Rails (time warp beyond physics) stop at this radius: the top of the air, the star's
     /// hot zone, or `clearance` above an airless surface.
     pub fn rails_floor(&self, body: Body, clearance: f64) -> f64 {

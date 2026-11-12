@@ -12,11 +12,11 @@
 use glam::{DMat3, DQuat, DVec3};
 
 use crate::{
-    flight::craft::{Craft, Part, WHEEL_RADIUS, center, direction, is_cube},
+    flight::craft::{Craft, Part, center, direction, door_piece, is_cube, wheel_radius},
     mobs::models::{Rgb, Rig},
     render::{
         ChunkMesh,
-        models::{Light, Quad, build},
+        models::{self, Light, Quad, build},
     },
     world::{block::Block, textures::Tex},
 };
@@ -26,20 +26,44 @@ use crate::{
 pub enum Motion {
     /// Propeller blades: spin with the throttle.
     Spin,
-    /// A wheel: rolls with the ground going by. Front wheels steer too (about the vehicle's up).
-    Roll { steers: bool },
+    /// A wheel of `radius` (m): rolls with the ground going by. Front wheels steer too (about
+    /// the vehicle's up).
+    Roll { steers: bool, radius: f32 },
     /// The back half of a flap, on its hinge: follows surface `n`'s deflection
     /// (`Stats::surfaces`, `Vessel::flaps`).
     Flap(usize),
+    /// A drill's cutting head: turns while the drills run.
+    Bore,
+    /// A gimballed engine's nozzle, `arm` (grid m) from the centre of mass: swings as its thrust
+    /// steers (`Vessel::gimbal`).
+    Gimbal { arm: DVec3 },
+    /// A leaf of door `n` (`Stats::doors`), moving as `how` says (a door motion of
+    /// `models::Motion`).
+    Door { n: usize, how: models::Motion },
 }
 
 /// A moving piece: turns about `axis` (grid axes, unit) through `at` (grid m), where its mesh's
-/// origin is.
+/// origin is. A door's leaf also moves: `lift` and `step` are one model unit up and along its
+/// axis (grid m).
 #[derive(Clone, Copy, Debug)]
 pub struct Pivot {
     pub motion: Motion,
     pub at: DVec3,
     pub axis: DVec3,
+    pub lift: DVec3,
+    pub step: DVec3,
+}
+
+impl Pivot {
+    fn new(motion: Motion, at: DVec3, axis: DVec3) -> Self {
+        Self {
+            motion,
+            at,
+            axis,
+            lift: DVec3::ZERO,
+            step: DVec3::ZERO,
+        }
+    }
 }
 
 /// How far a flap's back half swings at full deflection (rad): the angle whose sine is the
@@ -50,15 +74,29 @@ const FLAP_SWING: f64 = 0.45;
 const PROP_SPEED: f32 = 30.0;
 const MOST_STEP: f32 = 0.6;
 
+/// A drill's turning at full speed (rad/s).
+const BORE_SPEED: f32 = 14.0;
+/// How far a gimballed nozzle swings as drawn at full steering (rad; a little more than it
+/// really does, to read).
+const GIMBAL_SWING: f64 = 0.22;
+
 /// What the moving pieces are doing right now, eased from frame to frame.
 #[derive(Clone, Debug, Default)]
 pub struct Looks {
     prop_rate: f32,
     prop_angle: f32,
+    /// How fast the ground goes by (m/s), and how far the wheels have rolled (m).
     wheel_rate: f32,
-    wheel_angle: f32,
+    rolled: f64,
     steer: f32,
     flaps: Vec<f32>,
+    bore_rate: f32,
+    bore_angle: f32,
+    gimbal: DVec3,
+    /// How far open each door is (0..1), and whether it is moving.
+    doors: Vec<f32>,
+    door_moving: Vec<bool>,
+    clock: f64,
 }
 
 /// What the vehicle is doing, for `Looks::advance`.
@@ -71,6 +109,12 @@ pub struct Doing<'a> {
     /// The front wheels' angle (rad), and each surface's flap deflection (-1..1).
     pub steer: f32,
     pub flaps: &'a [f32],
+    /// The drills are boring.
+    pub drilling: bool,
+    /// How the gimballed engines steer (`Vessel::gimbal`).
+    pub gimbal: DVec3,
+    /// Each door (`Stats::doors`): whether it should be open, and how fast it opens (1/s).
+    pub doors: &'a [(bool, f32)],
 }
 
 /// Spins an angle on by `rate * dt`, never more than `MOST_STEP`, kept within a turn.
@@ -87,27 +131,52 @@ impl Looks {
         let spool = if target > self.prop_rate { 2.0 } else { 0.8 };
         self.prop_rate = approach(self.prop_rate, target, spool, dt);
         self.prop_angle = turn_on(self.prop_angle, self.prop_rate, dt);
-        // Wheels go with the ground; in the air they run down.
+        // Wheels go with the ground; in the air they run down. (As a distance rolled: each
+        // wheel turns by its own size. Never more than a wheel's worth of a step a frame.)
         let (target, grip) = if doing.touching {
-            (doing.ground_speed / WHEEL_RADIUS as f32, 20.0)
+            (doing.ground_speed, 20.0)
         } else {
             (0.0, 0.6)
         };
         self.wheel_rate = approach(self.wheel_rate, target, grip, dt);
-        self.wheel_angle = turn_on(self.wheel_angle, self.wheel_rate, dt);
+        let most = MOST_STEP * crate::flight::craft::WHEEL_RADIUS as f32;
+        self.rolled = (self.rolled + (self.wheel_rate * dt).clamp(-most, most) as f64) % 1.0e4;
         self.steer = approach(self.steer, doing.steer, 12.0, dt);
         self.flaps.resize(doing.flaps.len(), 0.0);
         for (shown, &wanted) in self.flaps.iter_mut().zip(doing.flaps) {
             *shown = approach(*shown, wanted.clamp(-1.0, 1.0), 14.0, dt);
         }
+        let bore = if doing.drilling { BORE_SPEED } else { 0.0 };
+        self.bore_rate = approach(self.bore_rate, bore, 3.0, dt);
+        self.bore_angle = turn_on(self.bore_angle, self.bore_rate, dt);
+        let keep = (-(dt as f64) * 6.0).exp();
+        self.gimbal = doing.gimbal + (self.gimbal - doing.gimbal) * keep;
+        self.doors.resize(doing.doors.len(), 0.0);
+        self.door_moving.resize(doing.doors.len(), false);
+        for ((open, moving), &(wanted, rate)) in
+            (self.doors.iter_mut().zip(&mut self.door_moving)).zip(doing.doors)
+        {
+            let target = if wanted { 1.0 } else { 0.0 };
+            let step = rate * dt;
+            *moving = (*open - target).abs() > 1e-4 && dt > 0.0;
+            *open += (target - *open).clamp(-step, step);
+        }
+        self.clock += dt as f64;
+    }
+
+    /// Doors already as they should be (a vehicle just seen: no opening as it comes into view).
+    pub fn settle_doors(&mut self, doors: &[(bool, f32)]) {
+        self.doors = doors.iter().map(|&(open, _)| f32::from(open)).collect();
+        self.door_moving = vec![false; doors.len()];
     }
 
     /// How a moving piece is turned now, in grid axes (`up`: the vehicle's).
     pub fn turn(&self, pivot: &Pivot, up: DVec3) -> DQuat {
         match pivot.motion {
             Motion::Spin => DQuat::from_axis_angle(pivot.axis, self.prop_angle as f64),
-            Motion::Roll { steers } => {
-                let roll = DQuat::from_axis_angle(pivot.axis, self.wheel_angle as f64);
+            Motion::Roll { steers, radius } => {
+                let angle = (self.rolled / radius.max(0.1) as f64) % std::f64::consts::TAU;
+                let roll = DQuat::from_axis_angle(pivot.axis, angle);
                 if steers {
                     DQuat::from_axis_angle(up, -self.steer as f64) * roll
                 } else {
@@ -118,7 +187,58 @@ impl Looks {
                 let d = self.flaps.get(n).copied().unwrap_or(0.0) as f64;
                 DQuat::from_axis_angle(pivot.axis, d * FLAP_SWING)
             }
+            Motion::Bore => DQuat::from_axis_angle(pivot.axis, self.bore_angle as f64),
+            Motion::Gimbal { arm } => {
+                // The thrust leans the way that gives the torque, so the exhaust leans the
+                // other way.
+                let exhaust = pivot.axis;
+                let lean = self.gimbal.cross(arm.normalize_or(DVec3::Y));
+                let lean = lean - exhaust * exhaust.dot(lean);
+                let turned = (exhaust - lean * GIMBAL_SWING.tan()).normalize_or(exhaust);
+                DQuat::from_rotation_arc(exhaust, turned)
+            }
+            Motion::Door { .. } => {
+                let pose = self.door_pose(pivot);
+                DQuat::from_axis_angle(pivot.axis, pose.angle as f64)
+            }
         }
+    }
+
+    /// How far a moving piece is moved now (grid m): only a door's leaves move.
+    pub fn offset(&self, pivot: &Pivot) -> DVec3 {
+        match pivot.motion {
+            Motion::Door { .. } => {
+                let pose = self.door_pose(pivot);
+                pivot.lift * pose.lift as f64 + pivot.step * pose.shift as f64
+            }
+            _ => DVec3::ZERO,
+        }
+    }
+
+    /// Whether a moving piece is drawn now (a big door's slats roll up out of sight).
+    pub fn shown(&self, pivot: &Pivot) -> bool {
+        match pivot.motion {
+            Motion::Door { .. } => self.door_pose(pivot).shown,
+            _ => true,
+        }
+    }
+
+    fn door_pose(&self, pivot: &Pivot) -> models::PartPose {
+        let Motion::Door { n, how } = pivot.motion else {
+            return how_still();
+        };
+        let open = self.doors.get(n).copied().unwrap_or(0.0);
+        let moving = self.door_moving.get(n).copied().unwrap_or(false);
+        how.pose(f64::from(u8::from(moving)), open, self.clock, n as u64)
+    }
+}
+
+fn how_still() -> models::PartPose {
+    models::PartPose {
+        lift: 0.0,
+        angle: 0.0,
+        shown: true,
+        shift: 0.0,
     }
 }
 
@@ -280,14 +400,16 @@ fn model(rig: &mut Rig, part: Part, whole: &Whole, moving: &mut Vec<(Pivot, Vec<
     let facing = direction(part.facing);
     let c = center(part.at);
     let salt = rig.salt;
+    let radius = wheel_radius(part.block).unwrap_or(0.7) as f32;
     let wheel = |moving: &mut Vec<_>, shape: &dyn Fn(&mut Rig)| {
-        let pivot = Pivot {
-            motion: Motion::Roll {
+        let pivot = Pivot::new(
+            Motion::Roll {
                 steers: c.dot(forward) > whole.com.dot(forward),
+                radius,
             },
-            at: c,
-            axis: up.cross(forward).normalize_or(DVec3::X),
-        };
+            c,
+            up.cross(forward).normalize_or(DVec3::X),
+        );
         moving.push((pivot, piece(salt, axle_turn(right, up), shape)));
     };
     match part.block {
@@ -321,12 +443,7 @@ fn model(rig: &mut Rig, part: Part, whole: &Whole, moving: &mut Vec<(Pivot, Vec<
                 // (A tip painted on one blade, so the eye can follow the turning.)
                 r.part([18.0, -1.6, 1.9], [22.1, 1.6, 3.6], tex, AMBER);
             });
-            let pivot = Pivot {
-                motion: Motion::Spin,
-                at: c,
-                axis: facing,
-            };
-            moving.push((pivot, blades));
+            moving.push((Pivot::new(Motion::Spin, c, facing), blades));
         }
         Block::Wing => shaped(rig, part, turned_to(facing), |r| {
             r.part([-8.0, -8.0, -1.5], [8.0, 8.0, 1.5], tex, WHITE);
@@ -348,12 +465,8 @@ fn model(rig: &mut Rig, part: Part, whole: &Whole, moving: &mut Vec<(Pivot, Vec<
                 .iter()
                 .position(|s| s.position == c)
                 .unwrap_or(usize::MAX);
-            let pivot = Pivot {
-                motion: Motion::Flap(n),
-                at: c + back * (2.0 / 16.0),
-                // Turning this way takes the back edge away from the side it pushes towards.
-                axis: facing.cross(back),
-            };
+            // (Turning this way takes the back edge away from the side it pushes towards.)
+            let pivot = Pivot::new(Motion::Flap(n), c + back * (2.0 / 16.0), facing.cross(back));
             moving.push((pivot, flap));
         }
         Block::Seat => shaped(rig, part, seat_turn(facing), |r| {
@@ -379,7 +492,160 @@ fn model(rig: &mut Rig, part: Part, whole: &Whole, moving: &mut Vec<(Pivot, Vec<
                 r.part([-4.3, -0.8, -4.6], [4.3, 0.8, 4.6], tex, METAL);
             });
         }
-        _ => {}
+        Block::LargeWheel | Block::GiantWheel => {
+            // Wider, with a chunkier tread and a hub that shows it turning.
+            let rim = radius * 16.0;
+            let half = if part.block == Block::GiantWheel {
+                7.5
+            } else {
+                6.0
+            };
+            wheel(moving, &|r| {
+                drum(r, half, rim, tex, TIRE);
+                drum(r, half + 0.4, rim * 0.92, tex, [52, 52, 58]);
+                drum(r, half + 0.6, rim * 0.5, tex, METAL);
+                drum(r, half + 0.9, rim * 0.18, tex, AMBER);
+                r.part(
+                    [-half - 0.8, -1.2, -rim * 0.48],
+                    [half + 0.8, 1.2, rim * 0.48],
+                    tex,
+                    LIGHT_METAL,
+                );
+            });
+        }
+        Block::VectorEngine => {
+            // A collar fixed to the body; the bell swings in it.
+            let turn = turned_to(facing);
+            shaped(rig, part, turn, |r| {
+                r.part([-7.0, -7.0, -8.0], [7.0, 7.0, -3.0], tex, METAL);
+                r.part([-5.0, -5.0, -3.0], [5.0, 5.0, -1.0], tex, AMBER);
+            });
+            let bell = piece(salt, turn, |r| {
+                r.part([-3.5, -3.5, -2.0], [3.5, 3.5, 2.0], tex, DARK);
+                r.part([-5.5, -5.5, 2.0], [5.5, 5.5, 6.0], tex, DARK);
+                r.part([-7.0, -7.0, 6.0], [7.0, 7.0, 9.5], tex, [60, 62, 70]);
+            });
+            let pivot = Pivot::new(
+                Motion::Gimbal { arm: c - whole.com },
+                c + facing * (-1.0 / 16.0),
+                facing,
+            );
+            moving.push((pivot, bell));
+        }
+        Block::Aerospike => shaped(rig, part, turned_to(facing), |r| {
+            // A short body with the spike the exhaust runs down, ringed by burners.
+            r.part([-7.0, -7.0, -8.0], [7.0, 7.0, -1.0], tex, LIGHT_METAL);
+            r.part([-7.5, -7.5, -1.0], [7.5, 7.5, 1.0], tex, [200, 96, 40]);
+            r.part([-5.0, -5.0, 1.0], [5.0, 5.0, 4.0], tex, METAL);
+            r.part([-3.5, -3.5, 4.0], [3.5, 3.5, 7.0], tex, METAL);
+            r.part([-2.0, -2.0, 7.0], [2.0, 2.0, 10.0], tex, DARK);
+        }),
+        Block::IonEngine => shaped(rig, part, turned_to(facing), |r| {
+            // A wide flat thruster: its grid glows blue (the face texture).
+            r.part([-7.5, -7.5, -8.0], [7.5, 7.5, 2.0], tex, METAL);
+            r.part([-7.0, -7.0, 2.0], [7.0, 7.0, 4.0], tex, LIGHT_METAL);
+            r.part([-6.0, -6.0, 4.0], [6.0, 6.0, 4.6], Tex::IonFace, WHITE);
+        }),
+        Block::VehicleDrill => {
+            // A gearbox against the body, and the cutting head turning out past the cell.
+            let turn = turned_to(facing);
+            shaped(rig, part, turn, |r| {
+                r.part([-7.5, -7.5, -8.0], [7.5, 7.5, -2.0], tex, [226, 172, 44]);
+                r.part([-5.0, -5.0, -2.0], [5.0, 5.0, 1.0], tex, DARK);
+            });
+            let head = piece(salt, turn, |r| {
+                r.part([-6.5, -6.5, 1.0], [6.5, 6.5, 4.0], tex, METAL);
+                r.part([-5.0, -5.0, 4.0], [5.0, 5.0, 7.5], tex, LIGHT_METAL);
+                r.part([-3.5, -3.5, 7.5], [3.5, 3.5, 10.5], tex, LIGHT_METAL);
+                r.part([-1.5, -1.5, 10.5], [1.5, 1.5, 13.0], tex, AMBER);
+                // Teeth on the head, so it is seen to turn.
+                r.part([-7.2, -1.0, 2.0], [7.2, 1.0, 5.0], tex, DARK);
+                r.part([-1.0, -5.8, 5.0], [1.0, 5.8, 8.0], tex, DARK);
+            });
+            moving.push((Pivot::new(Motion::Bore, c, facing), head));
+        }
+        Block::SolarPanel => shaped(rig, part, turned_to(facing), |r| {
+            // Flat against what it is on, its cells to the sky (+z of the model).
+            r.part([-8.0, -8.0, -8.0], [8.0, 8.0, -6.5], tex, METAL);
+            r.part([-7.5, -7.5, -6.5], [7.5, 7.5, -5.5], Tex::SolarCell, WHITE);
+        }),
+        Block::Accumulator | Block::CoalGenerator => {
+            placed(
+                rig,
+                part,
+                front_turn(facing),
+                models::held_model(part.block),
+            );
+        }
+        _ => {
+            if let Some((kind, _)) = part.block.door() {
+                // Its frame stays, its leaves move (with door `n`).
+                let turn = front_turn(facing);
+                let (fixed, leaves) = models::door_model(kind, piece_of(part.facing));
+                placed(rig, part, turn, fixed);
+                let n = whole.craft.door_at(part.at).map_or(usize::MAX, |(n, _)| n);
+                for leaf in leaves {
+                    let p = DVec3::from(leaf.pivot.map(|v| v as f64));
+                    let quads = leaf
+                        .quads
+                        .into_iter()
+                        .map(|mut q| {
+                            for corner in &mut q.corners {
+                                let v = turn * (DVec3::from(corner.map(|v| v as f64)) - p);
+                                *corner = v.as_vec3().to_array();
+                            }
+                            q
+                        })
+                        .collect();
+                    let axis = turn * DVec3::from(leaf.axis.map(|v| v as f64));
+                    let pivot = Pivot {
+                        lift: turn * DVec3::Z / 16.0,
+                        step: axis / 16.0,
+                        ..Pivot::new(
+                            Motion::Door {
+                                n,
+                                how: leaf.motion,
+                            },
+                            c + turn * (p - DVec3::splat(8.0)) / 16.0,
+                            axis.normalize_or(DVec3::Y),
+                        )
+                    };
+                    moving.push((pivot, quads));
+                }
+            }
+        }
+    }
+}
+
+/// Which cell of its door a door part is (`ModelState::piece`).
+fn piece_of(facing: u8) -> u8 {
+    let (col, row) = door_piece(facing);
+    (col + 3 * row) as u8
+}
+
+/// Takes a block model's axes (x across, -y its front, z up) onto a part whose front looks
+/// along `front` (horizontal), up the grid's +Y.
+fn front_turn(front: DVec3) -> DMat3 {
+    let front = if front.y.abs() > 0.5 {
+        DVec3::NEG_Z
+    } else {
+        front
+    };
+    let y = -front;
+    let z = DVec3::Y;
+    DMat3::from_cols(y.cross(z), y, z)
+}
+
+/// Adds the quads of a block model (0..16 model units, see `render::models`), turned by `turn`
+/// about the middle of the cell, at the part.
+fn placed(rig: &mut Rig, part: Part, turn: DMat3, quads: Vec<Quad>) {
+    let c = center(part.at) * 16.0;
+    for mut q in quads {
+        for corner in &mut q.corners {
+            let p = turn * (DVec3::from(corner.map(|v| v as f64)) - DVec3::splat(8.0)) + c;
+            *corner = p.as_vec3().to_array();
+        }
+        rig.quads.push(q);
     }
 }
 
@@ -555,6 +821,9 @@ mod tests {
             ground_speed: 0.0,
             steer: 0.0,
             flaps: &flaps,
+            drilling: false,
+            gimbal: DVec3::ZERO,
+            doors: &[],
         };
         for _ in 0..60 {
             looks.advance(&doing, 1.0 / 60.0);
@@ -574,6 +843,84 @@ mod tests {
             "spooling up: {}",
             looks.prop_rate
         );
+    }
+
+    /// A drill's head and a gimballed nozzle move on their own; a door's leaves swing open
+    /// when it opens (and only then), round a hinge where the door is.
+    #[test]
+    fn drills_gimbals_and_doors_move() {
+        let mut c = Craft::new(4);
+        for (at, block, facing) in [
+            ([0, 0, 1], Block::VehicleDrill, DVec3::Z),
+            ([0, 0, -1], Block::VectorEngine, DVec3::NEG_Z),
+            ([1, 0, 0], Block::GiantWheel, DVec3::X),
+            ([0, 1, 0], Block::SolarPanel, DVec3::Y),
+            ([-1, 0, 0], Block::Accumulator, DVec3::NEG_X),
+        ] {
+            assert!(c.place(Part {
+                at,
+                block,
+                facing: facing_of(facing),
+            }));
+        }
+        let door = crate::flight::craft::door_cells(
+            crate::world::block::DoorKind::Hinged,
+            [0, 1, -1],
+            facing_of(DVec3::NEG_Z),
+        );
+        let parts: Vec<Part> = door
+            .iter()
+            .map(|&(at, facing)| Part {
+                at,
+                block: Block::Door,
+                facing,
+            })
+            .collect();
+        assert!(c.place_all(&parts));
+        assert_eq!(c.stats.doors.len(), 1);
+        let (_, moving) = craft_model(&c, Light::default());
+        let has = |f: &dyn Fn(&Motion) -> bool| moving.iter().filter(|(p, _)| f(&p.motion)).count();
+        assert_eq!(has(&|m| *m == Motion::Bore), 1);
+        assert_eq!(has(&|m| matches!(m, Motion::Gimbal { .. })), 1);
+        assert_eq!(
+            has(&|m| matches!(m, Motion::Roll { radius, .. } if *radius > 1.5)),
+            1
+        );
+        let leaves: Vec<Pivot> = moving
+            .iter()
+            .filter(|(p, _)| matches!(p.motion, Motion::Door { n: 0, .. }))
+            .map(|(p, _)| *p)
+            .collect();
+        assert_eq!(leaves.len(), 2, "a leaf for each cell");
+
+        let mut looks = Looks::default();
+        let run = |open: bool, looks: &mut Looks| {
+            let doors = [(open, 2.0)];
+            let doing = Doing {
+                power: 0.0,
+                touching: true,
+                ground_speed: 0.0,
+                steer: 0.0,
+                flaps: &[],
+                drilling: true,
+                gimbal: DVec3::X,
+                doors: &doors,
+            };
+            for _ in 0..60 {
+                looks.advance(&doing, 1.0 / 60.0);
+            }
+        };
+        run(false, &mut looks);
+        let shut = looks.turn(&leaves[0], DVec3::Y);
+        assert!(shut.angle_between(DQuat::IDENTITY) < 1e-6);
+        run(true, &mut looks);
+        let open = looks.turn(&leaves[0], DVec3::Y);
+        assert!((open.angle_between(DQuat::IDENTITY) - std::f64::consts::FRAC_PI_2).abs() < 1e-3);
+        assert!(looks.bore_rate > 0.5 * BORE_SPEED);
+        // Walked through when open, not when shut.
+        assert!(!c.solid([0, 1, -1]) || !c.door_open(0));
+        assert!(c.set_door([0, 2, -1], true));
+        assert!(c.door_open(0) && !c.solid([0, 1, -1]) && !c.solid([0, 2, -1]));
     }
 
     #[test]

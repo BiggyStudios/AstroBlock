@@ -61,6 +61,11 @@ const SPACING: f32 = 1.0 / BELT_ITEMS as f32;
 
 /// What a generator makes while it has fuel, used or not (W).
 pub const GENERATOR_POWER: f32 = 180_000.0;
+/// What a solar panel makes with the sun straight above it (W): as much less as the sun is
+/// lower, nothing at night.
+pub const SOLAR_POWER: f32 = 20_000.0;
+/// What a big door's motor takes while it moves (W).
+pub const DOOR_POWER: f32 = 20_000.0;
 /// Energy in fuel (J) per second it would burn in a furnace: coal makes 7.2 MJ.
 pub const FUEL_ENERGY: f32 = 90_000.0;
 /// Seconds an electric furnace takes per item (a furnace takes 10).
@@ -275,11 +280,16 @@ pub enum MachineKind {
     Assembler,
     ChipFab,
     Accumulator,
+    Solar,
+    /// A big door's motor (in the bottom middle cell of the door).
+    BigDoor,
 }
 
 impl MachineKind {
     pub fn of(block: Block) -> Option<MachineKind> {
         Some(match block {
+            Block::SolarPanel => MachineKind::Solar,
+            Block::BigDoor | Block::BigDoorOpen => MachineKind::BigDoor,
             Block::CoalGenerator => MachineKind::Generator,
             Block::ElectricFurnace => MachineKind::ElectricFurnace,
             Block::Miner => MachineKind::Miner,
@@ -305,13 +315,16 @@ impl MachineKind {
             MachineKind::Assembler => "assembler",
             MachineKind::ChipFab => "chip fab",
             MachineKind::Accumulator => "accumulator",
+            MachineKind::Solar => "solar panel",
+            MachineKind::BigDoor => "big door",
         }
     }
 
-    /// What it uses while it works (W); 0 for generators and accumulators.
+    /// What it uses while it works (W); 0 for what makes or stores power.
     pub fn power(self) -> f32 {
         match self {
-            MachineKind::Generator | MachineKind::Accumulator => 0.0,
+            MachineKind::Generator | MachineKind::Accumulator | MachineKind::Solar => 0.0,
+            MachineKind::BigDoor => DOOR_POWER,
             MachineKind::ElectricFurnace => 90_000.0,
             MachineKind::Miner => 60_000.0,
             MachineKind::OilPump => 50_000.0,
@@ -335,7 +348,13 @@ impl MachineKind {
 
     /// Has an output slot (conveyors behind it take from there).
     pub fn has_output(self) -> bool {
-        !matches!(self, MachineKind::Generator | MachineKind::Accumulator)
+        !matches!(
+            self,
+            MachineKind::Generator
+                | MachineKind::Accumulator
+                | MachineKind::Solar
+                | MachineKind::BigDoor
+        )
     }
 
     /// Where cables meet it (model units above the cell's floor).
@@ -343,6 +362,9 @@ impl MachineKind {
         match self {
             MachineKind::Miner => models::MINER_TOP,
             MachineKind::Refinery => models::REFINERY_TOP,
+            MachineKind::Solar => 8.0,
+            // (On the housing over the door.)
+            MachineKind::BigDoor => 3.0 * 16.0 + 5.0,
             _ => models::MACHINE_TOP,
         }
     }
@@ -375,6 +397,13 @@ pub struct Machine {
     /// What a miner or oil pump brings up (decided by what is under it when it is placed).
     #[serde(default)]
     pub resource: Option<Item>,
+    /// A solar panel: which way is up where it stands (planet-relative; worked out when it is
+    /// placed in space, see `locate`).
+    #[serde(skip)]
+    pub up: Option<[f32; 3]>,
+    /// A big door: its motor wants to run (the door is moving).
+    #[serde(skip)]
+    pub wanted: bool,
 }
 
 impl Machine {
@@ -397,6 +426,8 @@ impl Machine {
             supply: 0.0,
             recipe: None,
             resource: None,
+            up: None,
+            wanted: false,
         }
     }
 
@@ -480,9 +511,20 @@ impl Machine {
         }
     }
 
-    /// Wants power now: a machine with something to do.
+    /// Wants power now: a machine with something to do, a big door that is moving.
     fn working(&self) -> bool {
+        if self.kind == MachineKind::BigDoor {
+            return self.wanted;
+        }
         self.kind.power() > 0.0 && self.product().is_some()
+    }
+
+    /// What a solar panel makes with the sun the way `sun` points (planet-relative, unit).
+    fn sunlight(&self, sun: DVec3) -> f32 {
+        let up = self
+            .up
+            .map_or(DVec3::ZERO, |u| DVec3::from(u.map(f64::from)));
+        SOLAR_POWER * (up.dot(sun) as f32).max(0.0)
     }
 
     /// How far through the current item or batch (0..1).
@@ -622,6 +664,11 @@ impl Machine {
         match self.kind {
             MachineKind::Generator if self.power > 0.0 => format!("making {}", kw(self.power)),
             MachineKind::Generator => "no fuel".to_string(),
+            MachineKind::Solar if self.power > 0.0 => format!("making {}", kw(self.power)),
+            MachineKind::Solar => "no sun".to_string(),
+            MachineKind::BigDoor if self.wanted && self.supply <= 0.0 => "no power".to_string(),
+            MachineKind::BigDoor if self.wanted => format!("moving, {}", kw(self.power)),
+            MachineKind::BigDoor => "ready".to_string(),
             MachineKind::Accumulator => {
                 let charge = percent(self.energy / self.energy_total.max(1.0));
                 if self.power > 0.0 {
@@ -874,6 +921,11 @@ pub struct Factory {
     /// Each network's power over the last minute, by its key.
     history: FastMap<BlockCell, History>,
     pub art: Art,
+    /// The way to the sun in this world's frame (unit; the game sets it every frame), for
+    /// solar panels.
+    pub sun: DVec3,
+    /// Every network has all the power it asks for (`power infinite`).
+    pub infinite: bool,
 }
 
 impl Factory {
@@ -1299,8 +1351,16 @@ impl Factory {
         self.linked = true;
     }
 
-    /// Places conveyors in space (for drawing and the network), those that aren't yet.
+    /// Places conveyors in space (for drawing and the network), those that aren't yet, and
+    /// finds which way is up at solar panels.
     pub fn locate(&mut self, planet: &Planet) {
+        for m in &mut self.machines {
+            if m.kind == MachineKind::Solar && m.up.is_none() {
+                let up = models::cell_point(planet, m.cell, [8.0, 8.0, 16.0])
+                    - models::cell_point(planet, m.cell, [8.0, 8.0, 0.0]);
+                m.up = Some(up.normalize_or(DVec3::Y).as_vec3().to_array());
+            }
+        }
         if !self.unlocated {
             return;
         }
@@ -1364,7 +1424,22 @@ impl Factory {
     /// that have something to do get it first (all slowed alike when there isn't enough), what
     /// is left charges the accumulators, and when the generators fall short the accumulators
     /// make up what they can.
+    /// Whether the network the machine in `cell` is on has power to give, made or stored.
+    pub fn has_power(&self, cell: BlockCell) -> bool {
+        if self.infinite {
+            return true;
+        }
+        let Some(Node::Machine(i)) = self.node(cell) else {
+            return false;
+        };
+        self.machine_network
+            .get(i as usize)
+            .and_then(|&n| self.networks.get(n as usize))
+            .is_some_and(|n| n.capacity > 0.0 || n.stored > 1.0)
+    }
+
     fn step_power(&mut self, dt: f32) {
+        let (sun, infinite) = (self.sun, self.infinite);
         for net in &mut self.networks {
             let (mut capacity, mut demand, mut stored, mut storage) = (0.0, 0.0, 0.0, 0.0);
             let (mut gens, mut fuelled, mut users, mut busy, mut accumulators) = (0, 0, 0, 0, 0);
@@ -1378,6 +1453,14 @@ impl Factory {
                         if m.can_supply() {
                             fuelled += 1;
                             capacity += GENERATOR_POWER;
+                        }
+                    }
+                    MachineKind::Solar => {
+                        gens += 1;
+                        let made = m.sunlight(sun);
+                        if made > 0.0 {
+                            fuelled += 1;
+                            capacity += made;
                         }
                     }
                     MachineKind::Accumulator => {
@@ -1396,6 +1479,10 @@ impl Factory {
                     }
                 }
             }
+            if infinite {
+                // (Made out of nothing: as much as is asked for, and the accumulators filled.)
+                capacity = capacity.max(demand + can_take);
+            }
             let (used, charge, discharge) = if capacity >= demand {
                 (demand, (capacity - demand).min(can_take), 0.0)
             } else {
@@ -1411,6 +1498,14 @@ impl Factory {
                         // Full power while there is fuel, whether anything uses it or not.
                         let want = if m.can_supply() { GENERATOR_POWER } else { 0.0 };
                         m.power = m.burn(want * dt) / dt;
+                        m.supply = if capacity > 0.0 {
+                            (used + charge) / capacity
+                        } else {
+                            0.0
+                        };
+                    }
+                    MachineKind::Solar => {
+                        m.power = m.sunlight(sun);
                         m.supply = if capacity > 0.0 {
                             (used + charge) / capacity
                         } else {
@@ -1436,7 +1531,9 @@ impl Factory {
                         let working = m.working();
                         m.supply = if working { share } else { 0.0 };
                         m.power = if working { kind.power() * share } else { 0.0 };
-                        if working && share > 0.0 {
+                        if kind == MachineKind::BigDoor {
+                            // (A door's motor makes nothing: the door moves by `supply`.)
+                        } else if working && share > 0.0 {
                             m.work(dt * share);
                         } else if !working {
                             m.progress = 0.0;

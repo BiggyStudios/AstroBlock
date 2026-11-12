@@ -13,7 +13,7 @@ use crate::{
     render::{BlockVertex, ChunkMesh},
     survival::items::{Icon, Item},
     world::{
-        block::{Block, Tint},
+        block::{Block, DoorKind, Tint},
         chunk::BlockCell,
         mesher::POSITION_UNIT,
         planet::Planet,
@@ -50,6 +50,9 @@ pub struct ModelState {
     /// How full an accumulator is, 0..=`LEVELS` (its gauge).
     #[serde(default)]
     pub level: u8,
+    /// Which cell of a door this is: across + 3 x up, from the bottom left seen from its front.
+    #[serde(default)]
+    pub piece: u8,
 }
 
 /// Steps of an accumulator's gauge (`ModelState::level`).
@@ -507,15 +510,31 @@ pub enum Motion {
     Blink,
     /// Fire or an arc behind a window: flickers while the machine works, `0` times a second.
     Flicker(f32),
+    // Doors: `speed` is how far open (0..1), `work` 1 while it moves.
+    /// A door's leaf, swinging a quarter turn on its hinge.
+    Swing,
+    /// A sliding door's leaf, along its axis.
+    Slide,
+    /// A slat of a big door's shutter (its bottom `0` model units up the door): it rolls up
+    /// into the housing over the door, out of sight.
+    Shutter(f32),
+    /// A warning lamp, blinking while the door moves.
+    Warn,
 }
 
-/// Where a moving part is drawn: moved `lift` model units up, turned `angle` about its axis.
+/// Where a moving part is drawn: moved `lift` model units up and `shift` along its axis,
+/// turned `angle` about its axis.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PartPose {
     pub lift: f32,
     pub angle: f32,
     pub shown: bool,
+    pub shift: f32,
 }
+
+/// How far a sliding door's leaf goes, and how high a big door rolls up (model units).
+pub const SLIDE: f32 = 15.0;
+pub const SHUTTER: f32 = 48.0;
 
 /// Seconds of work a miner's drill takes to go down and come back.
 const DRILL_CYCLE: f64 = 6.0;
@@ -532,7 +551,9 @@ impl Motion {
             lift: 0.0,
             angle: 0.0,
             shown: true,
+            shift: 0.0,
         };
+        let open = speed.clamp(0.0, 1.0);
         let rock = || ROCK * ((work * ROCK_RATE) % TAU).sin() as f32;
         match self {
             Motion::Spin(rate) => PartPose {
@@ -555,7 +576,7 @@ impl Motion {
                     } else {
                         0.0
                     },
-                    shown: true,
+                    ..still
                 }
             }
             Motion::Rock => PartPose {
@@ -579,6 +600,27 @@ impl Motion {
                     ..still
                 }
             }
+            Motion::Swing => PartPose {
+                // (Eased, so it slows into its stops.)
+                angle: std::f32::consts::FRAC_PI_2 * open * open * (3.0 - 2.0 * open),
+                ..still
+            },
+            Motion::Slide => PartPose {
+                shift: SLIDE * open * open * (3.0 - 2.0 * open),
+                ..still
+            },
+            Motion::Shutter(bottom) => {
+                let lift = SHUTTER * open;
+                PartPose {
+                    lift,
+                    shown: bottom + lift < SHUTTER - 0.5,
+                    ..still
+                }
+            }
+            Motion::Warn => PartPose {
+                shown: work > 0.5 && clock % 0.6 < 0.32,
+                ..still
+            },
         }
     }
 }
@@ -825,6 +867,152 @@ fn refinery(front: Tex) -> Vec<ModelBox> {
     ]
 }
 
+/// A solar panel: a plate of cells tilted a little towards its front, on a post.
+fn solar_panel() -> Vec<Quad> {
+    use Tex::*;
+    let mut quads = quads_of(&[
+        steel([5.0, 5.0, 0.0], [11.0, 11.0, 1.5]),
+        steel([7.0, 7.0, 1.5], [9.0, 9.0, 7.5]),
+    ]);
+    let mut plate = quads_of(&[
+        cuboid(
+            [0.5, 0.5, 7.0],
+            [15.5, 15.5, 8.5],
+            SolarCell,
+            MachineSide,
+            MachineTop,
+        ),
+        steel([1.0, 7.0, 6.0], [15.0, 9.0, 7.0]),
+    ]);
+    transform(&mut plate, |p| pitch(p, [8.0, 7.5], 0.3));
+    quads.extend(plate);
+    quads
+}
+
+/// One cell of a door (`piece`: across + 3 x up, seen from its front, which is the model's
+/// -y): what stays put (hinges, rails, the housing a big door rolls up into), and its leaf,
+/// which moves (`Motion::Swing`, `Slide`, `Shutter`). In the model's units, as any model.
+pub fn door_model(kind: DoorKind, piece: u8) -> (Vec<Quad>, Vec<MovingPart>) {
+    use Tex::*;
+    let (col, row) = ((piece % 3) as f32, (piece / 3) as f32);
+    let up = [0.0, 0.0, 1.0];
+    match kind {
+        DoorKind::Hinged => {
+            let fixed = quads_of(&[
+                dark([0.0, 0.0, 2.0], [1.5, 2.5, 4.0]),
+                dark([0.0, 0.0, 12.0], [1.5, 2.5, 14.0]),
+            ]);
+            let mut leaf = vec![ModelBox {
+                full_uv: true,
+                ..cuboid(
+                    [0.5, 0.0, 0.0],
+                    [15.5, 2.5, 16.0],
+                    DoorPlanks,
+                    DoorPlanks,
+                    DoorPlanks,
+                )
+            }];
+            if row == 0.0 {
+                // The handle, at about the height of a hand.
+                leaf.push(dark([12.5, -0.8, 14.0], [14.0, 0.0, 15.0]));
+            }
+            let leaf = MovingPart::new(quads_of(&leaf), [1.25, 1.25, 8.0], up, Motion::Swing);
+            (fixed, vec![leaf])
+        }
+        DoorKind::Sliding => {
+            let mut fixed = Vec::new();
+            if row == 1.0 {
+                fixed.push(steel([0.0, 0.0, 14.5], [16.0, 3.0, 16.0]));
+            } else {
+                fixed.push(steel([0.0, 0.0, 0.0], [16.0, 3.0, 0.5]));
+            }
+            let mut leaf = vec![ModelBox {
+                full_uv: true,
+                ..cuboid(
+                    [0.0, 0.5, 0.5 * (1.0 - row)],
+                    [16.0, 2.5, 16.0 - 1.5 * row],
+                    SlidingPanel,
+                    SlidingPanel,
+                    SlidingPanel,
+                )
+            }];
+            if row == 0.0 {
+                leaf.push(dark([12.5, -0.3, 13.0], [13.5, 0.5, 15.5]));
+            }
+            let leaf = MovingPart::new(
+                quads_of(&leaf),
+                [8.0, 1.5, 8.0],
+                [1.0, 0.0, 0.0],
+                Motion::Slide,
+            );
+            (quads_of(&fixed), vec![leaf])
+        }
+        DoorKind::Big => {
+            let mut fixed = Vec::new();
+            // Rails up the sides, the housing over the top with a lamp that warns while it
+            // moves.
+            let (x0, x1) = match col as i32 {
+                0 => (1.5, 16.0),
+                2 => (0.0, 14.5),
+                _ => (0.0, 16.0),
+            };
+            if col == 0.0 {
+                fixed.push(steel([0.0, -0.5, 0.0], [1.5, 4.0, 16.0]));
+            }
+            if col == 2.0 {
+                fixed.push(steel([14.5, -0.5, 0.0], [16.0, 4.0, 16.0]));
+            }
+            let mut moving = Vec::new();
+            if row == 2.0 {
+                fixed.push(cuboid(
+                    [0.0, -1.0, 16.0],
+                    [16.0, 5.0, 21.0],
+                    MachineTop,
+                    MachineSide,
+                    MachineTop,
+                ));
+                fixed.push(cuboid(
+                    [0.0, -1.1, 16.0],
+                    [16.0, -1.0, 17.0],
+                    Hazard,
+                    Hazard,
+                    Hazard,
+                ));
+                if col == 1.0 {
+                    let mut dark_lamp = lamp([6.5, -1.6, 18.0], [9.5, -1.0, 20.0], [70, 44, 20]);
+                    let warn = lamp([6.4, -1.7, 17.9], [9.6, -1.05, 20.1], [255, 170, 40]);
+                    let mut quads = quads_of(&fixed);
+                    quads.append(&mut dark_lamp);
+                    moving.push(MovingPart::light(warn, Motion::Warn));
+                    return (quads, slats(x0, x1, row, moving));
+                }
+            }
+            (quads_of(&fixed), slats(x0, x1, row, moving))
+        }
+    }
+}
+
+/// A big door cell's four slats (each its own moving part), `x0..x1` wide, after `moving`.
+fn slats(x0: f32, x1: f32, row: f32, mut moving: Vec<MovingPart>) -> Vec<MovingPart> {
+    use Tex::*;
+    for i in 0..4 {
+        let z = i as f32 * 4.0;
+        let tex = if row == 0.0 && i == 0 {
+            Hazard
+        } else {
+            ShutterPanel
+        };
+        let slat = cuboid([x0, 1.0, z], [x1, 3.0, z + 4.0], tex, tex, tex);
+        moving.push(MovingPart::new(
+            quads_of(&[slat]),
+            [8.0, 2.0, z + 2.0],
+            [0.0, 0.0, 1.0],
+            Motion::Shutter(row * 16.0 + z),
+        ));
+    }
+    moving
+}
+
 /// The boxes of a model block that is only boxes (the chest's lid separately: see `chest`).
 fn model_boxes(block: Block, state: ModelState) -> Vec<ModelBox> {
     use Tex::*;
@@ -931,6 +1119,11 @@ fn model_quads(block: Block, state: ModelState) -> Vec<Quad> {
     let mut quads = match block {
         Block::Miner => miner(if state.lit { MinerFrontLit } else { MinerFront }),
         Block::Conveyor if state.bend != 0 => conveyor_bend(state.bend == 1),
+        Block::SolarPanel => solar_panel(),
+        b if b.door().is_some() => {
+            let (kind, _) = b.door().unwrap_or((DoorKind::Hinged, false));
+            door_model(kind, state.piece).0
+        }
         _ => quads_of(&model_boxes(block, state)),
     };
     match block {
@@ -984,10 +1177,14 @@ fn glow_quads(block: Block, state: ModelState) -> Vec<Quad> {
     quads
 }
 
-/// The parts of a model block that move while it works (drawn each frame: `part_model`).
-pub fn moving_parts(block: Block) -> Vec<MovingPart> {
+/// The parts of a model block that move while it works, or a door's leaves (drawn each frame:
+/// `part_model`).
+pub fn moving_parts(block: Block, state: ModelState) -> Vec<MovingPart> {
     use Tex::*;
     let (y, xs, zs) = HOUSING_FRONT;
+    if let Some((kind, _)) = block.door() {
+        return door_model(kind, state.piece).1;
+    }
     match block {
         Block::Miner => miner_parts(),
         Block::OilPump => oil_pump_parts(),
@@ -1389,14 +1586,32 @@ pub struct PartMesh {
     pub axis: DVec3,
     pub up: DVec3,
     pub radius: f32,
+    /// One model unit along the axis (for `PartPose::shift`).
+    pub step: DVec3,
 }
 
 /// A model block as it is held: all of it, its moving parts at rest; one taller than two
-/// blocks (a miner's rig) shrunk to that.
-fn held_model(block: Block) -> Vec<Quad> {
-    let state = ModelState::default();
-    let mut quads = model_quads(block, state);
-    quads.extend(moving_parts(block).into_iter().flat_map(|p| p.quads));
+/// blocks (a miner's rig) shrunk to that. A door: all its cells.
+pub fn held_model(block: Block) -> Vec<Quad> {
+    let mut quads = Vec::new();
+    let (w, h) = block.door().map_or((1, 1), |(kind, _)| kind.size());
+    for row in 0..h {
+        for col in 0..w {
+            let state = ModelState {
+                piece: (col + 3 * row) as u8,
+                ..Default::default()
+            };
+            let mut cell = model_quads(block, state);
+            cell.extend(moving_parts(block, state).into_iter().flat_map(|p| p.quads));
+            let (dx, dz) = (col as f32 * 16.0, row as f32 * 16.0);
+            transform(&mut cell, |[x, y, z]| [x + dx, y, z + dz]);
+            quads.extend(cell);
+        }
+    }
+    if w > 1 {
+        // (A big door: about the middle cell.)
+        transform(&mut quads, |[x, y, z]| [x - 16.0, y, z]);
+    }
     let top = quads
         .iter()
         .flat_map(|q| q.corners)
@@ -1441,6 +1656,7 @@ pub fn part_model(
         axis: offset(part.axis).normalize_or(DVec3::Z),
         up: offset([0.0, 0.0, 1.0]),
         radius: radius as f32 + 0.05,
+        step: offset(part.axis),
     }
 }
 
@@ -1794,9 +2010,17 @@ mod tests {
             Block::Assembler,
             Block::ChipFab,
             Block::Accumulator,
+            Block::SolarPanel,
+            Block::Door,
+            Block::SlidingDoorOpen,
+            Block::BigDoor,
         ] {
             for facing in 0..4 {
-                for (wall, open, bend) in [(false, false, 0), (true, true, 1), (false, true, 2)] {
+                for (i, (wall, open, bend)) in
+                    [(false, false, 0), (true, true, 1), (false, true, 2)]
+                        .into_iter()
+                        .enumerate()
+                {
                     let state = ModelState {
                         facing,
                         lit: bend != 2,
@@ -1804,11 +2028,18 @@ mod tests {
                         open,
                         bend,
                         level: 13,
+                        // (Every cell of a big door, in turn.)
+                        piece: if block == Block::BigDoor {
+                            (facing * 3 + i as u8) % 9
+                        } else {
+                            i as u8 % 2 * 3
+                        },
                     };
                     let (mesh, origin, radius) =
                         block_model(&planet, cell, block, state, Light::default());
                     assert_eq!(mesh.opaque.len() % 4, 0);
-                    assert!(!mesh.opaque.is_empty());
+                    // (A big door's middle cells are only their moving slats.)
+                    assert!(!mesh.opaque.is_empty() || block == Block::BigDoor);
                     assert!((origin - centre).length() < 1e-9);
                     // In its cell; a pole two blocks tall, a miner's rig five.
                     let most = match block {
@@ -1826,7 +2057,7 @@ mod tests {
                         assert!(p.length() <= radius as f64, "vertex outside the cell: {p}");
                         assert!(v.data & MODEL_FLAG != 0 && v.data & CUTOUT_FLAG == 0);
                     }
-                    for part in moving_parts(block) {
+                    for part in moving_parts(block, state) {
                         let made = part_model(&planet, cell, facing, &part, Light::default());
                         assert!(
                             !made.mesh.opaque.is_empty()
@@ -1884,6 +2115,39 @@ mod tests {
         };
         assert!(top(5) < top(15) && top(15) < top(LEVELS));
     }
+
+    /// Doors open by how far open they are: a leaf swings a quarter turn, a sliding one moves
+    /// most of a block, a big door's slats roll up out of sight (the bottom one last), and its
+    /// lamp warns only while it moves.
+    #[test]
+    fn doors_open() {
+        let pose = |m: Motion, open: f32, moving: f64| m.pose(moving, open, 0.1, 1);
+        assert_eq!(pose(Motion::Swing, 0.0, 0.0).angle, 0.0);
+        assert!((pose(Motion::Swing, 1.0, 0.0).angle - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
+        assert!((pose(Motion::Slide, 1.0, 0.0).shift - SLIDE).abs() < 1e-6);
+        for (bottom, gone_by) in [(44.0, 0.1), (0.0, 1.0)] {
+            assert!(pose(Motion::Shutter(bottom), 0.0, 0.0).shown);
+            assert!(
+                !pose(Motion::Shutter(bottom), gone_by, 0.0).shown,
+                "{bottom}"
+            );
+        }
+        assert!(pose(Motion::Shutter(0.0), 0.9, 0.0).shown);
+        assert!(!pose(Motion::Warn, 0.5, 0.0).shown && pose(Motion::Warn, 0.5, 1.0).shown);
+        // Every cell of a big door has its slats; a hinged door's two cells their leaf.
+        for piece in 0..9 {
+            let (_, moving) = door_model(DoorKind::Big, piece);
+            let slats = moving
+                .iter()
+                .filter(|p| matches!(p.motion, Motion::Shutter(_)))
+                .count();
+            assert_eq!(slats, 4);
+        }
+        assert_eq!(door_model(DoorKind::Hinged, 3).1.len(), 1);
+        // Held, a door shows all of it.
+        assert!(held_model(Block::Door).len() > 2 * door_model(DoorKind::Hinged, 0).0.len());
+    }
+
     #[test]
     fn drops_are_small() {
         let frame = (DVec3::X, DVec3::Z, DVec3::Y);

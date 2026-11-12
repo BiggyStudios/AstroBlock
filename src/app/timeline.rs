@@ -766,6 +766,9 @@ mod tests {
             touching: false,
             steer: 0.0,
             flaps: Vec::new(),
+            charge: 0.0,
+            drilling: false,
+            gimbal: [0; 3],
         }
     }
 

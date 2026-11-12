@@ -227,6 +227,59 @@ fn vehicle_recipes() -> Vec<Recipe> {
             2,
         ),
         recipe(&["I", "W"], &[iron, wheel], made(Block::LandingGear), 1),
+        recipe(&["WIW"], &[wheel, iron], made(Block::LargeWheel), 1),
+        recipe(
+            &[" L ", "LXL", " L "],
+            &[leather, ('X', Exactly(Item::Block(Block::LargeWheel)))],
+            made(Block::GiantWheel),
+            1,
+        ),
+        recipe(
+            &[" G ", "CRC"],
+            &[
+                gold,
+                copper,
+                ('R', Exactly(Item::Block(Block::RocketEngine))),
+            ],
+            made(Block::VectorEngine),
+            1,
+        ),
+        recipe(
+            &["GIG", " R "],
+            &[gold, iron, ('R', Exactly(Item::Block(Block::RocketEngine)))],
+            made(Block::Aerospike),
+            1,
+        ),
+        recipe(
+            &["IBI", "G G"],
+            &[iron, ('B', Exactly(Item::CircuitBoard)), gold],
+            made(Block::IonEngine),
+            1,
+        ),
+        recipe(
+            &["III", "IPI", " C "],
+            &[
+                iron,
+                ('P', Exactly(Item::Tool(ToolKind::Pickaxe, Tier::Iron))),
+                copper,
+            ],
+            made(Block::VehicleDrill),
+            1,
+        ),
+        // Doors, for buildings and vehicles alike.
+        recipe(&["PP", "PI", "PP"], &[planks, iron], made(Block::Door), 2),
+        recipe(
+            &["IG", "IG", "IG"],
+            &[iron, ('G', Exactly(Item::Block(Block::Glass)))],
+            made(Block::SlidingDoor),
+            2,
+        ),
+        recipe(
+            &["III", "CBC", "III"],
+            &[iron, copper, ('B', Exactly(Item::CircuitBoard))],
+            made(Block::BigDoor),
+            1,
+        ),
     ]
 }
 
@@ -316,6 +369,12 @@ fn factory_recipes() -> Vec<Recipe> {
             &[iron, ('B', Exactly(Item::Battery)), copper],
             made(Block::Accumulator),
             1,
+        ),
+        recipe(
+            &["GGG", "SSS", "ICI"],
+            &[glass, ('S', Exactly(Item::Silicon)), iron, copper],
+            made(Block::SolarPanel),
+            2,
         ),
     ]
 }

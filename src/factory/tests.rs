@@ -214,6 +214,77 @@ fn accumulators_keep_what_would_go_to_waste_and_give_it_back() {
     assert!(w.factory.machine(store).unwrap().energy < 1.0);
 }
 
+/// Solar panels make power while the sun is up over them, by how high it is, and none at
+/// night.
+#[test]
+fn solar_panels_make_power_by_day() {
+    let p = planet();
+    let mut w = World::new();
+    let (panel, store) = (at(&p, 0, 0), at(&p, 2, 0));
+    w.factory.add(&p, panel, Block::SolarPanel, 0);
+    w.factory.add(&p, store, Block::Accumulator, 0);
+    assert!(w.factory.connect(panel, store));
+    w.factory.locate(&p);
+    let up = models::cell_point(&p, panel, [8.0, 8.0, 16.0])
+        - models::cell_point(&p, panel, [8.0, 8.0, 0.0]);
+    let up = up.normalize();
+    w.factory.sun = up;
+    w.run(10.0);
+    let noon = w.factory.machine(store).unwrap().energy;
+    assert!(
+        (noon - SOLAR_POWER * 10.0).abs() < SOLAR_POWER * 0.2,
+        "{noon} J"
+    );
+    assert!(w.factory.machine(panel).unwrap().lit());
+    // Low in the sky: less.
+    let low = (up + up.any_orthonormal_vector() * 3.0).normalize();
+    w.factory.sun = low;
+    w.run(10.0);
+    let evening = w.factory.machine(store).unwrap().energy - noon;
+    assert!(evening > 0.0 && evening < 0.5 * noon, "{evening} J");
+    // Night.
+    w.factory.sun = -up;
+    let before = w.factory.machine(store).unwrap().energy;
+    w.run(10.0);
+    assert_eq!(w.factory.machine(store).unwrap().energy, before);
+    assert_eq!(w.factory.machine(panel).unwrap().status(), "no sun");
+}
+
+/// A big door's motor only gets power while the door moves, and only from a network that has
+/// some; `power infinite` gives it (and everything) all it asks.
+#[test]
+fn a_big_door_runs_on_its_network() {
+    let p = planet();
+    let mut w = World::new();
+    let door = at(&p, 0, 0);
+    w.factory.add(&p, door, Block::BigDoor, 0);
+    w.run(1.0);
+    assert!(!w.factory.has_power(door), "on its own, no power");
+    w.factory.machine_mut(door).unwrap().wanted = true;
+    w.run(1.0);
+    assert_eq!(w.factory.machine(door).unwrap().supply, 0.0);
+    powered(&mut w, &p, door);
+    w.run(1.0);
+    assert!(w.factory.has_power(door));
+    let m = w.factory.machine(door).unwrap();
+    assert!((m.supply - 1.0).abs() < 1e-3 && (m.power - DOOR_POWER).abs() < 1.0);
+    // Standing still, it takes nothing.
+    w.factory.machine_mut(door).unwrap().wanted = false;
+    w.run(1.0);
+    assert_eq!(w.factory.machine(door).unwrap().power, 0.0);
+
+    // Infinite: a furnace with no generator at all works at full speed.
+    let mut w = World::new();
+    let furnace = at(&p, 4, 0);
+    w.factory.add(&p, furnace, Block::ElectricFurnace, 0);
+    w.factory.machine_mut(furnace).unwrap().input = stack(Item::RawIron, 4);
+    w.run(1.0);
+    assert_eq!(w.factory.machine(furnace).unwrap().supply, 0.0);
+    w.factory.infinite = true;
+    w.run(1.0);
+    assert!((w.factory.machine(furnace).unwrap().supply - 1.0).abs() < 1e-3);
+}
+
 /// A generator full of coal wired to `machine`.
 fn powered(w: &mut World, p: &Planet, machine: BlockCell) {
     let generator = at(p, 0, 10);

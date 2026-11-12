@@ -29,7 +29,7 @@ use crate::{
 };
 
 /// Bumped whenever a message changes.
-pub const PROTOCOL: u32 = 11;
+pub const PROTOCOL: u32 = 12;
 /// The host is always player 0.
 pub const HOST: PlayerId = 0;
 /// Most people in one game, the host included.
@@ -87,6 +87,11 @@ pub enum CraftChange {
     Take(At),
     /// Knocked off in a crash: taken off, with a bang where it was.
     Crash(At),
+    /// The door with a cell at `at` opened or closed.
+    Door {
+        at: At,
+        open: bool,
+    },
 }
 
 /// A change to one world, passed on to everyone.
@@ -122,6 +127,11 @@ pub enum WorldEvent {
     Turned {
         cell: BlockCell,
         facing: u8,
+    },
+    /// The door with a cell at `cell` opened or closed (all its cells).
+    Door {
+        cell: BlockCell,
+        open: bool,
     },
     DropNew(NetDrop),
     DropGone(u32),
@@ -169,6 +179,10 @@ pub struct VesselState {
     pub touching: bool,
     pub steer: f32,
     pub flaps: Vec<i8>,
+    /// Electricity in its batteries (J), its drills running, how its gimbals steer (x 127).
+    pub charge: f32,
+    pub drilling: bool,
+    pub gimbal: [i8; 3],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

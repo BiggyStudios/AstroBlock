@@ -21,7 +21,10 @@
 use glam::{DMat3, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 
-use crate::{util::FastMap, world::block::Block};
+use crate::{
+    util::FastMap,
+    world::block::{Block, DoorKind},
+};
 
 /// A position in a vehicle's grid.
 pub type At = [i16; 3];
@@ -38,6 +41,97 @@ pub const PROPELLER_TOP: f64 = 400.0;
 /// Wheels stick this far out of their cell, and the spring gives this much at rest (m).
 pub const WHEEL_RADIUS: f64 = 0.7;
 pub const SPRING_REST: f64 = 0.12;
+
+// Electricity (see `Stats::battery` and `craft_physics`).
+/// What the core's own battery holds, and an accumulator on board (J).
+pub const CORE_BATTERY: f64 = 1_000_000.0;
+pub const ACCUMULATOR_BATTERY: f64 = 5_000_000.0;
+/// A solar panel square on to the sun at the home planet's distance (W).
+pub const SOLAR_POWER: f64 = 20_000.0;
+/// A coal generator on board, burning what is in the tanks: what it makes (W), and the energy
+/// in a kilogram of that fuel (J).
+pub const GENERATOR_POWER: f64 = 180_000.0;
+pub const FUEL_ENERGY: f64 = 2_000_000.0;
+/// A drill while it bores (W), and what opening a big door costs (J).
+pub const DRILL_POWER: f64 = 12_000.0;
+pub const BIG_DOOR_ENERGY: f64 = 40_000.0;
+
+/// `Part::facing` of a door: bits 0-2 the way its front looks (as for any part), bits 3-6 which
+/// cell of the door it is (across + 3 x up), bit 7 open.
+pub const DOOR_PIECE_SHIFT: u8 = 3;
+pub const DOOR_OPEN: u8 = 0x80;
+
+/// The radius of a wheel part (m), if it is one.
+pub fn wheel_radius(block: Block) -> Option<f64> {
+    match block {
+        Block::Wheel | Block::LandingGear => Some(WHEEL_RADIUS),
+        Block::LargeWheel => Some(1.1),
+        Block::GiantWheel => Some(1.6),
+        _ => None,
+    }
+}
+
+/// Blocks that are models in the world and can go on a vehicle too: power, and doors.
+pub fn is_vehicle_model(block: Block) -> bool {
+    matches!(
+        block,
+        Block::Accumulator
+            | Block::CoalGenerator
+            | Block::SolarPanel
+            | Block::Door
+            | Block::SlidingDoor
+            | Block::BigDoor
+    )
+}
+
+/// Which cell of its door a door part is: (across, up).
+pub fn door_piece(facing: u8) -> (i16, i16) {
+    let i = ((facing >> DOOR_PIECE_SHIFT) & 0xf) as i16;
+    (i % 3, i / 3)
+}
+
+/// The way across a door whose front looks along `front` (grid axes, up is +Y): its cells go
+/// from the anchor that way, then up.
+pub fn door_across(front: u8) -> At {
+    let f = direction(front);
+    let a = DVec3::Y.cross(f);
+    [a.x.round() as i16, 0, a.z.round() as i16]
+}
+
+/// The cells of a door of `kind` with its anchor (bottom left, seen from the front) at
+/// `anchor`, front looking along `front`: each with the facing its part has.
+pub fn door_cells(kind: DoorKind, anchor: At, front: u8) -> Vec<(At, u8)> {
+    let (w, h) = kind.size();
+    let across = door_across(front);
+    let mut cells = Vec::new();
+    for row in 0..h as i16 {
+        for col in 0..w as i16 {
+            let at = [
+                anchor[0] + across[0] * col,
+                anchor[1] + row,
+                anchor[2] + across[2] * col,
+            ];
+            let piece = (col + 3 * row) as u8;
+            cells.push((at, (front & 7) | piece << DOOR_PIECE_SHIFT));
+        }
+    }
+    cells
+}
+
+/// A door on a vehicle: where its anchor cell is, what kind, which way it looks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CraftDoor {
+    pub anchor: At,
+    pub kind: DoorKind,
+    pub front: u8,
+}
+
+/// A drill on a vehicle: where, and the way it bores (a direction index).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Drill {
+    pub at: At,
+    pub facing: u8,
+}
 
 /// The six directions a part can face.
 pub const DIRECTIONS: [DVec3; 6] = [
@@ -56,8 +150,9 @@ pub fn facing_of(v: DVec3) -> u8 {
         .unwrap_or(0) as u8
 }
 
+/// (Only the low bits say the way: a door keeps more in the rest, see `DOOR_PIECE_SHIFT`.)
 pub fn direction(facing: u8) -> DVec3 {
-    DIRECTIONS[(facing as usize).min(5)]
+    DIRECTIONS[((facing & 7) as usize).min(5)]
 }
 
 pub fn center(at: At) -> DVec3 {
@@ -78,10 +173,20 @@ pub struct Part {
 pub struct EngineKind {
     /// Thrust in the thick of the air (or in vacuum, for rockets) (N).
     pub thrust: f64,
-    /// Fuel: thrust / this (kg/s).
+    /// Fuel: thrust / this (kg/s). Infinite for an engine that runs on electricity.
     pub exhaust: f64,
     /// What it does in air of a given relative density, 0..1 at a given speed.
     pub air: AirUse,
+    /// Electricity at full throttle (W): it burns no fuel.
+    pub power: f64,
+    /// How far its nozzle swings to steer (rad); 0 for a fixed one.
+    pub gimbal: f64,
+}
+
+impl EngineKind {
+    pub fn electric(&self) -> bool {
+        self.power > 0.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -102,6 +207,8 @@ pub fn engine_kind(block: Block) -> Option<EngineKind> {
             thrust,
             exhaust,
             air,
+            power: 0.0,
+            gimbal: 0.0,
         })
     };
     match block {
@@ -109,6 +216,18 @@ pub fn engine_kind(block: Block) -> Option<EngineKind> {
         Block::JetEngine => kind(26_000.0, 18_000.0, AirUse::Breathes),
         Block::RocketEngine => kind(30_000.0, 4_000.0, AirUse::Rocket),
         Block::OrbitalEngine => kind(7_000.0, 7_000.0, AirUse::Vacuum(0.3)),
+        Block::VectorEngine => Some(EngineKind {
+            gimbal: 0.12,
+            ..kind(26_000.0, 4_000.0, AirUse::Rocket)?
+        }),
+        // (As good at sea level as in vacuum, and further on its fuel than a rocket engine.)
+        Block::Aerospike => kind(22_000.0, 5_400.0, AirUse::Rocket),
+        // 600 N for 300 kg: it can't even lift itself, but in space it pushes for as long as
+        // there is power.
+        Block::IonEngine => Some(EngineKind {
+            power: 40_000.0,
+            ..kind(600.0, f64::INFINITY, AirUse::Vacuum(0.0))?
+        }),
         _ => None,
     }
 }
@@ -143,6 +262,18 @@ pub fn part_mass(block: Block) -> f64 {
         Gyro => 120.0,
         Wheel => 80.0,
         LandingGear => 90.0,
+        LargeWheel => 160.0,
+        GiantWheel => 340.0,
+        VectorEngine => 560.0,
+        Aerospike => 420.0,
+        IonEngine => 300.0,
+        VehicleDrill => 400.0,
+        SolarPanel => 50.0,
+        Accumulator => 300.0,
+        CoalGenerator => 400.0,
+        Door | DoorOpen => 50.0,
+        SlidingDoor | SlidingDoorOpen => 60.0,
+        BigDoor | BigDoorOpen => 90.0,
         Glass => 40.0,
         WhiteWool => 20.0,
         OakLeaves | SpruceLeaves | JungleLeaves => 15.0,
@@ -175,7 +306,13 @@ pub fn is_cube(block: Block) -> bool {
             | Flap
             | Wheel
             | LandingGear
-    )
+            | LargeWheel
+            | GiantWheel
+            | VectorEngine
+            | Aerospike
+            | IonEngine
+            | VehicleDrill
+    ) && !is_vehicle_model(block)
 }
 
 /// Whether a part points somewhere (and `R` can turn it).
@@ -183,7 +320,18 @@ pub fn can_turn(block: Block) -> bool {
     use Block::*;
     matches!(
         block,
-        Propeller | JetEngine | RocketEngine | OrbitalEngine | Wing | Flap | Seat
+        Propeller
+            | JetEngine
+            | RocketEngine
+            | OrbitalEngine
+            | VectorEngine
+            | Aerospike
+            | IonEngine
+            | VehicleDrill
+            | SolarPanel
+            | Wing
+            | Flap
+            | Seat
     )
 }
 
@@ -193,8 +341,30 @@ pub fn auto_facing(block: Block, outward: DVec3, stats: &Stats) -> u8 {
     match block {
         // Facing is where the exhaust goes: a propeller at either end pulls forwards.
         Block::Propeller if outward.dot(forward).abs() > 0.5 => facing_of(-forward),
-        Block::Propeller | Block::JetEngine | Block::RocketEngine | Block::OrbitalEngine => {
-            facing_of(outward)
+        Block::Propeller
+        | Block::JetEngine
+        | Block::RocketEngine
+        | Block::OrbitalEngine
+        | Block::VectorEngine
+        | Block::Aerospike
+        | Block::IonEngine => facing_of(outward),
+        // A drill bores away from what it is put on.
+        Block::VehicleDrill => facing_of(outward),
+        // Panels face the sky; machines and doors face out (or forward, put on a floor).
+        Block::SolarPanel => facing_of(up),
+        Block::Accumulator
+        | Block::CoalGenerator
+        | Block::Door
+        | Block::SlidingDoor
+        | Block::BigDoor => {
+            let flat = DVec3::new(outward.x, 0.0, outward.z);
+            if flat.length() > 0.5 {
+                facing_of(flat)
+            } else if forward.y.abs() < 0.5 {
+                facing_of(-forward)
+            } else {
+                facing_of(DVec3::NEG_Z)
+            }
         }
         Block::Wing | Block::Flap => {
             // Flat along the way it flies, so it lifts at right angles to its span.
@@ -236,6 +406,7 @@ pub struct Surface {
 pub struct WheelMount {
     pub position: DVec3,
     pub driven: bool,
+    pub radius: f64,
 }
 
 /// The area a vehicle shows along one axis (m^2) and that area's centre.
@@ -275,6 +446,16 @@ pub struct Stats {
     pub has_core: bool,
     /// Furthest part from the origin (m).
     pub radius: f64,
+    /// What its batteries hold when full (J): the core's and the accumulators'.
+    pub battery: f64,
+    /// Each solar panel's face (grid axes, unit).
+    pub solar: Vec<DVec3>,
+    /// Coal generators aboard (they burn the tanks' fuel).
+    pub generators: usize,
+    pub drills: Vec<Drill>,
+    pub doors: Vec<CraftDoor>,
+    /// Something on it runs on electricity: driven wheels, ion engines, drills, big doors.
+    pub electric: bool,
 }
 
 /// How heavy a vehicle is right now and how that is spread out.
@@ -309,6 +490,12 @@ impl Default for Stats {
             seats: Vec::new(),
             has_core: false,
             radius: 1.0,
+            battery: 0.0,
+            solar: Vec::new(),
+            generators: 0,
+            drills: Vec::new(),
+            doors: Vec::new(),
+            electric: false,
         }
     }
 }
@@ -398,9 +585,78 @@ impl Craft {
         None
     }
 
-    /// Whether someone walking aboard is stopped by what is in cell `at`.
+    /// Whether someone walking aboard is stopped by what is in cell `at` (not an open door).
     pub fn solid(&self, at: At) -> bool {
-        self.get(at).is_some_and(|p| is_walkable_solid(p.block))
+        self.get(at).is_some_and(|p| {
+            is_walkable_solid(p.block) && !(p.block.door().is_some() && p.facing & DOOR_OPEN != 0)
+        })
+    }
+
+    /// The door the part at `at` is a cell of: its index in `Stats::doors`, and the door.
+    pub fn door_at(&self, at: At) -> Option<(usize, CraftDoor)> {
+        let part = self.get(at)?;
+        part.block.door()?;
+        let (col, row) = door_piece(part.facing);
+        let across = door_across(part.facing);
+        let anchor = [
+            at[0] - across[0] * col,
+            at[1] - row,
+            at[2] - across[2] * col,
+        ];
+        let n = self.stats.doors.iter().position(|d| d.anchor == anchor)?;
+        Some((n, self.stats.doors[n]))
+    }
+
+    /// Whether door `n` (of `Stats::doors`) stands open.
+    pub fn door_open(&self, n: usize) -> bool {
+        self.stats
+            .doors
+            .get(n)
+            .and_then(|d| self.get(d.anchor))
+            .is_some_and(|p| p.facing & DOOR_OPEN != 0)
+    }
+
+    /// Opens or closes the door that has a cell at `at` (all of its cells). Nothing else about
+    /// the vehicle changes, so its mesh stays (the door's leaves move on their own).
+    pub fn set_door(&mut self, at: At, open: bool) -> bool {
+        let Some((_, door)) = self.door_at(at) else {
+            return false;
+        };
+        for (cell, _) in door_cells(door.kind, door.anchor, door.front) {
+            if let Some(&i) = self.index.get(&cell)
+                && self.parts[i].block.door().is_some()
+            {
+                let f = &mut self.parts[i].facing;
+                *f = if open {
+                    *f | DOOR_OPEN
+                } else {
+                    *f & !DOOR_OPEN
+                };
+            }
+        }
+        true
+    }
+
+    /// Adds several parts at once (a door's cells): all of them, or none if any can't go
+    /// where it would (taken, too far, too many) or none of them touches the vehicle.
+    pub fn place_all(&mut self, parts: &[Part]) -> bool {
+        let free = parts.iter().all(|p| {
+            p.at.iter().all(|c| c.abs() <= MAX_REACH)
+                && !self.index.contains_key(&p.at)
+                && p.block != Block::VehicleCore
+        });
+        if !free
+            || self.parts.len() + parts.len() > MAX_PARTS
+            || !parts.iter().any(|p| self.touches(p.at))
+        {
+            return false;
+        }
+        for p in parts {
+            self.index.insert(p.at, self.parts.len());
+            self.parts.push(*p);
+        }
+        self.rebuild();
+        true
     }
 
     /// Whether a part can go at `at`.
@@ -496,11 +752,48 @@ impl Craft {
             s.dry_moment += r * mass;
             s.dry_inertia += inertia_of(mass, r);
             s.radius = s.radius.max(r.length() + 1.0);
+            if let Some(radius) = wheel_radius(part.block) {
+                let driven = part.block != Block::LandingGear;
+                s.electric |= driven;
+                s.wheels.push(WheelMount {
+                    position: r,
+                    driven,
+                    radius,
+                });
+            }
+            if let Some((kind, _)) = part.block.door() {
+                let (col, row) = door_piece(part.facing);
+                let across = door_across(part.facing);
+                let anchor = [
+                    part.at[0] - across[0] * col,
+                    part.at[1] - row,
+                    part.at[2] - across[2] * col,
+                ];
+                if !s.doors.iter().any(|d| d.anchor == anchor) {
+                    s.doors.push(CraftDoor {
+                        anchor,
+                        kind,
+                        front: part.facing & 7,
+                    });
+                    s.electric |= kind == DoorKind::Big;
+                }
+            }
             match part.block {
                 Block::VehicleCore => {
                     s.has_core = true;
                     core_facing = part.facing;
                     s.gyro_torque += 4_000.0;
+                    s.battery += CORE_BATTERY;
+                }
+                Block::Accumulator => s.battery += ACCUMULATOR_BATTERY,
+                Block::SolarPanel => s.solar.push(direction(part.facing)),
+                Block::CoalGenerator => s.generators += 1,
+                Block::VehicleDrill => {
+                    s.electric = true;
+                    s.drills.push(Drill {
+                        at: part.at,
+                        facing: part.facing,
+                    });
                 }
                 Block::Gyro => s.gyro_torque += 20_000.0,
                 Block::FuelTank => {
@@ -514,13 +807,10 @@ impl Craft {
                     normal: direction(part.facing),
                     moves: part.block == Block::Flap,
                 }),
-                Block::Wheel | Block::LandingGear => s.wheels.push(WheelMount {
-                    position: r,
-                    driven: part.block == Block::Wheel,
-                }),
                 _ => {}
             }
             if let Some(kind) = engine_kind(part.block) {
+                s.electric |= kind.electric();
                 s.engines.push(Engine {
                     position: r,
                     push: -direction(part.facing),
@@ -592,7 +882,7 @@ impl Craft {
         const MOST: usize = 320;
         let hull = |at: At| {
             self.get(at)
-                .is_some_and(|p| !matches!(p.block, Block::Wheel | Block::LandingGear))
+                .is_some_and(|p| wheel_radius(p.block).is_none())
         };
         // Corners are in half-meter units, so they are integers.
         let mut seen: FastMap<[i32; 3], ()> = FastMap::default();

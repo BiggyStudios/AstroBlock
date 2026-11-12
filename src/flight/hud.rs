@@ -26,6 +26,7 @@ pub const PROGRADE: [u8; 4] = [226, 222, 110, 255];
 pub const NORMAL: [u8; 4] = [214, 120, 226, 255];
 pub const RADIAL: [u8; 4] = [110, 210, 232, 255];
 pub const MANEUVER: [u8; 4] = [110, 160, 255, 255];
+pub const MINT: [u8; 4] = [110, 230, 170, 235];
 
 /// The mouse, for clickable UI.
 #[derive(Clone, Copy, Debug, Default)]
@@ -122,6 +123,10 @@ pub struct FlightInfo {
     pub landed: bool,
     /// Whether the wheel brake is on (None: no wheels to brake).
     pub brake: Option<bool>,
+    /// Its electricity (None: nothing aboard uses or makes any).
+    pub power: Option<PowerInfo>,
+    /// Whether its drills run (None: it has none).
+    pub drills: Option<bool>,
     pub attitude: Attitude,
     /// The next maneuver: seconds until its burn should start, remaining dv, burn time.
     pub node: Option<(f64, f64, f64)>,
@@ -130,11 +135,22 @@ pub struct FlightInfo {
     pub map: bool,
 }
 
+/// A vehicle's electricity: how full its batteries are (0..1), what they hold (J), what is
+/// being made and used (W).
+#[derive(Clone, Copy, Debug)]
+pub struct PowerInfo {
+    pub charge: f64,
+    pub stored: f64,
+    pub made: f64,
+    pub used: f64,
+}
+
 pub enum FlightAction {
     ToggleSas,
     Sas(SasMode),
     ToggleMap,
     ToggleBrake,
+    ToggleDrills,
 }
 
 pub fn draw(ui: &mut Ui, info: &FlightInfo, pointer: &mut Pointer, time: f32) -> Vec<FlightAction> {
@@ -270,6 +286,34 @@ pub fn draw(ui: &mut Ui, info: &FlightInfo, pointer: &mut Pointer, time: f32) ->
     );
     let label = "fuel";
     ui.text(fx - ui.text_width(label) / 2.0, gy - ch - s, label, DIM);
+    // Electricity, further left still: how full the batteries are, and what goes in or out.
+    if let Some(p) = info.power {
+        let px = fx - 52.0 * s;
+        ui.rect(px, gy, s, gauge_h, FAINT);
+        let filled = (gauge_h * p.charge as f32).round();
+        let low = p.charge < 0.15 && p.made < p.used;
+        let color = if low {
+            let pulse = 0.6 + 0.4 * (time * 9.0).sin();
+            [240, 90, 70, (255.0 * pulse) as u8]
+        } else {
+            MINT
+        };
+        ui.rect(px - s, gy + gauge_h - filled, 3.0 * s, filled, color);
+        let net = (p.made - p.used) / 1000.0;
+        let text = if net.abs() < 0.05 {
+            format!("{:.0} kj", p.stored / 1000.0)
+        } else {
+            format!("{net:+.1} kw")
+        };
+        ui.text(
+            px - ui.text_width(&text) - 4.0 * s,
+            cy - ch / 2.0,
+            &text,
+            if low { DANGER } else { DIM },
+        );
+        let label = "power";
+        ui.text(px - ui.text_width(label) / 2.0, gy - ch - s, label, DIM);
+    }
     let heat = ((info.temperature - 290.0) / (MAX_TEMPERATURE - 290.0)).clamp(0.0, 1.0) as f32;
     let hx = cx + radius + 14.0 * s;
     ui.rect(hx, gy, s, gauge_h, FAINT);
@@ -292,12 +336,19 @@ pub fn draw(ui: &mut Ui, info: &FlightInfo, pointer: &mut Pointer, time: f32) ->
         if hot { DANGER } else { DIM },
     );
 
-    // The wheel brake, at the foot of the temperature line.
+    // The wheel brake, at the foot of the temperature line, and the drills over it.
+    let mut by = gy + gauge_h - ch - 3.0 * s;
     if let Some(on) = info.brake {
-        let y = gy + gauge_h - ch - 3.0 * s;
-        let (clicked, _) = button(ui, pointer, hx + 5.0 * s, y, "brake", on, true);
+        let (clicked, _) = button(ui, pointer, hx + 5.0 * s, by, "brake", on, true);
         if clicked {
             actions.push(FlightAction::ToggleBrake);
+        }
+        by -= ch + 6.0 * s;
+    }
+    if let Some(on) = info.drills {
+        let (clicked, _) = button(ui, pointer, hx + 5.0 * s, by, "drill", on, true);
+        if clicked {
+            actions.push(FlightAction::ToggleDrills);
         }
     }
 
@@ -317,7 +368,7 @@ pub fn draw(ui: &mut Ui, info: &FlightInfo, pointer: &mut Pointer, time: f32) ->
     ui.text(
         8.0 * s,
         y + 2.0 * s,
-        "wasd qe steer   shift/ctrl throttle   z/x full/cut   space wheel brake   t sas   m map   f get out",
+        "wasd qe steer   shift/ctrl throttle   z/x full/cut   space wheel brake   g drills   t sas   m map   f get out",
         [190, 200, 210, 110],
     );
     actions
@@ -592,6 +643,8 @@ mod tests {
             sas_mode: SasMode::Stability,
             landed: false,
             brake,
+            power: None,
+            drills: None,
             attitude: Attitude {
                 right: DVec3::X,
                 nose: DVec3::Y,
